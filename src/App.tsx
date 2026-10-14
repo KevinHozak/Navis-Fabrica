@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
@@ -255,6 +255,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
   const [stackFilter, setStackFilter] = useState("all");
   const [scrollTop, setScrollTop] = useState(0);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const lastViewRef = useRef({ projects, query, stackFilter, selectedProjectId });
   const stacks = useMemo(() => [...new Set(projects.flatMap((project) => project.detectedStacks))].sort(), [projects]);
   const visible = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -264,13 +265,35 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
     );
   }, [projects, query, stackFilter]);
   const selected = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const selectedIndex = visible.findIndex((project) => project.id === selectedProjectId);
   const start = Math.max(0, Math.floor(scrollTop / PROJECT_ROW_HEIGHT) - PROJECT_OVERSCAN);
   const end = Math.min(visible.length, Math.ceil((scrollTop + 360) / PROJECT_ROW_HEIGHT) + PROJECT_OVERSCAN);
 
-  useEffect(() => {
-    setScrollTop(0);
-    if (viewportRef.current) viewportRef.current.scrollTop = 0;
-  }, [query, stackFilter, projects]);
+  useLayoutEffect(() => {
+    const previous = lastViewRef.current;
+    lastViewRef.current = { projects, query, stackFilter, selectedProjectId };
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    if (previous.query !== query || previous.stackFilter !== stackFilter) {
+      viewport.scrollTop = 0;
+      setScrollTop(0);
+      return;
+    }
+    if (previous.projects === projects && previous.selectedProjectId === selectedProjectId) return;
+
+    const index = visible.findIndex((project) => project.id === selectedProjectId);
+    if (index < 0) return;
+    const rowTop = index * PROJECT_ROW_HEIGHT;
+    const rowBottom = rowTop + PROJECT_ROW_HEIGHT;
+    let nextScrollTop = viewport.scrollTop;
+    if (rowTop < nextScrollTop) nextScrollTop = rowTop;
+    else if (rowBottom > nextScrollTop + viewport.clientHeight) nextScrollTop = rowBottom - viewport.clientHeight;
+    if (nextScrollTop !== viewport.scrollTop) {
+      viewport.scrollTop = nextScrollTop;
+      setScrollTop(nextScrollTop);
+    }
+  }, [projects, query, stackFilter, selectedProjectId, visible]);
 
   function choose(index: number) {
     const bounded = Math.max(0, Math.min(visible.length - 1, index));
@@ -300,7 +323,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
       <span className="project-count">{visible.length} of {projects.length}</span>
     </div>
     <div className="project-browser-layout">
-      <div ref={viewportRef} className="project-viewport" role="listbox" aria-label="Projects" aria-activedescendant={selected && visible.some((project) => project.id === selected.id) ? `project-option-${cssSafeId(selected.id)}` : undefined} tabIndex={0} onKeyDown={handleListKeyDown} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+      <div ref={viewportRef} className="project-viewport" role="listbox" aria-label="Projects" aria-activedescendant={selected && selectedIndex >= start && selectedIndex < end ? `project-option-${cssSafeId(selected.id)}` : undefined} tabIndex={0} onKeyDown={handleListKeyDown} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
         {visible.length ? <div className="project-virtual-space" style={{ height: visible.length * PROJECT_ROW_HEIGHT }}>
           <div className="project-virtual-window" style={{ transform: `translateY(${start * PROJECT_ROW_HEIGHT}px)` }}>
             {visible.slice(start, end).map((project, offset) => {
@@ -329,6 +352,7 @@ function ProjectDetails({ project }: { project: ProjectEntry | null }) {
       {git.latestCommit && <span>{git.latestCommit.shortHash} · {git.latestCommit.subject}</span>}
       {git.upstream.status === "tracking" && <span>Upstream · ↑{git.upstream.ahead ?? 0} ↓{git.upstream.behind ?? 0}</span>}
       {git.upstream.status === "noUpstream" && <span>No upstream configured</span>}
+      {git.upstream.status === "unavailable" && git.status === "available" && <span>Upstream status unavailable</span>}
     </div>
     <div className="detail-group"><strong>Detected stacks</strong><div className="project-detail-tags">{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span>None detected</span>}</div></div>
     {git.remotes.length > 0 && <div className="detail-group"><strong>Remotes</strong>{git.remotes.map((remote) => <span className="detail-break" key={remote.name}>{remote.name}{remote.url ? ` · ${remote.url}` : " · URL unavailable"}</span>)}</div>}

@@ -124,9 +124,7 @@ pub fn scan(
                         }
                     };
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    names.insert(name.to_lowercase());
-                    if depth >= options.depth || (!options.include_hidden && name.starts_with('.'))
-                    {
+                    if !options.include_hidden && name.starts_with('.') {
                         continue;
                     }
                     let child_path = entry.path();
@@ -137,8 +135,15 @@ pub fn scan(
                     if excluded(relative, &options.exclusions) {
                         continue;
                     }
-                    match entry.file_type() {
-                        Ok(kind) if kind.is_dir() || kind.is_symlink() => children.push(child_path),
+                    match entry.metadata() {
+                        Ok(metadata) if metadata.is_dir() => {
+                            if depth < options.depth {
+                                children.push(child_path);
+                            }
+                        }
+                        Ok(metadata) if metadata.is_file() => {
+                            names.insert(name.to_lowercase());
+                        }
                         Ok(_) => {}
                         Err(error) => {
                             push_error(&mut errors, format!("Could not inspect {name}: {error}"))
@@ -412,6 +417,17 @@ mod tests {
     }
 
     #[test]
+    fn marker_named_directories_do_not_create_coding_projects() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("package.json")).unwrap();
+
+        let result = scan_fixture(root.path(), 1);
+
+        assert!(result.projects.is_empty());
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
     fn missing_roots_report_a_fatal_error() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing");
@@ -438,6 +454,21 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_symlink_is_not_scanned_as_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("notes.txt");
+        fs::write(&target, "not a project").unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("notes-link")).unwrap();
+
+        let result = scan_fixture(root.path(), 1);
+
+        assert_eq!(result.directories_scanned, 1);
+        assert!(result.projects.is_empty());
+        assert!(result.errors.is_empty());
     }
 
     #[test]

@@ -24,7 +24,7 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 
 ### Fixture and compile verification
 
-- `cargo test --locked --manifest-path src-tauri/Cargo.toml`: 12 tests passed on Windows. Fixtures cover spaces in paths, nested Git/coding projects, `.git` worktree pointer files, depth/hidden/exclusion settings, missing and non-folder roots, cancellation, broken worktree metadata, and partial results. Unix-only permission-denied root/subfolder and duplicate-alias fixtures are present but were not run on Windows.
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml`: 13 tests passed on Windows. Fixtures cover spaces in paths, nested Git/coding projects, `.git` worktree pointer files, depth/hidden/exclusion settings, missing and non-folder roots, cancellation, broken worktree metadata, marker-named directories, and partial results. Unix-only permission-denied root/subfolder, duplicate-alias, and file-symlink fixtures are present but were not run on Windows.
 - `cargo check --locked --manifest-path src-tauri/Cargo.toml`: passed.
 - `npm run build`: TypeScript and Vite production build passed.
 - A Windows symlink/junction cycle fixture was not run: creating a directory symlink failed with Windows error 1314 (required privilege not held). Unix builds run the duplicate-alias symlink fixture.

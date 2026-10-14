@@ -16,6 +16,6 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 ## Foundation-P1 shell
 
 - The main sections use hash navigation (`#projects`, `#runs`, `#providers`, `#settings`) so browser history and the Tauri webview share the same navigation behavior.
-- The saved project root is stored in the current browser/webview profile under `navis-fabrica.settings.v1`; no project scanning is performed in this phase.
+- Settings remain a shell-only placeholder in Foundation-P1. Root persistence, validation and app-specific storage are deferred to Foundation-P2; no project scanning is performed in this phase.
 - To preview the project panel fixtures, use the toolbar's **Preview state** selector, or open the app with `?demo=loading`, `?demo=empty`, or `?demo=error`. These are UI fixtures, not live filesystem results.
 - The window and document title include the current package version. The shell uses system fonts and supports keyboard focus, narrow viewports, and reduced motion.

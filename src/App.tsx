@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState } from "react";
 
 type Section = "projects" | "runs" | "providers" | "settings";
 type PreviewState = "ready" | "loading" | "empty" | "error";
@@ -10,23 +10,6 @@ const sections: { id: Section; label: string; icon: string }[] = [
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
-const settingsKey = "navis-fabrica.settings.v1";
-
-function readRootPath() {
-  try {
-    const saved = window.localStorage.getItem(settingsKey);
-    if (saved) {
-      const parsed: unknown = JSON.parse(saved);
-      if (typeof parsed === "object" && parsed !== null && "rootPath" in parsed && typeof parsed.rootPath === "string") {
-        return parsed.rootPath;
-      }
-    }
-  } catch {
-    // Storage may be unavailable in private browser contexts; keep the usable default.
-  }
-  return "C:\\Projects";
-}
-
 function sectionFromHash(): Section {
   const candidate = window.location.hash.slice(1);
   return sections.some((section) => section.id === candidate) ? (candidate as Section) : "projects";
@@ -34,8 +17,6 @@ function sectionFromHash(): Section {
 
 function App() {
   const [section, setSection] = useState<Section>(sectionFromHash);
-  const [rootPath, setRootPath] = useState(readRootPath);
-  const [saved, setSaved] = useState(false);
   const [preview, setPreview] = useState<PreviewState>(() => {
     const candidate = new URLSearchParams(window.location.search).get("demo");
     return candidate === "loading" || candidate === "empty" || candidate === "error" ? candidate : "ready";
@@ -51,18 +32,6 @@ function App() {
     document.title = `Navis-Fabrica · v${__APP_VERSION__}`;
   }, []);
 
-  function saveSettings(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    try {
-      window.localStorage.setItem(settingsKey, JSON.stringify({ rootPath: rootPath.trim() || "C:\\Projects" }));
-      setRootPath((current) => current.trim() || "C:\\Projects");
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 2200);
-    } catch {
-      setSaved(false);
-    }
-  }
-
   const current = sections.find((item) => item.id === section) ?? sections[0];
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Recent runs" : "Connected providers";
   const emptyTitle = preview === "empty"
@@ -74,7 +43,7 @@ function App() {
 
   return (
     <div className="app-shell">
-      <a className="skip-link" href="#main-content">Skip to content</a>
+      <a className="skip-link" href="#main-content" onClick={(event) => { event.preventDefault(); document.getElementById("main-content")?.focus(); }}>Skip to content</a>
       <aside className="sidebar" aria-label="Application navigation">
         <a className="brand" href="#projects" aria-label="Navis-Fabrica home">
           <span className="brand-mark" aria-hidden="true">N</span>
@@ -86,7 +55,7 @@ function App() {
           {sections.map((item) => (
             <a key={item.id} className={`nav-link${section === item.id ? " active" : ""}`} href={`#${item.id}`} aria-current={section === item.id ? "page" : undefined}>
               <span className="nav-icon" aria-hidden="true">{item.icon}</span>{item.label}
-              {item.id === "projects" && <span className="nav-indicator" aria-label="Current section" />}
+              {section === item.id && <span className="nav-indicator" aria-hidden="true" />}
             </a>
           ))}
         </nav>
@@ -127,17 +96,13 @@ function App() {
 
           {section === "settings" ? (
             <section className="panel settings-panel" aria-labelledby="root-setting-title">
-              <div className="panel-heading"><div><h2 id="root-setting-title">Project location</h2><p>Choose the folder Navis-Fabrica will use to find projects.</p></div><span className="setting-glyph" aria-hidden="true">⌂</span></div>
-              <form className="settings-form" onSubmit={saveSettings}>
-                <label htmlFor="root-path">Projects folder</label>
-                <div className="input-row"><input id="root-path" value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="C:\\Projects" autoComplete="off" /><button className="button button-primary" type="submit">Save location</button></div>
-                <p className={`form-feedback${saved ? " visible" : ""}`} role="status">{saved ? "Location saved on this device." : "Saved locally in this browser profile."}</p>
-              </form>
+              <div className="panel-heading"><div><h2 id="root-setting-title">Workspace settings</h2><p>Preferences and project location controls are part of the next foundation phase.</p></div><span className="setting-glyph" aria-hidden="true">⌂</span></div>
+              <div className="settings-note" role="note"><span className="settings-note-icon" aria-hidden="true">✦</span><p>Settings storage and project-location validation will be added in Foundation-P2.</p></div>
             </section>
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">
-                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? <>Projects in <code>{rootPath}</code></> : "This workspace section is part of the foundation shell."}</p></div>
+                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? "Project discovery is planned for a future phase." : "This workspace section is part of the foundation shell."}</p></div>
                 <button className="icon-button" type="button" aria-label="More project options" disabled>···</button>
               </div>
               <div className="panel-rule" />

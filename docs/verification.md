@@ -58,3 +58,17 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 ### Live GitHub integration
 
 - Not run. This phase performs local, read-only remote parsing and stores optional account labels plus opaque credential references; no GitHub authentication adapter exists to verify credentials or repository access. The UI reports access as unchecked and continues to show local project data. No live access result is inferred from fixture tests.
+
+## GitHub-P3 issue picker and workflow context (issue #16)
+
+### Fixture and build verification
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked github::tests`: 7 passed. Fixtures cover repository-scoped issue references, parent and checklist extraction, linked PR filtering, bounded fields, plus existing GitHub parsing and status behavior.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked`: 34 passed, 2 failed outside issue #16. The rename fixture hit Windows access denied; the 100-project benchmark measured 6.10 seconds against its 5-second target.
+- `npm run build`: blocked because this worktree does not have the TypeScript compiler installed (`tsc` was not recognized). `npm ci --ignore-scripts --prefer-offline --no-audit --no-fund` failed with npm's internal `Exit handler never called!`; frontend typecheck/build remains unverified.
+- `git diff --check`: passed.
+
+### Live GitHub integration
+
+- The connected GitHub integration read issue #16 successfully. The desktop app's direct API calls, native dependency lookup, and repository issue picker were not exercised live in this environment; no live blocker or PR-link behavior is claimed.

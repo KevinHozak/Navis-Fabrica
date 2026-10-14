@@ -6,6 +6,8 @@ fn main() {
             "start_project_scan",
             "cancel_project_scan",
             "inspect_providers",
+            "list_github_issues",
+            "get_github_issue",
         ]),
     ))
     .expect("failed to build Tauri permission manifest");

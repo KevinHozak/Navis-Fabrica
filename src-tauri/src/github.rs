@@ -9,6 +9,10 @@ const PAGE_SIZE: usize = 100;
 const MAX_ITEMS: usize = MAX_PAGES * PAGE_SIZE;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const TOTAL_REQUEST_BUDGET: Duration = Duration::from_secs(30);
+const MAX_ISSUE_BODY_CHARS: usize = 12_000;
+const MAX_ISSUE_TITLE_CHARS: usize = 300;
+const MAX_ACCEPTANCE_ITEMS: usize = 30;
+const MAX_BLOCKERS: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +38,291 @@ pub struct CommitSummary {
     pub hash: String,
     pub subject: String,
     pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryIssue {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub body: String,
+    pub acceptance_criteria: Vec<String>,
+    pub blocked_by: Vec<IssueLink>,
+    pub blockers_truncated: bool,
+    pub blockers_available: bool,
+    pub parent_epic: Option<IssueLink>,
+    pub pull_request_urls: Vec<String>,
+    pub selectable: bool,
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueLink {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueSummary {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+}
+
+pub async fn list_issues(
+    owner: &str,
+    repository: &str,
+    token: Option<&str>,
+) -> Result<Vec<IssueSummary>, String> {
+    if !valid_repository_name(owner, repository) {
+        return Err("The GitHub repository identity is invalid.".into());
+    }
+    let client = issue_client()?;
+    let url = format!("{API_ROOT}/repos/{owner}/{repository}/issues?state=open&per_page=50&page=1");
+    let (items, _) = get_json(&client, &url, token, Instant::now() + TOTAL_REQUEST_BUDGET).await?;
+    Ok(items.iter().filter_map(issue_summary).collect())
+}
+
+pub async fn fetch_issue(
+    owner: &str,
+    repository: &str,
+    number: u64,
+    token: Option<&str>,
+) -> Result<RepositoryIssue, String> {
+    if !valid_repository_name(owner, repository) || number == 0 {
+        return Err("The GitHub issue reference is invalid.".into());
+    }
+    let client = issue_client()?;
+    let deadline = Instant::now() + TOTAL_REQUEST_BUDGET;
+    let (items, _) = get_json(
+        &client,
+        &format!("{API_ROOT}/repos/{owner}/{repository}/issues/{number}"),
+        token,
+        deadline,
+    )
+    .await?;
+    let item = items
+        .first()
+        .ok_or_else(|| "GitHub returned no issue.".to_string())?;
+    let mut issue = detailed_issue(item, owner, repository)
+        .ok_or_else(|| "GitHub returned an unsupported issue record.".to_string())?;
+    if issue.state != "open" {
+        issue.selectable = false;
+        return Ok(issue);
+    }
+    match get_json(&client, &format!("{API_ROOT}/repos/{owner}/{repository}/issues/{number}/dependencies/blocked_by?per_page=21"), token, deadline).await {
+        Ok((blockers, headers)) => {
+            issue.blockers_available = true;
+            issue.blockers_truncated = blockers.len() > MAX_BLOCKERS || next_page(&headers).is_some();
+            issue.blocked_by = blockers.iter().take(MAX_BLOCKERS).filter_map(|item| issue_summary(item).map(|summary| IssueLink { number: summary.number, title: summary.title, url: summary.url, state: summary.state })).collect();
+            issue.blocked = issue.blockers_truncated || issue.blocked_by.iter().any(|blocker| blocker.state == "open");
+        }
+        Err(_) => { issue.blocked = true; }
+    }
+    if let Some(parent_number) =
+        parent_issue_number(item.get("body").and_then(Value::as_str).unwrap_or_default())
+    {
+        if parent_number != number {
+            if let Ok((parents, _)) = get_json(
+                &client,
+                &format!("{API_ROOT}/repos/{owner}/{repository}/issues/{parent_number}"),
+                token,
+                deadline,
+            )
+            .await
+            {
+                issue.parent_epic = parents
+                    .first()
+                    .and_then(|parent| issue_summary(parent))
+                    .map(|summary| IssueLink {
+                        number: summary.number,
+                        title: summary.title,
+                        url: summary.url,
+                        state: summary.state,
+                    });
+            }
+        }
+    }
+    if let Ok((events, _)) = get_json(
+        &client,
+        &format!("{API_ROOT}/repos/{owner}/{repository}/issues/{number}/timeline?per_page=100"),
+        token,
+        deadline,
+    )
+    .await
+    {
+        for url in timeline_pull_requests(&events, owner, repository) {
+            if issue.pull_request_urls.len() >= 10 {
+                break;
+            }
+            if !issue.pull_request_urls.contains(&url) {
+                issue.pull_request_urls.push(url);
+            }
+        }
+    }
+    issue.selectable = issue.state == "open" && issue.blockers_available && !issue.blocked;
+    Ok(issue)
+}
+
+fn issue_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(concat!("Navis-Fabrica/", env!("CARGO_PKG_VERSION")))
+        .default_headers(default_headers())
+        .build()
+        .map_err(|_| "Could not prepare the GitHub connection.".into())
+}
+
+fn issue_summary(value: &Value) -> Option<IssueSummary> {
+    if value.get("pull_request").is_some() {
+        return None;
+    }
+    let number = value.get("number")?.as_u64()?;
+    let url = value.get("html_url")?.as_str()?;
+    if !url.starts_with("https://github.com/") {
+        return None;
+    }
+    Some(IssueSummary {
+        number,
+        title: truncate_chars(
+            value
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Untitled issue"),
+            MAX_ISSUE_TITLE_CHARS,
+        ),
+        url: url.to_owned(),
+        state: value.get("state")?.as_str()?.to_owned(),
+    })
+}
+
+fn detailed_issue(value: &Value, owner: &str, repository: &str) -> Option<RepositoryIssue> {
+    let summary = issue_summary(value)?;
+    let body = truncate_chars(
+        value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        MAX_ISSUE_BODY_CHARS,
+    );
+    let acceptance_criteria = body
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let (_, text) = trimmed.split_once("[ ]")?;
+            let text = text.trim();
+            (!text.is_empty()).then(|| truncate_chars(text, 500))
+        })
+        .take(MAX_ACCEPTANCE_ITEMS)
+        .collect();
+    let parent_epic = parent_issue_number(&body).map(|number| IssueLink {
+        number,
+        title: format!("Issue #{number}"),
+        url: format!("https://github.com/{owner}/{repository}/issues/{number}"),
+        state: "unknown".into(),
+    });
+    let pull_request_urls = body
+        .split_whitespace()
+        .filter(|token| token.starts_with("https://github.com/") && token.contains("/pull/"))
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| {
+                    !ch.is_ascii_alphanumeric()
+                        && ch != ':'
+                        && ch != '/'
+                        && ch != '.'
+                        && ch != '-'
+                        && ch != '_'
+                })
+                .to_owned()
+        })
+        .filter(|url| url.starts_with(&format!("https://github.com/{owner}/{repository}/pull/")))
+        .take(10)
+        .collect();
+    Some(RepositoryIssue {
+        number: summary.number,
+        title: summary.title,
+        url: summary.url,
+        state: summary.state,
+        body,
+        acceptance_criteria,
+        blocked_by: Vec::new(),
+        blockers_truncated: false,
+        blockers_available: false,
+        parent_epic,
+        pull_request_urls,
+        selectable: false,
+        blocked: false,
+    })
+}
+
+fn parent_issue_number(body: &str) -> Option<u64> {
+    body.lines()
+        .find(|line| line.to_ascii_lowercase().contains("parent epic"))?
+        .split('#')
+        .nth(1)?
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn timeline_pull_requests(events: &[Value], owner: &str, repository: &str) -> Vec<String> {
+    let prefix = format!("https://github.com/{owner}/{repository}/pull/");
+    events
+        .iter()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("cross-referenced"))
+        .filter_map(|event| {
+            event
+                .get("source")?
+                .get("issue")?
+                .get("pull_request")?
+                .get("html_url")?
+                .as_str()
+        })
+        .filter(|url| {
+            url.starts_with(&prefix) && url[prefix.len()..].chars().all(|ch| ch.is_ascii_digit())
+        })
+        .take(10)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    let mut chars = value.chars();
+    let prefix: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+pub fn parse_issue_reference(owner: &str, repository: &str, input: &str) -> Result<u64, String> {
+    let trimmed = input.trim();
+    let number = if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        trimmed
+    } else {
+        let prefix = format!("https://github.com/{owner}/{repository}/issues/");
+        let Some(path) = trimmed.strip_prefix(&prefix) else {
+            return Err("Enter an issue number or a URL for this repository.".into());
+        };
+        path.split(['?', '#']).next().unwrap_or_default()
+    };
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| "Enter a valid GitHub issue number.".to_string())?;
+    Ok(number)
 }
 
 pub fn valid_repository_name(owner: &str, repository: &str) -> bool {
@@ -247,10 +536,14 @@ async fn get_json(
         body.extend_from_slice(&chunk);
     }
     let value: Value = serde_json::from_slice(&body).map_err(|_| "unavailable".to_owned())?;
-    let Some(items) = value.as_array() else {
+    let items = if let Some(items) = value.as_array() {
+        items.clone()
+    } else if value.is_object() {
+        vec![value]
+    } else {
         return Err("unavailable".into());
     };
-    Ok((items.clone(), headers))
+    Ok((items, headers))
 }
 
 async fn count_collection(
@@ -383,5 +676,75 @@ mod tests {
         assert!(!valid_repository_name("../private", "repo"));
         assert!(!valid_repository_name("owner/repository", "repo"));
         assert!(!valid_repository_name("owner", ".."));
+    }
+
+    #[test]
+    fn issue_references_are_limited_to_selected_repository() {
+        assert_eq!(parse_issue_reference("owner", "repo", "42").unwrap(), 42);
+        assert_eq!(
+            parse_issue_reference("owner", "repo", "https://github.com/owner/repo/issues/7")
+                .unwrap(),
+            7
+        );
+        assert!(parse_issue_reference(
+            "owner",
+            "repo",
+            "https://github.com/elsewhere/repo/issues/7"
+        )
+        .is_err());
+        assert!(
+            parse_issue_reference("owner", "repo", "https://github.com/owner/repo/pull/7").is_err()
+        );
+        assert!(parse_issue_reference("owner", "repo", "0").is_err());
+    }
+
+    #[test]
+    fn issue_context_extracts_parent_and_acceptance_and_bounds_body() {
+        let issue = detailed_issue(
+            &serde_json::json!({
+                "number": 8,
+                "title": "A scoped issue",
+                "html_url": "https://github.com/owner/repo/issues/8",
+                "state": "open",
+                "body": "Parent Epic: #3\n\n- [ ] First criterion\n- [ ] Second criterion"
+            }),
+            "owner",
+            "repo",
+        )
+        .unwrap();
+        assert_eq!(issue.parent_epic.unwrap().number, 3);
+        assert_eq!(
+            issue.acceptance_criteria,
+            vec!["First criterion", "Second criterion"]
+        );
+        let huge = "x".repeat(MAX_ISSUE_BODY_CHARS + 20);
+        let bounded = detailed_issue(
+            &serde_json::json!({
+                "number": 9,
+                "title": "x".repeat(MAX_ISSUE_TITLE_CHARS + 20),
+                "html_url": "https://github.com/owner/repo/issues/9",
+                "state": "closed",
+                "body": huge
+            }),
+            "owner",
+            "repo",
+        )
+        .unwrap();
+        assert!(!bounded.selectable);
+        assert_eq!(bounded.title.chars().count(), MAX_ISSUE_TITLE_CHARS + 1);
+        assert_eq!(bounded.body.chars().count(), MAX_ISSUE_BODY_CHARS + 1);
+    }
+
+    #[test]
+    fn issue_timeline_includes_only_same_repository_cross_referenced_prs() {
+        let events = vec![
+            serde_json::json!({"event":"cross-referenced","source":{"issue":{"pull_request":{"html_url":"https://github.com/owner/repo/pull/12"}}}}),
+            serde_json::json!({"event":"cross-referenced","source":{"issue":{"pull_request":{"html_url":"https://github.com/other/repo/pull/13"}}}}),
+            serde_json::json!({"event":"closed","source":{"issue":{"pull_request":{"html_url":"https://github.com/owner/repo/pull/14"}}}}),
+        ];
+        assert_eq!(
+            timeline_pull_requests(&events, "owner", "repo"),
+            vec!["https://github.com/owner/repo/pull/12"]
+        );
     }
 }

@@ -228,6 +228,29 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .github-freshness { color: #8090a3; }
 .github-commit { font-size: 9px; }
 .github-activity .text-button { justify-self: start; margin-top: 2px; }
+.issue-picker { display: grid; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+.issue-picker > strong, .issue-detail strong { color: #cbd7e5; font-size: 10px; font-weight: 600; }
+.issue-picker > p, .issue-feedback, .issue-detail small { margin: 0; color: #8995a5; font-size: 9px; line-height: 1.5; }
+.issue-picker-entry { display: flex; gap: 6px; }
+.issue-picker-entry input { width: 100%; min-width: 0; height: 33px; padding: 0 8px; border: 1px solid #303b49; border-radius: 7px; background: #10151d; color: #e1e8f1; font-size: 10px; }
+.issue-picker-entry .button { min-height: 33px; padding: 0 9px; font-size: 9px; white-space: nowrap; }
+.issue-picker-list { display: grid; max-height: 150px; overflow: auto; border: 1px solid #303b49; border-radius: 7px; }
+.issue-picker-list button { display: flex; width: 100%; justify-content: space-between; gap: 8px; padding: 8px; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: #a9c9e8; font-size: 9px; text-align: left; cursor: pointer; }
+.issue-picker-list button:hover { background: #ffffff08; }
+.issue-picker-list button span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.issue-detail { display: grid; gap: 9px; margin-top: 5px; padding: 10px; border: 1px solid #35485b; border-radius: 8px; background: #14202c; }
+.issue-detail h4 { margin: 0; font-size: 10px; line-height: 1.5; }
+.issue-detail a, .work-context a { color: #9dcbf4; overflow-wrap: anywhere; }
+.issue-detail > div { display: grid; gap: 5px; color: #99a8b8; font-size: 9px; line-height: 1.5; }
+.issue-detail ul { display: grid; gap: 4px; margin: 0; padding-left: 16px; }
+.issue-state { width: fit-content; padding: 3px 6px; border: 1px solid #3c6551; border-radius: 999px; color: #9adabb; font-size: 8px; text-transform: capitalize; }
+.issue-state.closed { border-color: #70424a; color: #f0bbc0; }
+.issue-detail .button { justify-self: start; min-height: 32px; padding: 0 10px; font-size: 9px; }
+.issue-detail .button:disabled { cursor: not-allowed; opacity: .45; }
+.work-context { display: grid; gap: 12px; padding: 20px 23px; }
+.work-context h3 { margin: 0; font-size: 15px; }
+.work-context > p:not(.eyebrow) { max-height: 360px; overflow: auto; white-space: pre-wrap; color: #a9b7c7; font-size: 11px; line-height: 1.6; }
+.work-context small { color: #8291a3; font-size: 10px; }
 .project-detail-tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .empty-detail { display: flex; flex-direction: column; justify-content: center; }
 .empty-detail p { color: #8995a5; font-size: 10px; line-height: 1.6; }

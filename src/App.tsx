@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
+import { GitHubIssuePicker } from "./GitHubIssuePicker";
 import {
   cancelProjectScan,
   getCachedGitHubActivity,
@@ -13,6 +14,7 @@ import {
   onProjectScanProgress,
   onProjectWatchError,
   ProjectEntry,
+  GitHubIssue,
   ProjectScanFinished,
   ProjectScanProgress,
   refreshGitHubActivity,
@@ -45,6 +47,7 @@ function App() {
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
+  const [workIssue, setWorkIssue] = useState<GitHubIssue | null>(null);
   const activeScanId = useRef("");
   const cancelRequested = useRef(false);
   const refreshAfterScan = useRef(false);
@@ -145,7 +148,7 @@ function App() {
   }, [projects]);
 
   const current = sections.find((item) => item.id === section) ?? sections[0];
-  const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Recent runs" : "Connected providers";
+  const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Work context" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
 
   async function beginScan(forceRefresh = true) {
@@ -238,6 +241,11 @@ function App() {
             <SettingsPanel />
           ) : section === "providers" ? (
             <ProvidersPanel />
+          ) : section === "runs" ? (
+            <section className="panel project-panel" aria-labelledby="project-list-title">
+              <div className="panel-heading"><div><h2 id="project-list-title">Work context</h2><p>Issue details selected from a repository. Selection never edits GitHub.</p></div></div><div className="panel-rule" />
+              {workIssue ? <div className="work-context"><p className="eyebrow">READY FOR WORK</p><h3><a href={workIssue.url} target="_blank" rel="noreferrer">#{workIssue.number} · {workIssue.title} ↗</a></h3><p>{workIssue.body}</p>{workIssue.acceptanceCriteria.length > 0 && <div><strong>Acceptance criteria</strong><ul>{workIssue.acceptanceCriteria.map((criterion, index) => <li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{workIssue.blockedBy.length > 0 && <div><strong>Blockers</strong>{workIssue.blockedBy.map((blocker) => <a key={blocker.number} href={blocker.url} target="_blank" rel="noreferrer">#{blocker.number} · {blocker.title} ({blocker.state})</a>)}</div>}{workIssue.parentEpic && <div><strong>Parent epic</strong><a href={workIssue.parentEpic.url} target="_blank" rel="noreferrer">#{workIssue.parentEpic.number} · {workIssue.parentEpic.title}</a></div>}{workIssue.pullRequestUrls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">PR context: {url}</a>)}<small>Bounded read-only context · {workIssue.acceptanceCriteria.length} acceptance criteria · {workIssue.blockedBy.length} blockers</small><p className="issue-feedback">Workflow execution will be available in a later phase.</p></div> : <div className="empty-state"><h3>No issue context yet</h3><p>Choose an issue in a project’s GitHub activity panel to prepare its work context.</p><a href="#projects">Browse projects</a></div>}
+            </section>
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">
@@ -256,7 +264,7 @@ function App() {
                   {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div>}
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
                   {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
-                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} />
+                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onWork={(issue) => { setWorkIssue(issue); window.location.hash = "runs"; }} />
                 </>
               ) : scanning ? (
                 <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
@@ -297,10 +305,11 @@ function gitStatusLabel(status: string): string {
 const PROJECT_ROW_HEIGHT = 68;
 const PROJECT_OVERSCAN = 5;
 
-function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
+function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
   projects: ProjectEntry[];
   selectedProjectId: string | null;
   onSelect: (id: string) => void;
+  onWork: (issue: GitHubIssue) => void;
 }) {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
@@ -388,12 +397,12 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
           </div>
         </div> : <div className="project-filter-empty">No projects match these filters.</div>}
       </div>
-      <ProjectDetails project={selected} />
+      <ProjectDetails project={selected} onWork={onWork} />
     </div>
   </div>;
 }
 
-function ProjectDetails({ project }: { project: ProjectEntry | null }) {
+function ProjectDetails({ project, onWork }: { project: ProjectEntry | null; onWork: (issue: GitHubIssue) => void }) {
   const [activity, setActivity] = useState<GitHubActivity | null>(null);
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityError, setActivityError] = useState("");
@@ -460,6 +469,7 @@ function ProjectDetails({ project }: { project: ProjectEntry | null }) {
       {activity?.remoteStatus === "unauthorized" && <span role="status">GitHub did not provide repository activity. Private data stays hidden.</span>}
       {activity?.remoteStatus === "unavailable" && <span role="status">Remote activity is unavailable. Local project details are still available.</span>}
       {activity?.recentCommits.map((commit) => <a className="github-commit" key={commit.hash} href={commit.url} target="_blank" rel="noreferrer"><code>{commit.hash}</code> · {commit.subject}</a>)}
+      {isDesktopApp() && <GitHubIssuePicker owner={remote.owner} repository={remote.repository} onWork={onWork} />}
       {activityError && <span role="status">{activityError}</span>}
       {isDesktopApp() && <button className="text-button" type="button" onClick={() => { void refreshActivity(); }} disabled={activityLoading}>{activityLoading ? "Refreshing GitHub…" : "Refresh GitHub activity"}</button>}
     </div>}

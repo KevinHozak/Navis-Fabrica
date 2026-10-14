@@ -172,6 +172,43 @@ async fn refresh_github_activity(
     Ok(activity)
 }
 
+fn github_token_for_app(app: &AppHandle) -> Result<Option<String>, String> {
+    let settings = load_settings(&settings_path(app)?)?;
+    let reference = settings
+        .selected_github_account_id
+        .as_deref()
+        .and_then(|id| {
+            settings
+                .github_accounts
+                .iter()
+                .find(|account| account.id == id)
+        })
+        .and_then(|account| account.credential_ref.as_deref());
+    Ok(reference.and_then(resolve_github_credential))
+}
+
+#[tauri::command]
+async fn list_github_issues(
+    app: AppHandle,
+    owner: String,
+    repository: String,
+) -> Result<Vec<github::IssueSummary>, String> {
+    let token = github_token_for_app(&app)?;
+    github::list_issues(&owner, &repository, token.as_deref()).await
+}
+
+#[tauri::command]
+async fn get_github_issue(
+    app: AppHandle,
+    owner: String,
+    repository: String,
+    reference: String,
+) -> Result<github::RepositoryIssue, String> {
+    let number = github::parse_issue_reference(&owner, &repository, &reference)?;
+    let token = github_token_for_app(&app)?;
+    github::fetch_issue(&owner, &repository, number, token.as_deref()).await
+}
+
 fn resolve_github_credential(reference: &str) -> Option<String> {
     let key = reference.strip_prefix("credential-store:")?;
     if key.is_empty()
@@ -912,6 +949,8 @@ pub fn run() {
             inspect_providers,
             get_cached_github_activity,
             refresh_github_activity,
+            list_github_issues,
+            get_github_issue,
             start_project_scan,
             cancel_project_scan
         ])

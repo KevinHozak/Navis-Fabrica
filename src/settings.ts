@@ -109,7 +109,7 @@ export type WorkflowRunMetadata = {
   issueUrl: string | null;
   scopePaths: string[];
   requestedEffects: ("commit" | "push" | "createPullRequest")[];
-  sideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null } | null;
+  sideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null;
 };
 export type CodexStartRequest = {
   cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number;

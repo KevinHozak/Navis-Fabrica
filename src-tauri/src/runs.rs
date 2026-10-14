@@ -86,6 +86,10 @@ pub struct WorkflowSideEffects {
     pub commit_sha: Option<String>,
     pub remote_branch: Option<String>,
     pub pull_request_url: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub verification_message: Option<String>,
 }
 
 fn parse_side_effect_marker(text: &str) -> Option<WorkflowSideEffects> {
@@ -109,6 +113,8 @@ fn parse_side_effect_marker(text: &str) -> Option<WorkflowSideEffects> {
             commit_sha,
             remote_branch,
             pull_request_url,
+            verified: false,
+            verification_message: None,
         },
     )
 }
@@ -516,6 +522,320 @@ fn command_for(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     Ok(command)
+}
+
+fn run_readonly_command(
+    executable: &Path,
+    cwd: &Path,
+    args: &[String],
+    failure_message: &str,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let request = StartRequest {
+        executable: executable.to_string_lossy().into_owned(),
+        arguments: args.to_vec(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds: 10,
+        mutating: false,
+    };
+    let (executable, cwd, host) = validate_request(&request)?;
+    let mut command = command_for(&executable, &cwd, &host, args)?;
+    command.stdin(Stdio::null()).stderr(Stdio::null());
+    command.stdout(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| failure_message.to_owned())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| failure_message.to_owned())?;
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout.by_ref().take(64 * 1024).read_to_end(&mut output);
+        output
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader.join().map_err(|_| failure_message.to_owned())?;
+                return Ok((status, output));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(failure_message.to_owned());
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(failure_message.to_owned());
+            }
+        }
+    }
+}
+
+fn preflight_command(
+    executable: &Path,
+    cwd: &Path,
+    args: &[String],
+    failure_message: &str,
+) -> Result<(), String> {
+    let (status, _) = run_readonly_command(executable, cwd, args, failure_message)?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| failure_message.to_owned())
+}
+
+pub fn preflight_agent_workflow(
+    codex_executable: &Path,
+    cwd: &Path,
+    workflow: &WorkflowRunMetadata,
+) -> Result<(), String> {
+    preflight_command(
+        codex_executable,
+        cwd,
+        &["login".into(), "status".into()],
+        "Codex authentication is unavailable or expired; the workflow was not started.",
+    )?;
+
+    if workflow
+        .requested_effects
+        .iter()
+        .any(|effect| effect == "push")
+    {
+        let gh = crate::providers::find_executable("gh", std::env::var_os("PATH").as_deref())
+            .ok_or("GitHub CLI is required for push or pull-request permission.")?;
+        preflight_command(
+            &gh,
+            cwd,
+            &[
+                "auth".into(),
+                "status".into(),
+                "--hostname".into(),
+                "github.com".into(),
+            ],
+            "GitHub CLI authentication is unavailable; the workflow was not started.",
+        )?;
+    }
+    Ok(())
+}
+
+fn command_output(cwd: &Path, program: &str, args: &[String]) -> Result<String, String> {
+    let (status, output) = run_readonly_command(
+        Path::new(program),
+        cwd,
+        args,
+        "Could not verify the workflow's reported repository side effects.",
+    )?;
+    if !status.success() {
+        return Err("Could not verify the workflow's reported repository side effects.".into());
+    }
+    String::from_utf8(output).map_err(|_| "Verification returned unreadable command output.".into())
+}
+
+fn verify_reported_side_effects(
+    cwd: &Path,
+    workflow: &WorkflowRunMetadata,
+    effects: &WorkflowSideEffects,
+) -> Result<(), String> {
+    let permits = |effect: &str| workflow.requested_effects.iter().any(|item| item == effect);
+    if effects.commit_sha.is_some() && !permits("commit") {
+        return Err("The run reported a commit that was not explicitly permitted.".into());
+    }
+    if effects.remote_branch.is_some() && !permits("push") {
+        return Err("The run reported a push that was not explicitly permitted.".into());
+    }
+    if effects.pull_request_url.is_some() && !permits("createPullRequest") {
+        return Err("The run reported a pull request that was not explicitly permitted.".into());
+    }
+    if permits("commit") && effects.commit_sha.is_none() {
+        return Err("The run requested a commit but did not report its commit SHA.".into());
+    }
+
+    if let Some(commit_sha) = effects.commit_sha.as_deref() {
+        command_output(
+            cwd,
+            "git",
+            &[
+                "-C".into(),
+                cwd.to_string_lossy().into_owned(),
+                "cat-file".into(),
+                "-e".into(),
+                format!("{commit_sha}^{{commit}}"),
+            ],
+        )?;
+    }
+
+    let mut remote_sha = None;
+    let mut repository = None;
+    if permits("push") || permits("createPullRequest") || effects.remote_branch.is_some() {
+        let remote = command_output(
+            cwd,
+            "git",
+            &[
+                "-C".into(),
+                cwd.to_string_lossy().into_owned(),
+                "remote".into(),
+                "get-url".into(),
+                "origin".into(),
+            ],
+        )?;
+        repository = github_repository_from_remote(remote.trim());
+        if repository.is_none() {
+            return Err("The configured origin is not a supported GitHub remote.".into());
+        }
+    }
+
+    if permits("push") {
+        let branch = effects
+            .remote_branch
+            .as_deref()
+            .ok_or("The run requested a push but did not report its remote branch.")?;
+        let commit_sha = effects
+            .commit_sha
+            .as_deref()
+            .ok_or("The run requested a push but did not report its commit SHA.")?;
+        command_output(
+            cwd,
+            "git",
+            &[
+                "-C".into(),
+                cwd.to_string_lossy().into_owned(),
+                "check-ref-format".into(),
+                "--branch".into(),
+                branch.into(),
+            ],
+        )?;
+        let listing = command_output(
+            cwd,
+            "git",
+            &[
+                "-C".into(),
+                cwd.to_string_lossy().into_owned(),
+                "ls-remote".into(),
+                "--exit-code".into(),
+                "origin".into(),
+                format!("refs/heads/{branch}"),
+            ],
+        )?;
+        let (sha, reference) = listing
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .split_first()
+            .and_then(|(sha, rest)| rest.first().map(|reference| (*sha, *reference)))
+            .ok_or("The reported remote branch was not found.")?;
+        if reference != format!("refs/heads/{branch}") || !sha.eq_ignore_ascii_case(commit_sha) {
+            return Err("The remote branch does not point to the reported commit.".into());
+        }
+        remote_sha = Some(sha.to_owned());
+    }
+
+    if permits("createPullRequest") {
+        let url = effects
+            .pull_request_url
+            .as_deref()
+            .ok_or("The run requested a pull request but did not report its URL.")?;
+        let parts = url
+            .strip_prefix("https://github.com/")
+            .unwrap_or_default()
+            .split('/')
+            .collect::<Vec<_>>();
+        let expected_repository = repository
+            .as_deref()
+            .ok_or("The GitHub origin could not be verified.")?;
+        if parts.len() != 4
+            || format!("{}/{}", parts[0], parts[1]).to_ascii_lowercase() != expected_repository
+            || parts[2] != "pull"
+            || parts[3].parse::<u64>().is_err()
+        {
+            return Err("The reported pull request URL does not match the GitHub origin.".into());
+        }
+        let gh = crate::providers::find_executable("gh", std::env::var_os("PATH").as_deref())
+            .ok_or("GitHub CLI is required to verify the pull request URL.")?;
+        let (status, output) = run_readonly_command(
+            &gh,
+            cwd,
+            &[
+                "pr".into(),
+                "view".into(),
+                url.into(),
+                "--json".into(),
+                "url,headRefName,headRefOid".into(),
+            ],
+            "GitHub could not verify the reported pull request URL.",
+        )?;
+        if !status.success() {
+            return Err("GitHub could not verify the reported pull request URL.".into());
+        }
+        let pull_request: serde_json::Value = serde_json::from_slice(&output).map_err(|_| {
+            "GitHub returned unreadable pull request verification data.".to_string()
+        })?;
+        let branch = effects.remote_branch.as_deref().unwrap_or_default();
+        let commit_sha = effects.commit_sha.as_deref().unwrap_or_default();
+        let head_matches = pull_request
+            .get("headRefName")
+            .and_then(serde_json::Value::as_str)
+            == Some(branch)
+            && pull_request
+                .get("headRefOid")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|sha| {
+                    remote_sha
+                        .as_deref()
+                        .unwrap_or(commit_sha)
+                        .eq_ignore_ascii_case(sha)
+                });
+        if pull_request.get("url").and_then(serde_json::Value::as_str) != Some(url) || !head_matches
+        {
+            return Err(
+                "The pull request does not point to the reported remote branch and commit.".into(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_run_side_effects(app: &AppHandle, path: &Path, run_id: &str) {
+    let (cwd, workflow, mut effects) = match store().lock().ok().and_then(|state| {
+        state
+            .records
+            .iter()
+            .find(|record| record.id == run_id)
+            .and_then(|record| {
+                let workflow = record.workflow.clone()?;
+                let effects = workflow.side_effects.clone()?;
+                Some((PathBuf::from(&record.cwd), workflow, effects))
+            })
+    }) {
+        Some(value) => value,
+        None => return,
+    };
+    if effects.verified || effects.verification_message.is_some() {
+        return;
+    }
+    match verify_reported_side_effects(&cwd, &workflow, &effects) {
+        Ok(()) => {
+            effects.verified = true;
+            effects.verification_message =
+                Some("All reported side effects were independently verified.".into());
+        }
+        Err(error) => effects.verification_message = Some(error),
+    }
+    if let Ok(mut state) = store().lock() {
+        if let Some(record) = state.records.iter_mut().find(|record| record.id == run_id) {
+            if let Some(workflow) = record.workflow.as_mut() {
+                workflow.side_effects = Some(effects);
+            }
+            let snapshot = record.clone();
+            let _ = persist_records(path, &state.records);
+            let _ = app.emit("workflow-run-updated", snapshot);
+        }
+    }
 }
 
 fn history_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1302,6 +1622,7 @@ fn finish_codex_run(
     if !text.is_empty() && event_kind != "state" {
         emit_event(app, path, run_id, event_kind, text);
     }
+    verify_run_side_effects(app, path, run_id);
     set_state(app, path, run_id, state_name, None);
 }
 
@@ -1366,6 +1687,14 @@ pub fn start_codex_workflow_run(
             },
         )?;
         verify_workflow_repository(&cwd, workflow)?;
+        let missing = crate::scanner::unavailable_workflow_prerequisites(&cwd)?;
+        if !missing.is_empty() {
+            return Err(format!(
+                "Required project tools are unavailable: {}.",
+                missing.join(", ")
+            ));
+        }
+        preflight_agent_workflow(&config.executable, &cwd, workflow)?;
     } else {
         ensure_clean_git_worktree(&cwd)?;
     }
@@ -1966,6 +2295,8 @@ mod tests {
                     commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
                     remote_branch: Some("feat/example".into()),
                     pull_request_url: None,
+                    verified: false,
+                    verification_message: None,
                 }),
             }),
         };
@@ -2067,6 +2398,79 @@ mod tests {
     }
 
     #[test]
+    fn side_effect_verification_rejects_effects_without_user_permission() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workflow = WorkflowRunMetadata {
+            action: "dev-work".into(),
+            operation_key: "b".repeat(64),
+            intent: "Inspect the selected issue.".into(),
+            issue_url: Some("https://github.com/owner/repo/issues/1".into()),
+            scope_paths: vec![],
+            requested_effects: vec![],
+            side_effects: None,
+        };
+        let effects = WorkflowSideEffects {
+            commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            remote_branch: None,
+            pull_request_url: None,
+            verified: false,
+            verification_message: None,
+        };
+
+        assert!(
+            verify_reported_side_effects(fixture.path(), &workflow, &effects)
+                .unwrap_err()
+                .contains("not explicitly permitted")
+        );
+    }
+
+    #[test]
+    fn side_effect_verification_confirms_a_local_commit_object() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet"]).status.success());
+        assert!(git(&["config", "user.name", "Fixture User"])
+            .status
+            .success());
+        assert!(git(&["config", "user.email", "fixture@example.invalid"])
+            .status
+            .success());
+        fs::write(fixture.path().join("tracked.txt"), "fixture").unwrap();
+        assert!(git(&["add", "tracked.txt"]).status.success());
+        assert!(git(&["commit", "--quiet", "-m", "fixture"])
+            .status
+            .success());
+        let sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let workflow = WorkflowRunMetadata {
+            action: "dev-work".into(),
+            operation_key: "c".repeat(64),
+            intent: "Commit the selected changes.".into(),
+            issue_url: Some("https://github.com/owner/repo/issues/1".into()),
+            scope_paths: vec![],
+            requested_effects: vec!["commit".into()],
+            side_effects: None,
+        };
+        let effects = WorkflowSideEffects {
+            commit_sha: Some(sha),
+            remote_branch: None,
+            pull_request_url: None,
+            verified: false,
+            verification_message: None,
+        };
+
+        assert!(verify_reported_side_effects(fixture.path(), &workflow, &effects).is_ok());
+    }
+
+    #[test]
     fn codex_preflight_allows_non_git_project_directories() {
         let fixture = tempfile::tempdir().unwrap();
         ensure_clean_git_worktree(fixture.path()).unwrap();
@@ -2162,7 +2566,6 @@ mod tests {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("first arg"), "{text}");
         assert!(text.contains("second arg"), "{text}");
-
         let ps_file = folder.join("run file.ps1");
         fs::write(
             &ps_file,

@@ -135,6 +135,7 @@ pub fn scan(
     let mut directories_scanned = 0;
     let mut was_cancelled = false;
     let mut root_error = None;
+    let mut tool_availability = HashMap::new();
 
     while let Some((path, depth)) = queue.pop_front() {
         if cancelled.load(Ordering::Relaxed) {
@@ -256,6 +257,7 @@ pub fn scan(
                         &canonical,
                         &names,
                         is_git_repository,
+                        &mut tool_availability,
                     ),
                 });
             }
@@ -533,6 +535,7 @@ fn workflow_prerequisites(
     path: &Path,
     names: &HashSet<String>,
     is_git_repository: bool,
+    tool_availability: &mut HashMap<String, bool>,
 ) -> Vec<WorkflowPrerequisite> {
     let mut required: Vec<(&str, Vec<&str>)> = Vec::new();
     if is_git_repository {
@@ -602,22 +605,55 @@ fn workflow_prerequisites(
             required_for: required_for.into_iter().map(str::to_owned).collect(),
             available: match name {
                 "gradle" => {
-                    executable_available(name)
+                    executable_available(name, tool_availability)
                         || path.join("gradlew").is_file()
                         || path.join("gradlew.bat").is_file()
                         || path.join("android/gradlew.bat").is_file()
                 }
-                _ => executable_available(name),
+                _ => executable_available(name, tool_availability),
             },
         })
         .collect()
 }
 
-fn executable_available(name: &str) -> bool {
+pub fn unavailable_workflow_prerequisites(path: &Path) -> Result<Vec<String>, String> {
+    let entries = fs::read_dir(path).map_err(|_| {
+        "Could not inspect project dependencies before starting the workflow.".to_string()
+    })?;
+    let mut names = HashSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            "Could not inspect project dependencies before starting the workflow.".to_string()
+        })?;
+        if entry
+            .metadata()
+            .map_err(|_| {
+                "Could not inspect project dependencies before starting the workflow.".to_string()
+            })?
+            .is_file()
+        {
+            names.insert(entry.file_name().to_string_lossy().to_lowercase());
+        }
+    }
+    let mut tool_availability = HashMap::new();
+    Ok(
+        workflow_prerequisites(path, &names, true, &mut tool_availability)
+            .into_iter()
+            .filter(|item| !item.available)
+            .map(|item| item.name)
+            .collect(),
+    )
+}
+
+fn executable_available(name: &str, cache: &mut HashMap<String, bool>) -> bool {
+    if let Some(available) = cache.get(name) {
+        return *available;
+    }
     let Some(path) = std::env::var_os("PATH") else {
+        cache.insert(name.to_owned(), false);
         return false;
     };
-    std::env::split_paths(&path).any(|folder| {
+    let available = std::env::split_paths(&path).any(|folder| {
         #[cfg(windows)]
         let candidates = [
             format!("{name}.exe"),
@@ -630,7 +666,9 @@ fn executable_available(name: &str) -> bool {
         candidates
             .iter()
             .any(|candidate| folder.join(candidate).is_file())
-    })
+    });
+    cache.insert(name.to_owned(), available);
+    available
 }
 
 fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitFacts {
@@ -1260,7 +1298,7 @@ mod tests {
         assert!(stacks.contains(&"Tauri".to_owned()));
         assert!(stacks.contains(&"React Native".to_owned()));
         assert!(stacks.contains(&"Android".to_owned()));
-        let prerequisites = workflow_prerequisites(root.path(), &names, false);
+        let prerequisites = workflow_prerequisites(root.path(), &names, false, &mut HashMap::new());
         assert!(prerequisites
             .iter()
             .any(|item| item.name == "cargo" && item.required_for.contains(&"Tauri".to_owned())));
@@ -1347,7 +1385,7 @@ mod tests {
 
     #[test]
     fn preserves_project_identity_across_rename_and_drops_removed_projects() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let original = root.path().join("before");
         fs::create_dir_all(&original).unwrap();
         fs::write(original.join("package.json"), "{}").unwrap();
@@ -1530,7 +1568,7 @@ mod tests {
 
     #[test]
     fn benchmarks_one_hundred_direct_child_projects_against_documented_targets() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         for index in 0..100 {
             let project = root.path().join(format!("project-{index:03}"));
             fs::create_dir_all(&project).unwrap();

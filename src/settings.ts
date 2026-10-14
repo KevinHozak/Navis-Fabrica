@@ -13,7 +13,11 @@ export type Settings = {
   preferences: Preferences;
   providers: ProviderProfile[];
   providerSelection: ProviderSelection;
+  githubAccounts: GitHubAccount[];
+  selectedGithubAccountId: string | null;
 };
+
+export type GitHubAccount = { id: string; login: string; credentialRef: string | null };
 
 export type SettingsInput = Omit<Settings, "schemaVersion">;
 
@@ -66,7 +70,7 @@ export type GitFacts = {
   branch: string | null;
   dirty: boolean | null;
   latestCommit: { shortHash: string; subject: string } | null;
-  remotes: { name: string; url: string | null }[];
+  remotes: { name: string; url: string | null; github: { owner: string; repository: string; canonicalUrl: string } | null }[];
   upstream: { status: "tracking" | "noUpstream" | "unavailable"; ahead: number | null; behind: number | null };
 };
 
@@ -93,12 +97,14 @@ export type ProjectScanFinished = {
 };
 
 export const defaultSettings: Settings = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   projectRoot: "C:\\Projects",
   exclusions: [".git", ".worktrees", "node_modules", "target"],
   preferences: { includeHidden: false, scanDepth: 3 },
   providers: [],
   providerSelection: { providerId: null, modelId: null, reasoningEffort: null, runtimeId: null },
+  githubAccounts: [],
+  selectedGithubAccountId: null,
 };
 
 const previewStorageKey = "navis-fabrica.settings.v1";
@@ -173,6 +179,8 @@ export async function loadSettings(): Promise<Settings> {
       providerSelection: candidate.providerSelection && typeof candidate.providerSelection === "object"
         ? candidate.providerSelection
         : defaultSettings.providerSelection,
+      githubAccounts: Array.isArray(candidate.githubAccounts) ? candidate.githubAccounts : defaultSettings.githubAccounts,
+      selectedGithubAccountId: typeof candidate.selectedGithubAccountId === "string" ? candidate.selectedGithubAccountId : null,
     };
   } catch {
     return defaultSettings;
@@ -183,7 +191,13 @@ export async function saveSettings(settings: SettingsInput): Promise<Settings> {
   if (isDesktopApp()) return invoke<Settings>("save_settings", { settings });
 
   validatePreviewSecretReferences(settings.providers);
-  const saved = { schemaVersion: 2, ...settings };
+  for (const account of settings.githubAccounts) {
+    const reference = account.credentialRef;
+    if (reference != null && !/^(credential-store|provider-managed):[a-zA-Z0-9.:/_-]+$/.test(reference)) {
+      throw new Error("Use an opaque credential-store: or provider-managed: reference; tokens are not accepted.");
+    }
+  }
+  const saved = { schemaVersion: 3, ...settings };
   localStorage.setItem(previewStorageKey, JSON.stringify(saved));
   return saved;
 }

@@ -43,3 +43,18 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 - `cargo test --locked --manifest-path src-tauri/Cargo.toml`: 21 passed. Fixtures cover unborn and detached HEAD, clean/dirty worktrees, sanitized remotes, no upstream, ahead/behind divergence, Tauri/mobile manifests, and prerequisite reporting.
 - `npm run build`: blocked because this worktree has no installed TypeScript executable. `npm ci --ignore-scripts --prefer-offline` failed inside npm with `Exit handler never called!`; frontend build/typecheck remains unverified.
 - Live desktop scanning and live repositories outside fixtures remain unverified.
+
+## GitHub-P1 auth and remote association (issue #14)
+
+### Fixture and build verification
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked github_`: 2 passed. Fixtures cover HTTPS/SSH/scp-style GitHub remotes, rejection of non-GitHub and malformed/HTTP remotes, opaque credential-reference validation, selected-account validation, and settings recovery.
+- Full `cargo test --manifest-path src-tauri/Cargo.toml --locked`: 25 passed, 2 failed for unrelated environment-sensitive checks. The rename fixture received Windows access denied while manipulating its temporary repository; the 100-project benchmark measured 5.32 seconds against its 5-second target. The issue-specific tests passed.
+- `npm.cmd ci --ignore-scripts --no-audit --no-fund`: passed (72 locked packages installed).
+- `npm run build`: TypeScript and Vite production build passed.
+- `git diff --check`: passed.
+
+### Live GitHub integration
+
+- Not run. This phase performs local, read-only remote parsing and stores optional account labels plus opaque credential references; no GitHub authentication adapter exists to verify credentials or repository access. The UI reports access as unchecked and continues to show local project data. No live access result is inferred from fixture tests.

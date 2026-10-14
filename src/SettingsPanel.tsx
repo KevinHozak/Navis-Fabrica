@@ -41,6 +41,8 @@ export function SettingsPanel() {
         preferences: settings.preferences,
         providers: settings.providers,
         providerSelection: settings.providerSelection,
+        githubAccounts: settings.githubAccounts,
+        selectedGithubAccountId: settings.selectedGithubAccountId,
       });
       setSettings(saved);
       setSaveState("saved");
@@ -100,6 +102,16 @@ export function SettingsPanel() {
           </label>
         </div>
 
+        <div className="settings-field">
+          <span>GitHub account association</span>
+          <select aria-label="Selected GitHub account" disabled={saving} value={settings.selectedGithubAccountId ?? ""} onChange={(event) => updateSettings({ ...settings, selectedGithubAccountId: event.target.value || null })}>
+            <option value="">No account selected</option>
+            {settings.githubAccounts.map((account) => <option key={account.id} value={account.id}>{account.login}</option>)}
+          </select>
+          <small>Remote matching is local and read-only. Account access is not checked until a supported GitHub adapter is available.</small>
+          <GitHubAccounts accounts={settings.githubAccounts} disabled={saving} onChange={(githubAccounts) => updateSettings({ ...settings, githubAccounts, selectedGithubAccountId: githubAccounts.some((account) => account.id === settings.selectedGithubAccountId) ? settings.selectedGithubAccountId : null })} />
+        </div>
+
         <div className="settings-actions">
           <p className={`settings-feedback ${saveState}`} role={saveState === "error" ? "alert" : "status"} aria-live="polite">
             {message || (desktop ? "Settings are ready to edit." : "Browser preview saves changes in this browser.")}
@@ -111,4 +123,22 @@ export function SettingsPanel() {
       </form>
     </section>
   );
+}
+
+function GitHubAccounts({ accounts, disabled, onChange }: { accounts: Settings["githubAccounts"]; disabled: boolean; onChange: (accounts: Settings["githubAccounts"]) => void }) {
+  const [login, setLogin] = useState("");
+  const [credentialRef, setCredentialRef] = useState("");
+  return <div className="provider-form">
+    {accounts.map((account) => <div className="settings-options" key={account.id}>
+      <span>{account.login} · {account.credentialRef ? "credential reference saved" : "auth reference not configured"}</span>
+      <button className="text-button" type="button" disabled={disabled} onClick={() => onChange(accounts.filter((item) => item.id !== account.id))}>Remove</button>
+    </div>)}
+    <label className="settings-field"><span>GitHub login</span><input maxLength={100} disabled={disabled} value={login} onChange={(event) => setLogin(event.target.value)} placeholder="account name" /></label>
+    <label className="settings-field"><span>Credential reference (optional)</span><input maxLength={260} disabled={disabled} value={credentialRef} onChange={(event) => setCredentialRef(event.target.value)} placeholder="credential-store:github-account" /><small>Use an opaque reference only. Never paste a token here.</small></label>
+    <button className="button button-secondary" type="button" disabled={disabled || !login.trim()} onClick={() => {
+      onChange([...accounts, { id: crypto.randomUUID(), login: login.trim(), credentialRef: credentialRef.trim() || null }]);
+      setLogin("");
+      setCredentialRef("");
+    }}>Add account</button>
+  </div>;
 }

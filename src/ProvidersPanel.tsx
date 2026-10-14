@@ -79,6 +79,8 @@ export function ProvidersPanel() {
         preferences: next.preferences,
         providers: next.providers,
         providerSelection: next.providerSelection,
+        githubAccounts: next.githubAccounts,
+        selectedGithubAccountId: next.selectedGithubAccountId,
       });
       setSettings(saved);
       if (desktop && saved.providers.length) setAvailability(await inspectProviders(saved.providers));

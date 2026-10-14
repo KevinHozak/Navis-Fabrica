@@ -38,7 +38,7 @@ fn project_fact_cache() -> &'static Mutex<HashMap<String, scanner::ProjectEntry>
     PROJECT_FACT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-const SETTINGS_SCHEMA_VERSION: u32 = 2;
+const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const SETTINGS_FILE: &str = "settings.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +66,16 @@ pub struct Settings {
     pub preferences: Preferences,
     pub providers: Vec<providers::ProviderProfile>,
     pub provider_selection: providers::ProviderSelection,
+    pub github_accounts: Vec<GitHubAccount>,
+    pub selected_github_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubAccount {
+    pub id: String,
+    pub login: String,
+    pub credential_ref: Option<String>,
 }
 
 impl Default for Settings {
@@ -82,6 +92,8 @@ impl Default for Settings {
             preferences: Preferences::default(),
             providers: Vec::new(),
             provider_selection: providers::ProviderSelection::default(),
+            github_accounts: Vec::new(),
+            selected_github_account_id: None,
         }
     }
 }
@@ -96,6 +108,10 @@ struct SettingsInput {
     providers: Vec<providers::ProviderProfile>,
     #[serde(default)]
     provider_selection: providers::ProviderSelection,
+    #[serde(default)]
+    github_accounts: Vec<GitHubAccount>,
+    #[serde(default)]
+    selected_github_account_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +256,18 @@ fn recover_settings(value: Value) -> Settings {
         (defaults.providers, defaults.provider_selection)
     };
 
+    let github_accounts = object
+        .get("githubAccounts")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<GitHubAccount>>(value).ok())
+        .filter(|accounts| validate_github_accounts(accounts, None).is_ok())
+        .unwrap_or_default();
+    let selected_github_account_id = object
+        .get("selectedGithubAccountId")
+        .and_then(Value::as_str)
+        .filter(|id| github_accounts.iter().any(|account| &account.id == *id))
+        .map(str::to_owned);
+
     Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         project_root,
@@ -250,6 +278,8 @@ fn recover_settings(value: Value) -> Settings {
         },
         providers,
         provider_selection,
+        github_accounts,
+        selected_github_account_id,
     }
 }
 
@@ -367,6 +397,10 @@ fn get_settings(app: AppHandle) -> Result<Settings, String> {
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, String> {
     providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
+    validate_github_accounts(
+        &settings.github_accounts,
+        settings.selected_github_account_id.as_deref(),
+    )?;
     let settings = Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         project_root: validate_project_root(&settings.project_root)?,
@@ -377,6 +411,8 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         },
         providers: settings.providers,
         provider_selection: settings.provider_selection,
+        github_accounts: settings.github_accounts,
+        selected_github_account_id: settings.selected_github_account_id,
     };
     if !(1..=8).contains(&settings.preferences.scan_depth) {
         return Err("Scan depth must be between 1 and 8.".into());
@@ -390,6 +426,48 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         });
     }
     Ok(settings)
+}
+
+fn validate_github_accounts(
+    accounts: &[GitHubAccount],
+    selected: Option<&str>,
+) -> Result<(), String> {
+    if accounts.len() > 20 {
+        return Err("Configure 20 or fewer GitHub accounts.".into());
+    }
+    let mut ids = Vec::new();
+    for account in accounts {
+        if account.id.trim().is_empty()
+            || account.id.len() > 80
+            || account.login.trim().is_empty()
+            || account.login.len() > 100
+            || account.id.chars().any(char::is_control)
+            || account.login.chars().any(char::is_control)
+            || ids.iter().any(|id: &String| id == &account.id)
+        {
+            return Err("GitHub account IDs and logins must be valid and unique.".into());
+        }
+        ids.push(account.id.clone());
+        if account.credential_ref.as_ref().is_some_and(|value| {
+            let key = value
+                .strip_prefix("credential-store:")
+                .or_else(|| value.strip_prefix("provider-managed:"));
+            value.len() > 260
+                || value.chars().any(char::is_control)
+                || key.is_none_or(|key| {
+                    key.is_empty()
+                        || !key
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || ".:/_-".contains(c))
+                })
+        }) {
+            return Err("Use an opaque credential-store: or provider-managed: reference; tokens are not accepted.".into());
+        }
+    }
+    if selected.is_some_and(|id| !accounts.iter().any(|account| account.id == id)) {
+        return Err("Select a configured GitHub account.".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -690,7 +768,7 @@ mod tests {
     #[test]
     fn defaults_are_schema_versioned_and_windows_friendly() {
         let settings = Settings::default();
-        assert_eq!(settings.schema_version, 2);
+        assert_eq!(settings.schema_version, 3);
         assert_eq!(settings.project_root, r"C:\Projects");
         assert_eq!(settings.preferences.scan_depth, 3);
     }
@@ -769,11 +847,35 @@ mod tests {
     fn leaves_settings_from_a_newer_schema_untouched() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = folder.path().join(SETTINGS_FILE);
-        fs::write(&path, r#"{"schemaVersion":3,"projectRoot":"C:\\Projects"}"#).unwrap();
+        fs::write(&path, r#"{"schemaVersion":4,"projectRoot":"C:\\Projects"}"#).unwrap();
         assert!(load_settings(&path).unwrap_err().contains("newer version"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            r#"{"schemaVersion":3,"projectRoot":"C:\\Projects"}"#
+            r#"{"schemaVersion":4,"projectRoot":"C:\\Projects"}"#
+        );
+    }
+
+    #[test]
+    fn github_account_settings_accept_only_opaque_references_and_valid_selection() {
+        let accounts = vec![GitHubAccount {
+            id: "personal".into(),
+            login: "kevin".into(),
+            credential_ref: Some("credential-store:github-personal".into()),
+        }];
+        assert!(validate_github_accounts(&accounts, Some("personal")).is_ok());
+        assert!(validate_github_accounts(&accounts, Some("missing")).is_err());
+        let mut secret_value = accounts.clone();
+        secret_value[0].credential_ref = Some("ghp_exampletoken".into());
+        assert!(validate_github_accounts(&secret_value, None).is_err());
+
+        let mut settings = Settings::default();
+        settings.github_accounts = accounts;
+        settings.selected_github_account_id = Some("personal".into());
+        let recovered = recover_settings(serde_json::to_value(settings).unwrap());
+        assert_eq!(recovered.github_accounts[0].login, "kevin");
+        assert_eq!(
+            recovered.selected_github_account_id.as_deref(),
+            Some("personal")
         );
     }
 

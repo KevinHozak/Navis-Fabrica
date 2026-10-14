@@ -324,3 +324,21 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .workflow-detail-columns ul { color: #8995a5; font-size: 10px; margin: 3px 0 0; padding-left: 16px; }
 .workflow-detail-columns li + li { margin-top: 3px; }
 @media (max-width: 600px) { .workflow-action-top { flex-direction: column; } }
+
+.runs-workspace { display: grid; gap: 18px; }
+.run-launch-form { display: grid; gap: 12px; padding: 16px 0; }
+.run-launch-form > label, .run-launch-options > label, .run-input-form > label { color: #aab5c3; display: grid; font-size: 11px; gap: 6px; }
+.run-launch-form input, .run-launch-form textarea, .run-input-form input { background: #0c1118; border: 1px solid #354252; border-radius: 7px; color: #e8eef6; font: inherit; min-width: 0; padding: 9px 10px; }
+.run-launch-form textarea { font-family: ui-monospace, Consolas, monospace; resize: vertical; }
+.run-launch-options { align-items: end; display: flex; flex-wrap: wrap; gap: 16px; }
+.run-launch-options > label:first-child { width: 150px; }
+.run-checkbox { align-items: center; display: flex !important; min-height: 36px; }
+.runs-layout { display: grid; gap: 18px; grid-template-columns: minmax(210px, 0.35fr) minmax(0, 1fr); }
+.run-list-panel, .run-detail-panel, .run-launch-panel { min-width: 0; padding: 18px; }
+.run-list-item { background: transparent; border: 1px solid transparent; border-radius: 8px; color: #dce5f0; cursor: pointer; display: grid; gap: 5px; margin-top: 7px; padding: 10px; text-align: left; width: 100%; }
+.run-list-item:hover, .run-list-item.selected { background: #151e29; border-color: #34465b; }
+.run-list-item span, .run-list-item small { color: #8995a5; overflow-wrap: anywhere; }
+.run-output { background: #080c11; border: 1px solid #293444; border-radius: 8px; color: #d6e0eb; font: 11px/1.55 ui-monospace, Consolas, monospace; max-height: 430px; min-height: 200px; overflow: auto; padding: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.run-input-form { align-items: end; display: flex; gap: 9px; }
+.run-input-form > label { flex: 1; }
+@media (max-width: 720px) { .runs-layout { grid-template-columns: 1fr; } }

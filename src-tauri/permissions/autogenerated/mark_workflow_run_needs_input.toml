@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mark-workflow-run-needs-input"
+description = "Enables the mark_workflow_run_needs_input command without any pre-configured scope."
+commands.allow = ["mark_workflow_run_needs_input"]
+
+[[permission]]
+identifier = "deny-mark-workflow-run-needs-input"
+description = "Denies the mark_workflow_run_needs_input command without any pre-configured scope."
+commands.deny = ["mark_workflow_run_needs_input"]

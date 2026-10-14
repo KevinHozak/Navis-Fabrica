@@ -93,6 +93,16 @@ export type GitHubIssue = GitHubIssueSummary & {
   blocked: boolean;
 };
 
+export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
+export type WorkflowRun = {
+  id: string; executable: string; cwd: string; mutating: boolean; state: string;
+  startedAtMs: number; finishedAtMs: number | null; exitCode: number | null;
+  nextSequence: number; events: WorkflowRunEvent[];
+};
+export type WorkflowRunRequest = {
+  executable: string; arguments: string[]; cwd: string; timeoutSeconds: number; mutating: boolean;
+};
+
 export type GitFacts = {
   status: "available" | "detached" | "unborn" | "unsafeOwnership" | "gitUnavailable" | "notRepository" | "error";
   branch: string | null;
@@ -192,6 +202,20 @@ export const listGitHubIssues = (owner: string, repository: string) =>
 
 export const getGitHubIssue = (owner: string, repository: string, reference: string) =>
   invoke<GitHubIssue>("get_github_issue", { owner, repository, reference });
+
+export const listWorkflowRuns = () => invoke<WorkflowRun[]>("list_workflow_runs");
+export const startWorkflowRun = (request: WorkflowRunRequest) =>
+  invoke<WorkflowRun>("start_workflow_run", { request });
+export const cancelWorkflowRun = (runId: string) =>
+  invoke<boolean>("cancel_workflow_run", { runId });
+export const markWorkflowRunNeedsInput = (runId: string) =>
+  invoke<boolean>("mark_workflow_run_needs_input", { runId });
+export const writeWorkflowRunInput = (runId: string, input: string) =>
+  invoke<boolean>("write_workflow_run_input", { runId, input });
+export const onWorkflowRunUpdated = (handler: (run: WorkflowRun) => void) =>
+  listen<WorkflowRun>("workflow-run-updated", (event) => handler(event.payload));
+export const onWorkflowRunEvent = (handler: (payload: [string, WorkflowRunEvent]) => void) =>
+  listen<[string, WorkflowRunEvent]>("workflow-run-event", (event) => handler(event.payload));
 
 export const onProjectScanProgress = (handler: (progress: ProjectScanProgress) => void) =>
   listen<ProjectScanProgress>("project-scan-progress", (event) => handler(event.payload));

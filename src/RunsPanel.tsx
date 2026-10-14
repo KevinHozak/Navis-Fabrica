@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { GitHubIssue, ProjectEntry, WorkflowRunMetadata } from "./settings";
 import {
   cancelWorkflowRun, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
-  respondCodexApproval, respondCodexUserInput, startCodexWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
+  loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
 } from "./settings";
 
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
@@ -25,6 +25,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [skills, setSkills] = useState<WorkflowSkillStatus[]>([]);
   const [respondedRequests, setRespondedRequests] = useState<Set<string>>(() => new Set());
   const [codexAnswers, setCodexAnswers] = useState<Record<string, Record<string, string>>>({});
+  const [selectedProviderKind, setSelectedProviderKind] = useState<string | null>(null);
   const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push">("dev-work");
   const [workflowIntent, setWorkflowIntent] = useState("");
   const [scopePathsText, setScopePathsText] = useState("");
@@ -51,15 +52,18 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   }, []);
 
   useEffect(() => setCwd(defaultCwd), [defaultCwd]);
+  useEffect(() => { loadSettings().then((settings) => setSelectedProviderKind(settings.providers.find((provider) => provider.id === settings.providerSelection.providerId)?.kind ?? null)).catch(() => setSelectedProviderKind(null)); }, []);
   useEffect(() => { discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
   const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0] ?? null, [runs, selectedId]);
 
-  async function startCodex(event: FormEvent) {
+  async function startAgent(event: FormEvent) {
     event.preventDefault();
     setError("");
     setBusy(true);
     try {
-      const run = await startCodexWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, skillId: codexSkill || null, timeoutSeconds: codexTimeout });
+      const run = selectedProviderKind === "antigravity"
+        ? await startAntigravityWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, timeoutSeconds: codexTimeout })
+        : await startCodexWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, skillId: codexSkill || null, timeoutSeconds: codexTimeout });
       setRuns((items) => [run, ...items.filter((item) => item.id !== run.id)].slice(0, 100));
       setSelectedId(run.id);
       setCodexPrompt("");
@@ -182,18 +186,19 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
     <section className="panel run-launch-panel" aria-labelledby="codex-run-title">
-      <div className="panel-heading"><div><h2 id="codex-run-title">Start Codex in this project</h2><p>Uses the selected Codex provider, model, and supported reasoning effort.</p></div></div>
+      <div className="panel-heading"><div><h2 id="codex-run-title">Start {selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"} in this project</h2><p>Uses the selected provider and model, plus settings supported by that runtime.</p></div></div>
       <div className="panel-rule" />
-      <form className="run-launch-form" onSubmit={(event) => { void startCodex(event); }}>
+      <form className="run-launch-form" onSubmit={(event) => { void startAgent(event); }}>
         <label>Project scope<input value={defaultCwd} readOnly aria-readonly="true" /></label>
-        <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
+        {selectedProviderKind !== "antigravity" && <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
           <option value="">No skill</option>{skills.filter((skill) => skill.status === "available" && skill.compatibleAgents.includes("Codex")).map((skill) => <option key={skill.id} value={skill.id}>{skill.id}</option>)}
-        </select></label>
-        <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder="Describe the work for Codex…" /></label>
+        </select></label>}
+        {selectedProviderKind === "antigravity" && <p className="registry-context-note">Antigravity CLI discovers workspace skills from .agents/skills and global CLI skills. Headless runs cannot pause for approvals or input; terminal tools run with the CLI sandbox. Structured progress and reasoning-effort options are unavailable in the installed CLI version.</p>}
+        <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder={`Describe the work for ${selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"}…`} /></label>
         <div className="run-launch-options">
           <label>Timeout (seconds)<input type="number" min={1} max={86400} value={codexTimeout} onChange={(event) => setCodexTimeout(Number(event.target.value))} /></label>
-          <p className="registry-context-note">Writes are limited to this project. Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision.</p>
-          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim()}>{busy ? "Starting…" : "Start Codex"}</button>
+          <p className="registry-context-note">{selectedProviderKind === "antigravity" ? "Git projects must have a clean worktree. The headless CLI cannot pause for approvals; tool permissions follow Antigravity CLI settings and sandbox policy." : "Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision."}</p>
+          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim() || !["codex", "antigravity"].includes(selectedProviderKind ?? "")}>{busy ? "Starting…" : `Start ${selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"}`}</button>
         </div>
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
@@ -231,11 +236,11 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           {selected.workflow?.sideEffects && <p className="registry-context-note">{selected.workflow.sideEffects.verified ? "Verified side effects: " : "Agent-reported side effects, not fully verified: "}{selected.workflow.sideEffects.commitSha ? `commit ${selected.workflow.sideEffects.commitSha} · ` : ""}{selected.workflow.sideEffects.remoteBranch ? `branch ${selected.workflow.sideEffects.remoteBranch} · ` : ""}{selected.workflow.sideEffects.pullRequestUrl ? <a href={selected.workflow.sideEffects.pullRequestUrl} target="_blank" rel="noreferrer">pull request</a> : ""}{selected.workflow.sideEffects.verificationMessage ? ` · ${selected.workflow.sideEffects.verificationMessage}` : ""}</p>}
           {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
           {selected.state === "needsInput" && selected.events.filter((item) => item.kind === "approvalRequest" || item.kind === "userInputRequest").map((item) => <CodexRequestCard key={`${item.sequence}-${item.kind}`} runId={selected.id} event={item} onResolved={(requestId) => setRespondedRequests((prior) => new Set(prior).add(requestId))} isResolved={(requestId) => respondedRequests.has(requestId)} />)}
-          {selected.state === "needsInput" && selected.provider !== "codex" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>
+          {selected.state === "needsInput" && selected.provider !== "codex" && selected.provider !== "antigravity" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>
             <label>Send process input (one line)<input value={input} onChange={(event) => setInput(event.target.value)} /></label>
             <button className="button button-secondary" type="submit" disabled={!input}>Send input</button>
           </form>}
-          {activeStates.has(selected.state) && selected.state !== "needsInput" && selected.provider !== "codex" && <button className="text-button" type="button" onClick={() => { void markNeedsInput(); }}>Mark as waiting for input</button>}
+          {activeStates.has(selected.state) && selected.state !== "needsInput" && selected.provider !== "codex" && selected.provider !== "antigravity" && <button className="text-button" type="button" onClick={() => { void markNeedsInput(); }}>Mark as waiting for input</button>}
           {selected.exitCode !== null && <p className="registry-context-note">Exit code {selected.exitCode}</p>}
         </> : <div className="empty-state"><h3>Nothing running yet</h3><p>Start a configured executable to see sequence-numbered output here.</p></div>}
       </section>

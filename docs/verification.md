@@ -1,6 +1,6 @@
-﻿# Initial scaffold verification
+﻿# Verification history
 
-The initial scaffold delivered only the basic structure. Later phase work is recorded below; workflow execution, model routing, and live provider runs remain outside the completed phases so far.
+The initial scaffold delivered only the basic structure. Its original verification is followed by phase-specific delivery evidence below.
 
 - `npm install --ignore-scripts`: locked dependencies installed; audit reported zero vulnerabilities.
 - `npm run build`: TypeScript and Vite production build passed.
@@ -72,3 +72,19 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 ### Live GitHub integration
 
 - The connected GitHub integration read issue #16 successfully. The desktop app's direct API calls, native dependency lookup, and repository issue picker were not exercised live in this environment; no live blocker or PR-link behavior is claimed.
+
+## Providers-P3 Antigravity coding adapter (issue #23)
+
+- Installed Windows CLI probe: `agy --version` reported `1.0.10`. The executable is `agy.exe` on PATH.
+- Installed-version noninteractive surface: `agy --sandbox --print-timeout <seconds>s --model <slug> --print <prompt>`. The installed `1.0.10` help exposes model selection, sandbox, print mode, and timeout; it does not expose the newer docs' `--output-format` or `--effort` flags. stdout/stderr are streamed through the run manager and cancellation terminates the process tree. Output is plain text/diagnostics, not structured per-step events.
+- Skills: the CLI automatically discovers workspace skills under `.agents/skills` and its global Antigravity CLI skill folder. This adapter does not inject Codex-specific skill files.
+- Headless limitations: approval requests, interactive user input, and resumable checkpoints are unsupported. The CLI permission policy may soft-deny tools that require interactive approval; the adapter never passes `--dangerously-skip-permissions`.
+- Provider probe runs `agy --version` and `agy models` from a disposable temporary directory and omits raw diagnostics. The local model probe returned “Please sign in to view available models”; the profile is not authenticated in this environment. This is an explicit unavailable state, not evidence of a broken installation.
+- A live model run in a Windows temporary repository was not possible because Antigravity authentication is unavailable. No live provider response is claimed. Rust fixtures cover installed-version argument construction and the declared capability matrix.
+- Official references: [Headless mode](https://www.antigravity.google/docs/cli/headless/), [Agent skills](https://www.antigravity.google/docs/skills?tab=ide), and [CLI permissions](https://www.antigravity.google/docs/cli/modes).
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked providers::tests::antigravity -- --nocapture`: 2 passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml --locked`: passed.
+- `git diff --check`: passed.
+- `npm run build`: unavailable because `tsc` is not installed in this worktree; frontend typecheck/build remains unverified.
+- Full Rust suite: `cargo test --manifest-path src-tauri/Cargo.toml --locked` — 52 passed, 3 failed outside the changed adapter. The Windows project-rename fixture hit access denied; the Codex preflight fixture's temporary `git init` returned failure; and the 100-project scanner benchmark took 5.88 s against the 5 s target. The focused Antigravity tests and native compile check passed.

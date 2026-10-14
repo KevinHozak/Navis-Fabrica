@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window access to the settings read and write commands only.",
+  "description": "Main window access to saved settings and bounded project discovery events.",
   "windows": ["main"],
-  "permissions": ["allow-get-settings", "allow-save-settings"]
+  "permissions": [
+    "allow-get-settings",
+    "allow-save-settings",
+    "allow-start-project-scan",
+    "allow-cancel-project-scan",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
 }

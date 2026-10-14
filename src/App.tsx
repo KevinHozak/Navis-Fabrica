@@ -1,8 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { SettingsPanel } from "./SettingsPanel";
+import {
+  cancelProjectScan,
+  isDesktopApp,
+  loadSettings,
+  onProjectScanFinished,
+  onProjectScanProgress,
+  ProjectEntry,
+  ProjectScanFinished,
+  ProjectScanProgress,
+  startProjectScan,
+} from "./settings";
 
 type Section = "projects" | "runs" | "providers" | "settings";
-type PreviewState = "ready" | "loading" | "empty" | "error";
+type ScanStatus = "idle" | "scanning" | "cancelling" | "complete" | "cancelled" | "error";
 
 const sections: { id: Section; label: string; icon: string }[] = [
   { id: "projects", label: "Projects", icon: "◫" },
@@ -18,10 +29,16 @@ function sectionFromHash(): Section {
 
 function App() {
   const [section, setSection] = useState<Section>(sectionFromHash);
-  const [preview, setPreview] = useState<PreviewState>(() => {
-    const candidate = new URLSearchParams(window.location.search).get("demo");
-    return candidate === "loading" || candidate === "empty" || candidate === "error" ? candidate : "ready";
-  });
+  const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
+  const [scanId, setScanId] = useState("");
+  const [progress, setProgress] = useState<ProjectScanProgress | null>(null);
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
+  const [scanError, setScanError] = useState("");
+  const [projectRoot, setProjectRoot] = useState("C:\\Projects");
+  const activeScanId = useRef("");
+  const cancelRequested = useRef(false);
+  const desktop = isDesktopApp();
 
   useEffect(() => {
     const handleNavigation = () => setSection(sectionFromHash());
@@ -31,16 +48,90 @@ function App() {
 
   useEffect(() => {
     document.title = `Navis-Fabrica · v${__APP_VERSION__}`;
+    loadSettings().then((settings) => setProjectRoot(settings.projectRoot)).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let active = true;
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenFinished: (() => void) | undefined;
+
+    onProjectScanProgress((next) => {
+      if (active && next.scanId === activeScanId.current) setProgress(next);
+    }).then((stop) => {
+      if (active) unlistenProgress = stop;
+      else stop();
+    }).catch((error: unknown) => {
+      if (active) {
+        setScanStatus("error");
+        setScanError(error instanceof Error ? error.message : String(error));
+      }
+    });
+    onProjectScanFinished((result) => {
+      if (!active || result.scanId !== activeScanId.current) return;
+      setScanResult(result);
+      setProjects(result.projects);
+      setScanError(result.fatalError ?? "");
+      setScanStatus(result.fatalError ? "error" : result.cancelled ? "cancelled" : "complete");
+    }).then((stop) => {
+      if (active) unlistenFinished = stop;
+      else stop();
+    }).catch((error: unknown) => {
+      if (active) {
+        setScanStatus("error");
+        setScanError(error instanceof Error ? error.message : String(error));
+      }
+    });
+
+    return () => {
+      active = false;
+      unlistenProgress?.();
+      unlistenFinished?.();
+    };
+  }, [desktop]);
 
   const current = sections.find((item) => item.id === section) ?? sections[0];
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Recent runs" : "Connected providers";
-  const emptyTitle = preview === "empty"
-    ? section === "projects" ? "No projects here yet" : section === "runs" ? "No runs yet" : "No providers connected"
-    : "A little room to grow";
-  const emptyDescription = preview === "empty"
-    ? section === "projects" ? "Add a project to begin shaping your workspace." : section === "runs" ? "Completed and active work will appear here." : "Provider connections will appear here once configured."
-    : "This section is ready for a future phase.";
+  const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
+
+  async function beginScan() {
+    if (!desktop) {
+      setScanStatus("error");
+      setScanError("Project scanning is available in the Navis-Fabrica desktop app.");
+      return;
+    }
+    const id = crypto.randomUUID();
+    activeScanId.current = id;
+    cancelRequested.current = false;
+    setScanId(id);
+    setScanStatus("scanning");
+    setProjects([]);
+    setScanResult(null);
+    setProgress(null);
+    setScanError("");
+    try {
+      const settings = await loadSettings();
+      setProjectRoot(settings.projectRoot);
+      await startProjectScan(id);
+      if (cancelRequested.current) await cancelProjectScan(id);
+    } catch (error) {
+      setScanStatus("error");
+      setScanError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function stopScan() {
+    if (!scanId) return;
+    setScanStatus("cancelling");
+    try {
+      const accepted = await cancelProjectScan(scanId);
+      if (!accepted) cancelRequested.current = true;
+    } catch (error) {
+      setScanStatus("scanning");
+      setScanError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -73,16 +164,7 @@ function App() {
       <div className="main-column">
         <header className="toolbar">
           <div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{current.label}</strong></div>
-          <div className="toolbar-actions">
-            <label className="preview-control">
-              <span>Preview state</span>
-              <select aria-label="Preview a fixture state" value={preview} onChange={(event) => setPreview(event.target.value as PreviewState)}>
-                <option value="ready">Default</option><option value="loading">Loading</option><option value="empty">Empty</option><option value="error">Error</option>
-              </select>
-            </label>
-            <span className="toolbar-divider" />
-            <button className="avatar" type="button" aria-label="Local profile">K</button>
-          </div>
+          <div className="toolbar-actions"><span className="toolbar-divider" /><button className="avatar" type="button" aria-label="Local profile">K</button></div>
         </header>
 
         <main id="main-content" className="content" tabIndex={-1}>
@@ -92,7 +174,9 @@ function App() {
               <h1>{section === "projects" ? "Projects" : current.label}</h1>
               <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : `${current.label} will live here as the foundation grows.`}</p>
             </div>
-            {section === "projects" && <button className="button button-primary" type="button" disabled title="Project discovery arrives in a later phase"><span aria-hidden="true">＋</span> Add project</button>}
+            {section === "projects" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : beginScan} disabled={scanStatus === "cancelling"}>
+              <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : "Scan projects"}
+            </button>}
           </div>
 
           {section === "settings" ? (
@@ -100,20 +184,40 @@ function App() {
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">
-                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? "Project discovery is planned for a future phase." : "This workspace section is part of the foundation shell."}</p></div>
-                <button className="icon-button" type="button" aria-label="More project options" disabled>···</button>
+                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? `Scanning ${projectRoot} and its configured folders.` : "This workspace section is part of the foundation shell."}</p></div>
+                <span className="project-count" aria-live="polite">{section === "projects" ? projects.length : ""}</span>
               </div>
               <div className="panel-rule" />
-              {preview === "loading" ? (
-                <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>Finding your projects</strong><p>Looking through your workspace…</p></div></div>
-              ) : preview === "error" ? (
-                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t open this folder</strong><p>Check that the location exists and that this app can access it.</p><button className="text-button" type="button" onClick={() => setPreview("ready")}>Try again</button></div></div>
+
+              {section !== "projects" ? (
+                <div className="empty-state"><h3>A little room to grow</h3><p>This section is ready for a future phase.</p></div>
+              ) : scanning ? (
+              <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{scanError || (progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…")}</p></div></div>
+              ) : scanStatus === "error" ? (
+                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t scan this folder</strong><p>{scanError}</p><button className="text-button" type="button" onClick={beginScan}>Try again</button></div></div>
+              ) : projects.length > 0 ? (
+                <>
+                  {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
+                  {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing projects found so far.</div>}
+                  <ul className="project-list">
+                    {projects.map((project) => <li className="project-row" key={project.id}>
+                      <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
+                      <div className="project-details"><strong>{project.name}</strong><span>{project.path}</span></div>
+                      <div className="project-tags">
+                        {project.isGitRepository && <span className="project-tag">Git</span>}
+                        {project.isWorktree && <span className="project-tag">Worktree</span>}
+                        {project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>)}
+                      </div>
+                    </li>)}
+                  </ul>
+                </>
               ) : (
                 <div className="empty-state">
                   <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="orbit orbit-three" /><span className="empty-spark spark-one">✦</span><span className="empty-spark spark-two">·</span><span className="folder-shape"><span /></span></div>
-                  <h3>{emptyTitle}</h3>
-                  <p>{emptyDescription}</p>
-                  {section === "projects" && <button className="button button-secondary" type="button" disabled title="Project discovery arrives in a later phase">＋ Add your first project</button>}
+                  <h3>{scanStatus === "complete" ? scanResult?.errors.length ? "Scan partly complete" : "No projects found" : scanStatus === "cancelled" ? "Scan cancelled" : "Ready when you are"}</h3>
+                  <p>{scanStatus === "complete" ? scanResult?.errors.length ? `Some folders under ${projectRoot} could not be inspected.` : `No coding projects were found under ${projectRoot}.` : scanStatus === "cancelled" ? `The scan stopped after checking ${scanResult?.directoriesScanned ?? 0} folders.` : "Scan your configured workspace to find coding projects and repositories."}</p>
+                  {scanResult?.errors.length ? <details className="scan-notice"><summary>Show scan issues ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul></details> : null}
+                  {scanStatus === "idle" && <button className="button button-secondary" type="button" onClick={beginScan}>↻ Scan workspace</button>}
                 </div>
               )}
             </section>

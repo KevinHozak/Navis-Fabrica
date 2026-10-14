@@ -17,5 +17,19 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 
 - The main sections use hash navigation (`#projects`, `#runs`, `#providers`, `#settings`) so browser history and the Tauri webview share the same navigation behavior.
 - Settings remain a shell-only placeholder in Foundation-P1. Root persistence, validation and app-specific storage are deferred to Foundation-P2; no project scanning is performed in this phase.
-- To preview the project panel fixtures, use the toolbar's **Preview state** selector, or open the app with `?demo=loading`, `?demo=empty`, or `?demo=error`. These are UI fixtures, not live filesystem results.
+- At the Foundation-P1 stage, the project panel used preview-state fixtures (`?demo=loading`, `?demo=empty`, or `?demo=error`); Discovery-P1 replaces that panel with live desktop scanning.
 - The window and document title include the current package version. The shell uses system fonts and supports keyboard focus, narrow viewports, and reduced motion.
+
+## Discovery-P1 bounded project scanner (issue #11)
+
+### Fixture and compile verification
+
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml`: 12 tests passed on Windows. Fixtures cover spaces in paths, nested Git/coding projects, `.git` worktree pointer files, depth/hidden/exclusion settings, missing and non-folder roots, cancellation, broken worktree metadata, and partial results. Unix-only permission-denied root/subfolder and duplicate-alias fixtures are present but were not run on Windows.
+- `cargo check --locked --manifest-path src-tauri/Cargo.toml`: passed.
+- `npm run build`: TypeScript and Vite production build passed.
+- A Windows symlink/junction cycle fixture was not run: creating a directory symlink failed with Windows error 1314 (required privilege not held). Unix builds run the duplicate-alias symlink fixture.
+- An ACL-denied root was not exercised in this Windows environment. Unix fixtures exercise permission-denied roots and subfolders where the test user can enforce directory permissions. The scanner reports canonicalization and directory-read failures and preserves results from other folders.
+
+### Live desktop integration
+
+- Not run in this change. The Tauri window was not launched to invoke a scan against the configured live root. Native command compilation and scanner cancellation fixtures passed; end-to-end event delivery and desktop UI behavior remain unverified.

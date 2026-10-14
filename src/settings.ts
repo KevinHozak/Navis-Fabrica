@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type Preferences = {
   includeHidden: boolean;
@@ -14,6 +15,31 @@ export type Settings = {
 
 export type SettingsInput = Omit<Settings, "schemaVersion">;
 
+export type ProjectEntry = {
+  id: string;
+  name: string;
+  path: string;
+  isGitRepository: boolean;
+  isWorktree: boolean;
+  detectedStacks: string[];
+};
+
+export type ProjectScanProgress = {
+  scanId: string;
+  directoriesScanned: number;
+  projectsFound: number;
+  currentPath: string;
+};
+
+export type ProjectScanFinished = {
+  scanId: string;
+  projects: ProjectEntry[];
+  errors: string[];
+  directoriesScanned: number;
+  cancelled: boolean;
+  fatalError: string | null;
+};
+
 export const defaultSettings: Settings = {
   schemaVersion: 1,
   projectRoot: "C:\\Projects",
@@ -24,6 +50,18 @@ export const defaultSettings: Settings = {
 const previewStorageKey = "navis-fabrica.settings.v1";
 
 export const isDesktopApp = () => isTauri();
+
+export const startProjectScan = (scanId: string) =>
+  invoke<void>("start_project_scan", { scanId });
+
+export const cancelProjectScan = (scanId: string) =>
+  invoke<boolean>("cancel_project_scan", { scanId });
+
+export const onProjectScanProgress = (handler: (progress: ProjectScanProgress) => void) =>
+  listen<ProjectScanProgress>("project-scan-progress", (event) => handler(event.payload));
+
+export const onProjectScanFinished = (handler: (result: ProjectScanFinished) => void) =>
+  listen<ProjectScanFinished>("project-scan-finished", (event) => handler(event.payload));
 
 export async function loadSettings(): Promise<Settings> {
   if (isDesktopApp()) return invoke<Settings>("get_settings");

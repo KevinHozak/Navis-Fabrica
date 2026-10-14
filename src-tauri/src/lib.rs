@@ -1,10 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use tauri::{AppHandle, Manager};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, OnceLock};
+use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
+
+mod scanner;
+
+static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn active_scans() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    ACTIVE_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "settings.json";
@@ -314,10 +325,73 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
     Ok(settings)
 }
 
+#[tauri::command]
+fn start_project_scan(app: AppHandle, scan_id: String) -> Result<(), String> {
+    if scan_id.is_empty()
+        || scan_id.len() > 80
+        || !scan_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("The scan identifier is invalid.".into());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    {
+        let mut scans = active_scans()
+            .lock()
+            .map_err(|_| "Could not access active scans.".to_string())?;
+        if !scans.is_empty() {
+            return Err("A project scan is already running.".into());
+        }
+        scans.insert(scan_id.clone(), cancellation.clone());
+    }
+
+    std::thread::spawn(move || {
+        let options = scanner::ScanOptions {
+            depth: settings.preferences.scan_depth,
+            include_hidden: settings.preferences.include_hidden,
+            exclusions: settings.exclusions,
+        };
+        let result = scanner::scan(
+            &scan_id,
+            Path::new(&settings.project_root),
+            &options,
+            &cancellation,
+            |progress| {
+                let _ = app.emit("project-scan-progress", progress);
+            },
+        );
+        if let Ok(mut scans) = active_scans().lock() {
+            scans.remove(&scan_id);
+        }
+        let _ = app.emit("project-scan-finished", result);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_project_scan(scan_id: String) -> Result<bool, String> {
+    let scans = active_scans()
+        .lock()
+        .map_err(|_| "Could not access active scans.".to_string())?;
+    if let Some(cancellation) = scans.get(&scan_id) {
+        cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            save_settings,
+            start_project_scan,
+            cancel_project_scan
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Navis-Fabrica");
 }
@@ -385,5 +459,15 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             r#"{"schemaVersion":2,"projectRoot":"C:\\Projects"}"#
         );
+    }
+
+    #[test]
+    fn rejects_invalid_scan_identifiers() {
+        assert!(!"bad/scan"
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-'));
+        assert!("a"
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-'));
     }
 }

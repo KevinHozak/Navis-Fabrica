@@ -328,11 +328,13 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .runs-workspace { display: grid; gap: 18px; }
 .run-launch-form { display: grid; gap: 12px; padding: 16px 0; }
 .run-launch-form > label, .run-launch-options > label, .run-input-form > label { color: #aab5c3; display: grid; font-size: 11px; gap: 6px; }
-.run-launch-form input, .run-launch-form textarea, .run-input-form input { background: #0c1118; border: 1px solid #354252; border-radius: 7px; color: #e8eef6; font: inherit; min-width: 0; padding: 9px 10px; }
+.run-launch-form input, .run-launch-form textarea, .run-launch-form select, .run-input-form input { background: #0c1118; border: 1px solid #354252; border-radius: 7px; color: #e8eef6; font: inherit; min-width: 0; padding: 9px 10px; }
 .run-launch-form textarea { font-family: ui-monospace, Consolas, monospace; resize: vertical; }
 .run-launch-options { align-items: end; display: flex; flex-wrap: wrap; gap: 16px; }
 .run-launch-options > label:first-child { width: 150px; }
 .run-checkbox { align-items: center; display: flex !important; min-height: 36px; }
+.run-effect-options { border: 1px solid #354252; border-radius: 8px; display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 0; padding: 8px 12px 12px; }
+.run-effect-options legend { color: #aab5c3; font-size: 11px; padding: 0 5px; }
 .runs-layout { display: grid; gap: 18px; grid-template-columns: minmax(210px, 0.35fr) minmax(0, 1fr); }
 .run-list-panel, .run-detail-panel, .run-launch-panel { min-width: 0; padding: 18px; }
 .run-list-item { background: transparent; border: 1px solid transparent; border-radius: 8px; color: #dce5f0; cursor: pointer; display: grid; gap: 5px; margin-top: 7px; padding: 10px; text-align: left; width: 100%; }

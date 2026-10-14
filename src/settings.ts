@@ -102,8 +102,21 @@ export type WorkflowRun = {
   id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; mutating: boolean; state: string;
   startedAtMs: number; finishedAtMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
+  workflow: WorkflowRunMetadata | null;
 };
-export type CodexStartRequest = { cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number };
+export type WorkflowRunMetadata = {
+  action: "dev-work" | "dev-push";
+  operationKey: string;
+  intent: string;
+  issueUrl: string | null;
+  scopePaths: string[];
+  requestedEffects: ("commit" | "push" | "createPullRequest")[];
+  sideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null;
+};
+export type CodexStartRequest = {
+  cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number;
+  workflow?: WorkflowRunMetadata;
+};
 export type AntigravityStartRequest = { cwd: string; prompt: string; timeoutSeconds: number };
 export type WorkflowRunRequest = {
   executable: string; arguments: string[]; cwd: string; timeoutSeconds: number; mutating: boolean;

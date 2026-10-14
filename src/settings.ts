@@ -108,6 +108,17 @@ export type WorkflowPrerequisite = {
   available: boolean;
 };
 
+export type WorkflowSkillStatus = {
+  id: "dev-work" | "dev-push" | "dev-build";
+  status: "available" | "missing" | "unavailable" | "incompatible";
+  compatibleAgents: string[];
+};
+
+export async function discoverWorkflowSkills(): Promise<WorkflowSkillStatus[]> {
+  if (!isTauri()) return ["dev-work", "dev-push", "dev-build"].map((id) => ({ id: id as WorkflowSkillStatus["id"], status: "unavailable", compatibleAgents: [] }));
+  return invoke<WorkflowSkillStatus[]>("discover_workflow_skills");
+}
+
 export type ProjectScanProgress = {
   scanId: string;
   directoriesScanned: number;

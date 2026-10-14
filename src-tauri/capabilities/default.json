@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-get-settings",
+    "allow-discover-workflow-skills",
     "allow-save-settings",
     "allow-start-project-scan",
     "allow-cancel-project-scan",

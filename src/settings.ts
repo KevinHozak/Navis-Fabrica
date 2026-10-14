@@ -65,6 +65,20 @@ export type ProjectEntry = {
   workflowPrerequisites: WorkflowPrerequisite[];
 };
 
+export type GitHubActivity = {
+  owner: string;
+  repository: string;
+  repositoryUrl: string;
+  issuesUrl: string;
+  pullsUrl: string;
+  issueCount: number | null;
+  pullRequestCount: number | null;
+  recentCommits: { hash: string; subject: string; url: string }[];
+  checkedAt: string | null;
+  remoteStatus: "unchecked" | "fresh" | "rateLimited" | "unauthorized" | "authExpired" | "unavailable";
+  authentication: "notConfigured" | "available" | "expired";
+};
+
 export type GitFacts = {
   status: "available" | "detached" | "unborn" | "unsafeOwnership" | "gitUnavailable" | "notRepository" | "error";
   branch: string | null;
@@ -141,6 +155,12 @@ export const cancelProjectScan = (scanId: string) =>
 
 export const inspectProviders = (profiles: ProviderProfile[]) =>
   invoke<ProviderAvailability[]>("inspect_providers", { profiles });
+
+export const getCachedGitHubActivity = (owner: string, repository: string) =>
+  invoke<GitHubActivity>("get_cached_github_activity", { owner, repository });
+
+export const refreshGitHubActivity = (owner: string, repository: string) =>
+  invoke<GitHubActivity>("refresh_github_activity", { owner, repository });
 
 export const onProjectScanProgress = (handler: (progress: ProjectScanProgress) => void) =>
   listen<ProjectScanProgress>("project-scan-progress", (event) => handler(event.payload));

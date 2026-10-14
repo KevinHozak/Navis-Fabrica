@@ -223,6 +223,11 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .detail-group { display: grid; gap: 7px; margin-top: 16px; color: #98a7b8; font-size: 10px; line-height: 1.45; }
 .detail-group > strong { color: #cbd7e5; font-size: 10px; font-weight: 600; }
 .detail-break { overflow-wrap: anywhere; }
+.github-activity a { color: #9dcbf4; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.github-activity-counts { display: flex; flex-wrap: wrap; gap: 10px; }
+.github-freshness { color: #8090a3; }
+.github-commit { font-size: 9px; }
+.github-activity .text-button { justify-self: start; margin-top: 2px; }
 .project-detail-tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .empty-detail { display: flex; flex-direction: column; justify-content: center; }
 .empty-detail p { color: #8995a5; font-size: 10px; line-height: 1.6; }

@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-refresh-github-activity"
+description = "Enables the refresh_github_activity command without any pre-configured scope."
+commands.allow = ["refresh_github_activity"]
+
+[[permission]]
+identifier = "deny-refresh-github-activity"
+description = "Denies the refresh_github_activity command without any pre-configured scope."
+commands.deny = ["refresh_github_activity"]

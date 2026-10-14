@@ -205,7 +205,16 @@ function App() {
                   <ul className="project-list">
                     {projects.map((project) => <li className="project-row" key={project.id}>
                       <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
-                      <div className="project-details"><strong>{project.name}</strong><span>{project.path}</span></div>
+                      <div className="project-details"><strong>{project.name}</strong><span>{project.path}</span>
+                        {project.git.status === "available" ? <span className="project-facts">
+                          {project.git.branch ? `Branch ${project.git.branch}` : "Branch unavailable"}
+                          {project.git.dirty === true ? " · Uncommitted changes" : project.git.dirty === false ? " · Clean" : ""}
+                          {project.git.latestCommit ? ` · ${project.git.latestCommit.shortHash} ${project.git.latestCommit.subject}` : ""}
+                          {project.git.upstream.status === "tracking" ? ` · ↑${project.git.upstream.ahead ?? 0} ↓${project.git.upstream.behind ?? 0}` : project.git.upstream.status === "noUpstream" ? " · No upstream" : " · Upstream status unavailable"}
+                        </span> : project.isGitRepository ? <span className="project-facts">{gitStatusLabel(project.git.status)}</span> : null}
+                        {project.git.remotes.length > 0 && <span className="project-facts">Remotes: {project.git.remotes.map((remote) => remote.url ? `${remote.name} ${remote.url}` : remote.name).join(" · ")}</span>}
+                        {project.workflowPrerequisites.length > 0 && <span className="project-facts">Tools: {project.workflowPrerequisites.map((tool) => `${tool.name} ${tool.available ? "available" : "missing"}`).join(" · ")}</span>}
+                      </div>
                       <div className="project-tags">
                         {project.isGitRepository && <span className="project-tag">Git</span>}
                         {project.isWorktree && <span className="project-tag">Worktree</span>}
@@ -234,3 +243,14 @@ function App() {
 }
 
 export default App;
+
+function gitStatusLabel(status: string): string {
+  switch (status) {
+    case "detached": return "Git · Detached HEAD";
+    case "unborn": return "Git · No commits yet";
+    case "unsafeOwnership": return "Git · Ownership needs attention";
+    case "gitUnavailable": return "Git · Git executable unavailable";
+    case "notRepository": return "Git · Repository metadata unavailable";
+    default: return "Git · Inspection unavailable";
+  }
+}

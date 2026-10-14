@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_DIRECTORIES: usize = 20_000;
@@ -24,6 +25,51 @@ pub struct ProjectEntry {
     pub is_git_repository: bool,
     pub is_worktree: bool,
     pub detected_stacks: Vec<String>,
+    pub git: GitFacts,
+    pub workflow_prerequisites: Vec<WorkflowPrerequisite>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFacts {
+    /// available, detached, unborn, unsafeOwnership, gitUnavailable, notRepository, or error
+    pub status: String,
+    pub branch: Option<String>,
+    pub dirty: Option<bool>,
+    pub latest_commit: Option<LatestCommit>,
+    pub remotes: Vec<GitRemote>,
+    pub upstream: UpstreamDivergence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestCommit {
+    pub short_hash: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemote {
+    pub name: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamDivergence {
+    /// tracking, noUpstream, or unavailable
+    pub status: String,
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPrerequisite {
+    pub name: String,
+    pub required_for: Vec<String>,
+    pub available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,7 +205,7 @@ pub fn scan(
                 }
             }
         }
-        let detected_stacks = detect_stacks(&names);
+        let detected_stacks = detect_stacks(&canonical, &names);
         if is_git_repository || !detected_stacks.is_empty() {
             let key = path_key(&canonical);
             if project_ids.contains(&key) {
@@ -182,6 +228,12 @@ pub fn scan(
                     is_git_repository,
                     is_worktree,
                     detected_stacks,
+                    git: inspect_git(&canonical, is_git_repository),
+                    workflow_prerequisites: workflow_prerequisites(
+                        &canonical,
+                        &names,
+                        is_git_repository,
+                    ),
                 });
             }
         }
@@ -311,7 +363,7 @@ fn git_marker(path: &Path, errors: &mut Vec<String>) -> (bool, bool) {
     }
 }
 
-fn detect_stacks(names: &HashSet<String>) -> Vec<String> {
+fn detect_stacks(path: &Path, names: &HashSet<String>) -> Vec<String> {
     let markers = [
         ("package.json", "Node.js"),
         ("cargo.toml", "Rust"),
@@ -324,7 +376,7 @@ fn detect_stacks(names: &HashSet<String>) -> Vec<String> {
         ("pom.xml", "Java"),
         ("build.gradle", "Java"),
         ("build.gradle.kts", "Kotlin/Gradle"),
-        ("*.sln", " .NET"),
+        ("*.sln", ".NET"),
         ("*.csproj", ".NET"),
     ];
     let mut stacks = Vec::new();
@@ -338,7 +390,373 @@ fn detect_stacks(names: &HashSet<String>) -> Vec<String> {
             stacks.push(stack.trim().to_owned());
         }
     }
+    if names.contains("tauri.conf.json")
+        || path.join("src-tauri/tauri.conf.json").is_file()
+        || path.join("src-tauri/tauri.conf.json5").is_file()
+    {
+        stacks.push("Tauri".to_owned());
+    }
+    if path.join("src-tauri/Cargo.toml").is_file() && !stacks.iter().any(|stack| stack == "Rust") {
+        stacks.push("Rust".to_owned());
+    }
+    if names.contains("pubspec.yaml") {
+        stacks.push("Flutter".to_owned());
+    }
+    if path.join("android/build.gradle").is_file()
+        || path.join("android/build.gradle.kts").is_file()
+    {
+        stacks.push("Android".to_owned());
+    }
+    let ios_project = path.join("ios").read_dir().is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with(".xcodeproj")
+        })
+    });
+    if path.join("ios/Podfile").is_file() || ios_project {
+        stacks.push("iOS".to_owned());
+    }
+    if package_uses(path, "expo") {
+        stacks.push("Expo".to_owned());
+    } else if package_uses(path, "react-native") {
+        stacks.push("React Native".to_owned());
+    }
     stacks
+}
+
+fn package_uses(path: &Path, package: &str) -> bool {
+    let manifest = path.join("package.json");
+    let Ok(metadata) = fs::metadata(&manifest) else {
+        return false;
+    };
+    if metadata.len() > 1_048_576 {
+        return false;
+    }
+    let Ok(contents) = fs::read(&manifest) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "peerDependencies"]
+        .iter()
+        .any(|section| {
+            value
+                .get(section)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|deps| deps.contains_key(package))
+        })
+}
+
+fn workflow_prerequisites(
+    path: &Path,
+    names: &HashSet<String>,
+    is_git_repository: bool,
+) -> Vec<WorkflowPrerequisite> {
+    let mut required: Vec<(&str, Vec<&str>)> = Vec::new();
+    if is_git_repository {
+        required.push(("git", vec!["Git workflows"]));
+    }
+    if names.contains("package.json") {
+        required.push(("node", vec!["Node.js", "Tauri", "Expo", "React Native"]));
+        if names.contains("pnpm-lock.yaml") {
+            required.push(("pnpm", vec!["Node.js", "Tauri", "Expo", "React Native"]));
+        } else if names.contains("yarn.lock") {
+            required.push(("yarn", vec!["Node.js", "Tauri", "Expo", "React Native"]));
+        } else {
+            required.push(("npm", vec!["Node.js", "Tauri", "Expo", "React Native"]));
+        }
+    }
+    if names.contains("cargo.toml") || path.join("src-tauri/Cargo.toml").is_file() {
+        required.push(("cargo", vec!["Rust", "Tauri"]));
+        required.push(("rustc", vec!["Rust", "Tauri"]));
+    }
+    if names.contains("go.mod") {
+        required.push(("go", vec!["Go"]));
+    }
+    if names.contains("pyproject.toml")
+        || names.contains("requirements.txt")
+        || names.contains("setup.py")
+    {
+        required.push(("python", vec!["Python"]));
+    }
+    if names.contains("pubspec.yaml") {
+        required.push(("flutter", vec!["Flutter"]));
+    }
+    if path.join("android/build.gradle").is_file()
+        || path.join("android/build.gradle.kts").is_file()
+    {
+        required.push(("gradle", vec!["Android"]));
+        required.push(("java", vec!["Android"]));
+    }
+    if names.contains("pom.xml")
+        || names.contains("build.gradle")
+        || names.contains("build.gradle.kts")
+    {
+        required.push(("java", vec!["Java", "Kotlin/Gradle"]));
+    }
+    if path.join("ios/Podfile").is_file() {
+        required.push(("xcodebuild", vec!["iOS"]));
+        required.push(("pod", vec!["iOS"]));
+    }
+    required
+        .into_iter()
+        .map(|(name, required_for)| WorkflowPrerequisite {
+            name: name.to_owned(),
+            required_for: required_for.into_iter().map(str::to_owned).collect(),
+            available: match name {
+                "gradle" => {
+                    executable_available(name)
+                        || path.join("gradlew").is_file()
+                        || path.join("gradlew.bat").is_file()
+                        || path.join("android/gradlew.bat").is_file()
+                }
+                _ => executable_available(name),
+            },
+        })
+        .collect()
+}
+
+fn executable_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|folder| {
+        #[cfg(windows)]
+        let candidates = [
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            format!("{name}.bat"),
+            name.to_owned(),
+        ];
+        #[cfg(not(windows))]
+        let candidates = [name.to_owned()];
+        candidates
+            .iter()
+            .any(|candidate| folder.join(candidate).is_file())
+    })
+}
+
+fn inspect_git(path: &Path, is_repository: bool) -> GitFacts {
+    let unavailable = || GitFacts {
+        status: "gitUnavailable".to_owned(),
+        branch: None,
+        dirty: None,
+        latest_commit: None,
+        remotes: Vec::new(),
+        upstream: UpstreamDivergence {
+            status: "unavailable".to_owned(),
+            ahead: None,
+            behind: None,
+        },
+    };
+    if !is_repository {
+        return GitFacts {
+            status: "notRepository".to_owned(),
+            branch: None,
+            dirty: None,
+            latest_commit: None,
+            remotes: Vec::new(),
+            upstream: UpstreamDivergence {
+                status: "unavailable".to_owned(),
+                ahead: None,
+                behind: None,
+            },
+        };
+    }
+    if Command::new("git").arg("--version").output().is_err() {
+        return unavailable();
+    }
+
+    let (status, branch) = match git_output(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(Some(value)) => match git_output(path, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+            Ok(Some(_)) => ("available", Some(value)),
+            Ok(None) => ("unborn", Some(value)),
+            Err(status) => return empty_git_facts(&status),
+        },
+        Ok(None) => match git_output(path, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+            Ok(Some(_)) => ("detached", None),
+            Ok(None) => ("unborn", None),
+            Err(status) => return empty_git_facts(&status),
+        },
+        Err(status) => return empty_git_facts(&status),
+    };
+    let dirty = match git_output(
+        path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ],
+    ) {
+        Ok(Some(value)) => Some(!value.is_empty()),
+        Ok(None) => Some(false),
+        Err(status) => return empty_git_facts(&status),
+    };
+    let latest_commit = match git_output(path, &["log", "-1", "--format=%H%x00%s"]) {
+        Ok(Some(value)) => {
+            let (hash, subject) = value.split_once('\0').unwrap_or((&value, ""));
+            Some(LatestCommit {
+                short_hash: hash.chars().take(12).collect(),
+                subject: subject.chars().take(240).collect(),
+            })
+        }
+        Ok(None) => None,
+        Err(status) => return empty_git_facts(&status),
+    };
+    let remotes = match git_output(path, &["remote"]) {
+        Ok(Some(value)) => value
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|name| {
+                let url = git_output(path, &["remote", "get-url", name])
+                    .ok()
+                    .flatten()
+                    .map(|url| sanitize_remote(&url));
+                GitRemote {
+                    name: name.to_owned(),
+                    url,
+                }
+            })
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(status) => return empty_git_facts(&status),
+    };
+    let upstream = match git_output(
+        path,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    ) {
+        Ok(Some(_)) => match git_output(
+            path,
+            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        ) {
+            Ok(Some(counts)) => {
+                let mut parts = counts
+                    .split_whitespace()
+                    .filter_map(|part| part.parse::<u64>().ok());
+                match (parts.next(), parts.next()) {
+                    (Some(ahead), Some(behind)) => UpstreamDivergence {
+                        status: "tracking".to_owned(),
+                        ahead: Some(ahead),
+                        behind: Some(behind),
+                    },
+                    _ => UpstreamDivergence {
+                        status: "unavailable".to_owned(),
+                        ahead: None,
+                        behind: None,
+                    },
+                }
+            }
+            _ => UpstreamDivergence {
+                status: "unavailable".to_owned(),
+                ahead: None,
+                behind: None,
+            },
+        },
+        Ok(None) => UpstreamDivergence {
+            status: "noUpstream".to_owned(),
+            ahead: None,
+            behind: None,
+        },
+        Err(status) if status == "unsafeOwnership" => return empty_git_facts(&status),
+        Err(_) => UpstreamDivergence {
+            status: "unavailable".to_owned(),
+            ahead: None,
+            behind: None,
+        },
+    };
+    GitFacts {
+        status: status.to_owned(),
+        branch,
+        dirty,
+        latest_commit,
+        remotes,
+        upstream,
+    }
+}
+
+fn empty_git_facts(status: &str) -> GitFacts {
+    GitFacts {
+        status: status.to_owned(),
+        branch: None,
+        dirty: None,
+        latest_commit: None,
+        remotes: Vec::new(),
+        upstream: UpstreamDivergence {
+            status: "unavailable".to_owned(),
+            ahead: None,
+            behind: None,
+        },
+    }
+}
+
+fn git_output(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    let output: Output = command.output().map_err(|_| "gitUnavailable".to_owned())?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((!value.is_empty()).then_some(value))
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if error.contains("dubious ownership") || error.contains("safe.directory") {
+            Err("unsafeOwnership".to_owned())
+        } else if error.trim().is_empty()
+            || error.contains("does not have any commits yet")
+            || error.contains("no upstream")
+            || error.contains("upstream branch")
+            || error.contains("needed a single revision")
+        {
+            Ok(None)
+        } else if error.contains("not a git repository") {
+            Err("notRepository".to_owned())
+        } else {
+            Err("error".to_owned())
+        }
+    }
+}
+
+fn sanitize_remote(value: &str) -> String {
+    let without_credentials = if let Some((scheme, rest)) = value.split_once("://") {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let (authority, suffix) = rest.split_at(authority_end);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        format!("{scheme}://{host}{suffix}")
+    } else if let Some((user, host)) = value.split_once('@') {
+        if host.contains(':') {
+            let _ = user;
+            host.to_owned()
+        } else {
+            value.to_owned()
+        }
+    } else {
+        value.to_owned()
+    };
+    without_credentials
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn push_error(errors: &mut Vec<String>, message: String) {
@@ -351,6 +769,216 @@ fn push_error(errors: &mut Vec<String>, message: String) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_git_value(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn reports_unborn_dirty_remotes_and_read_only_commit_facts() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        run_git(root.path(), &["init", "-q"]);
+        let unborn = inspect_git(root.path(), true);
+        assert_eq!(unborn.status, "unborn");
+        assert_eq!(unborn.dirty, Some(false));
+
+        run_git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture commit",
+            ],
+        );
+        run_git(
+            root.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://user:secret@example.invalid/team/repo.git?token=hidden",
+            ],
+        );
+        fs::write(root.path().join("untracked.txt"), "fixture").unwrap();
+        let facts = inspect_git(root.path(), true);
+        assert_eq!(facts.status, "available");
+        assert_eq!(facts.dirty, Some(true));
+        assert_eq!(
+            facts.latest_commit.as_ref().unwrap().subject,
+            "fixture commit"
+        );
+        assert_eq!(facts.upstream.status, "noUpstream");
+        assert_eq!(
+            facts.remotes[0].url.as_deref(),
+            Some("https://example.invalid/team/repo.git")
+        );
+        assert!(!facts.remotes[0].url.as_deref().unwrap().contains("secret"));
+
+        run_git(root.path(), &["checkout", "--quiet", "--detach", "HEAD"]);
+        assert_eq!(inspect_git(root.path(), true).status, "detached");
+    }
+
+    #[test]
+    fn reports_ahead_and_behind_counts_from_existing_upstream_refs() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let local = root.path().join("local");
+        fs::create_dir_all(&local).unwrap();
+        run_git(&local, &["init", "-q"]);
+        run_git(
+            &local,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        let branch = run_git_value(&local, &["symbolic-ref", "--short", "HEAD"]);
+        run_git(
+            &local,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let initial = run_git_value(&local, &["rev-parse", "HEAD"]);
+        run_git(
+            &local,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                &initial,
+            ],
+        );
+        run_git(
+            &local,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        run_git(
+            &local,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        run_git(
+            &local,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "local ahead",
+            ],
+        );
+        let local_head = run_git_value(&local, &["rev-parse", "HEAD"]);
+        let tree = run_git_value(&local, &["rev-parse", "HEAD^{tree}"]);
+        let remote_head = run_git_value(
+            &local,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                &tree,
+                "-p",
+                &initial,
+                "-m",
+                "remote ahead",
+            ],
+        );
+        assert_ne!(local_head, remote_head);
+        run_git(
+            &local,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                &remote_head,
+            ],
+        );
+
+        let facts = inspect_git(&local, true);
+        assert_eq!(facts.upstream.status, "tracking");
+        assert_eq!(facts.upstream.ahead, Some(1));
+        assert_eq!(facts.upstream.behind, Some(1));
+    }
+
+    #[test]
+    fn detects_tauri_mobile_stacks_and_lists_toolchain_availability() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src-tauri")).unwrap();
+        fs::create_dir_all(root.path().join("android")).unwrap();
+        fs::write(root.path().join("src-tauri/tauri.conf.json"), "{}").unwrap();
+        fs::write(root.path().join("src-tauri/Cargo.toml"), "").unwrap();
+        fs::write(root.path().join("android/build.gradle"), "").unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"devDependencies":{"react-native":"*"}}"#,
+        )
+        .unwrap();
+        let names = HashSet::from(["package.json".to_owned()]);
+        let stacks = detect_stacks(root.path(), &names);
+        assert!(stacks.contains(&"Tauri".to_owned()));
+        assert!(stacks.contains(&"React Native".to_owned()));
+        assert!(stacks.contains(&"Android".to_owned()));
+        let prerequisites = workflow_prerequisites(root.path(), &names, false);
+        assert!(prerequisites
+            .iter()
+            .any(|item| item.name == "cargo" && item.required_for.contains(&"Tauri".to_owned())));
+        assert!(
+            prerequisites
+                .iter()
+                .any(|item| item.name == "gradle"
+                    && item.required_for.contains(&"Android".to_owned()))
+        );
+    }
 
     fn options(depth: u8) -> ScanOptions {
         ScanOptions {

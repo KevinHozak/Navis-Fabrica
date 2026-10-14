@@ -183,6 +183,7 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .project-details { display: grid; flex: 1; min-width: 0; gap: 4px; }
 .project-details strong { overflow: hidden; color: #e0e8f2; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .project-details > span { overflow: hidden; color: #8490a0; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.project-details > .project-facts { color: #98a9bc; font-size: 9px; }
 .project-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
 .project-tag { padding: 4px 7px; border: 1px solid #303b49; border-radius: 999px; color: #aebdce; font-size: 9px; white-space: nowrap; }
 .scan-notice { margin: 14px 22px 0; padding: 10px 12px; border: 1px solid #344b61; border-radius: 8px; background: #14202c; color: #b9cfe4; font-size: 11px; line-height: 1.5; }

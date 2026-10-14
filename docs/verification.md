@@ -1,6 +1,6 @@
 ﻿# Initial scaffold verification
 
-Only the basic structure is in scope. No scanner, workflow runner, provider adapter, model routing, or dashboard functionality is implemented.
+The initial scaffold delivered only the basic structure. Later phase work is recorded below; workflow execution, model routing, and live provider runs remain outside the completed phases so far.
 
 - `npm install --ignore-scripts`: locked dependencies installed; audit reported zero vulnerabilities.
 - `npm run build`: TypeScript and Vite production build passed.
@@ -33,3 +33,13 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 ### Live desktop integration
 
 - Not run in this change. The Tauri window was not launched to invoke a scan against the configured live root. Native command compilation and scanner cancellation fixtures passed; end-to-end event delivery and desktop UI behavior remain unverified.
+
+## Discovery-P2 Git facts and stack detection (issue #12)
+
+- The scanner reports Git branch/state, dirty status including normal untracked files, latest commit hash/subject, remotes, and ahead/behind counts against the already available upstream ref. It never fetches or changes refs; Git status disables optional index writes and fsmonitor execution.
+- Git inspection states include available, detached, unborn, unsafe ownership, unavailable Git executable, missing repository metadata, and generic inspection errors. Remotes have embedded credentials, query strings, and fragments removed before returning to the UI.
+- Stack manifests include Tauri/Rust, Node.js, Go, Python, PHP, Ruby, Java/Gradle, .NET, Flutter, Android, iOS, Expo, and React Native. Toolchain presence is reported from executable discovery; it does not promise that a workflow integration is installed.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`: passed.
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml`: 21 passed. Fixtures cover unborn and detached HEAD, clean/dirty worktrees, sanitized remotes, no upstream, ahead/behind divergence, Tauri/mobile manifests, and prerequisite reporting.
+- `npm run build`: blocked because this worktree has no installed TypeScript executable. `npm ci --ignore-scripts --prefer-offline` failed inside npm with `Exit handler never called!`; frontend build/typecheck remains unverified.
+- Live desktop scanning and live repositories outside fixtures remain unverified.

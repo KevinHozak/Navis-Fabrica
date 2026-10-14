@@ -703,11 +703,11 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
             .lines()
             .filter(|line| !line.is_empty())
             .map(|name| {
-                let url = git_output(path, &["remote", "get-url", name], cancelled)
+                let raw_url = git_output(path, &["remote", "get-url", name], cancelled)
                     .ok()
-                    .flatten()
-                    .map(|url| sanitize_remote(&url));
-                let github = url.as_deref().and_then(parse_github_remote);
+                    .flatten();
+                let github = raw_url.as_deref().and_then(parse_github_remote);
+                let url = raw_url.as_deref().map(sanitize_remote);
                 GitRemote {
                     name: name.to_owned(),
                     url,
@@ -1099,6 +1099,47 @@ mod tests {
         ] {
             assert!(parse_github_remote(input).is_none(), "{input}");
         }
+    }
+
+    #[test]
+    fn scan_detects_github_identity_before_sanitizing_ssh_remotes() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        run_git(root.path(), &["init", "-q"]);
+        run_git(
+            root.path(),
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
+        );
+
+        let facts = inspect_git_fixture(root.path());
+        assert_eq!(
+            facts.remotes[0].url.as_deref(),
+            Some("github.com:Owner/Repo.git")
+        );
+        let github = facts.remotes[0]
+            .github
+            .as_ref()
+            .expect("GitHub remote should be recognized");
+        assert_eq!(github.owner, "Owner");
+        assert_eq!(github.repository, "Repo");
+
+        run_git(
+            root.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@github.com/Owner/Repo.git",
+            ],
+        );
+        let facts = inspect_git_fixture(root.path());
+        assert_eq!(
+            facts.remotes[0].url.as_deref(),
+            Some("ssh://github.com/Owner/Repo.git")
+        );
+        assert!(facts.remotes[0].github.is_some());
     }
 
     #[test]

@@ -8,6 +8,7 @@ export function SettingsPanel() {
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState("");
   const desktop = isDesktopApp();
+  const saving = saveState === "saving";
 
   function updateSettings(next: Settings) {
     setSettings(next);
@@ -74,24 +75,24 @@ export function SettingsPanel() {
       <form className="settings-form" onSubmit={handleSave}>
         <label className="settings-field" htmlFor="project-root">
           <span>Projects folder</span>
-          <input id="project-root" autoComplete="off" spellCheck={false} value={settings.projectRoot} onChange={(event) => updateSettings({ ...settings, projectRoot: event.target.value })} />
+          <input id="project-root" autoComplete="off" spellCheck={false} disabled={saving} value={settings.projectRoot} onChange={(event) => updateSettings({ ...settings, projectRoot: event.target.value })} />
           <small>Use an absolute folder path. You can choose a folder that will be created later.</small>
         </label>
 
         <label className="settings-field" htmlFor="project-exclusions">
           <span>Folders to skip</span>
-          <textarea id="project-exclusions" rows={4} spellCheck={false} value={settings.exclusions.join("\n")} onChange={(event) => updateSettings({ ...settings, exclusions: event.target.value.split(/\r?\n/) })} />
+          <textarea id="project-exclusions" rows={4} spellCheck={false} disabled={saving} value={settings.exclusions.join("\n")} onChange={(event) => updateSettings({ ...settings, exclusions: event.target.value.split(/\r?\n/) })} />
           <small>One relative folder name or path per line.</small>
         </label>
 
         <div className="settings-options">
           <label className="settings-toggle" htmlFor="include-hidden">
-            <input id="include-hidden" type="checkbox" checked={settings.preferences.includeHidden} onChange={(event) => updateSettings({ ...settings, preferences: { ...settings.preferences, includeHidden: event.target.checked } })} />
+            <input id="include-hidden" type="checkbox" disabled={saving} checked={settings.preferences.includeHidden} onChange={(event) => updateSettings({ ...settings, preferences: { ...settings.preferences, includeHidden: event.target.checked } })} />
             <span><strong>Include hidden folders</strong><small>Show folders that start with a dot.</small></span>
           </label>
           <label className="settings-field settings-depth" htmlFor="scan-depth">
             <span>Search depth</span>
-            <select id="scan-depth" value={settings.preferences.scanDepth} onChange={(event) => updateSettings({ ...settings, preferences: { ...settings.preferences, scanDepth: Number(event.target.value) } })}>
+            <select id="scan-depth" disabled={saving} value={settings.preferences.scanDepth} onChange={(event) => updateSettings({ ...settings, preferences: { ...settings.preferences, scanDepth: Number(event.target.value) } })}>
               {[1, 2, 3, 4, 5, 6, 7, 8].map((depth) => <option key={depth} value={depth}>{depth} {depth === 1 ? "level" : "levels"}</option>)}
             </select>
           </label>
@@ -101,7 +102,7 @@ export function SettingsPanel() {
           <p className={`settings-feedback ${saveState}`} role={saveState === "error" ? "alert" : "status"} aria-live="polite">
             {message || (desktop ? "Settings are ready to edit." : "Browser preview saves changes in this browser.")}
           </p>
-          <button className="button button-primary" type="submit" disabled={saveState === "saving"}>
+          <button className="button button-primary" type="submit" disabled={saving}>
             {saveState === "saving" ? "Saving…" : "Save settings"}
           </button>
         </div>

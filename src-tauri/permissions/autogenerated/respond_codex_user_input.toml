@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-respond-codex-user-input"
+description = "Responds to a pending Codex user-input request."
+commands.allow = ["respond_codex_user_input"]
+
+[[permission]]
+identifier = "deny-respond-codex-user-input"
+description = "Denies responding to a Codex user-input request."
+commands.deny = ["respond_codex_user_input"]

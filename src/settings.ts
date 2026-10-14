@@ -49,6 +49,8 @@ export type ProviderAvailability = {
     runStart: boolean;
     runCancel: boolean;
     eventStream: boolean;
+    approvalRequests: boolean;
+    interactiveInput: boolean;
     checkpoints: boolean;
   };
   note: string;
@@ -95,10 +97,11 @@ export type GitHubIssue = GitHubIssueSummary & {
 
 export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
 export type WorkflowRun = {
-  id: string; executable: string; cwd: string; mutating: boolean; state: string;
+  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; mutating: boolean; state: string;
   startedAtMs: number; finishedAtMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
 };
+export type CodexStartRequest = { cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number };
 export type WorkflowRunRequest = {
   executable: string; arguments: string[]; cwd: string; timeoutSeconds: number; mutating: boolean;
 };
@@ -206,6 +209,12 @@ export const getGitHubIssue = (owner: string, repository: string, reference: str
 export const listWorkflowRuns = () => invoke<WorkflowRun[]>("list_workflow_runs");
 export const startWorkflowRun = (request: WorkflowRunRequest) =>
   invoke<WorkflowRun>("start_workflow_run", { request });
+export const startCodexWorkflowRun = (request: CodexStartRequest) =>
+  invoke<WorkflowRun>("start_codex_workflow_run", { request });
+export const respondCodexApproval = (runId: string, requestId: string, decision: string) =>
+  invoke<boolean>("respond_codex_approval", { runId, requestId, decision });
+export const respondCodexUserInput = (runId: string, requestId: string, answers: Record<string, string[]>) =>
+  invoke<boolean>("respond_codex_user_input", { runId, requestId, answers });
 export const cancelWorkflowRun = (runId: string) =>
   invoke<boolean>("cancel_workflow_run", { runId });
 export const markWorkflowRunNeedsInput = (runId: string) =>

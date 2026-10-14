@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
@@ -79,6 +80,8 @@ pub struct AdapterCapabilities {
     pub run_start: bool,
     pub run_cancel: bool,
     pub event_stream: bool,
+    pub approval_requests: bool,
+    pub interactive_input: bool,
     pub checkpoints: bool,
 }
 
@@ -159,6 +162,210 @@ pub struct ProviderRunRequest {
     pub checkpoint: Option<RunCheckpoint>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexEvent {
+    pub kind: String,
+    pub text: String,
+    pub terminal_state: Option<String>,
+}
+
+pub fn app_server_initialize(request_id: u64, app_version: &str) -> Value {
+    json!({
+        "id": request_id,
+        "method": "initialize",
+        "params": {
+            "clientInfo": { "name": "navis_fabrica", "title": "Navis-Fabrica", "version": app_version },
+            "capabilities": { "experimentalApi": true, "requestAttestation": false }
+        }
+    })
+}
+
+pub fn app_server_thread_start(request_id: u64, cwd: &str, model_id: &str) -> Value {
+    json!({
+        "id": request_id,
+        "method": "thread/start",
+        "params": {
+            "cwd": cwd,
+            "runtimeWorkspaceRoots": [cwd],
+            "model": model_id,
+            "allowProviderModelFallback": false,
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+            "ephemeral": false
+        }
+    })
+}
+
+pub fn app_server_turn_start(
+    request_id: u64,
+    thread_id: &str,
+    cwd: &str,
+    model_id: &str,
+    effort: Option<&str>,
+    prompt: &str,
+    skill: Option<(&str, &str)>,
+) -> Value {
+    let mut input = Vec::new();
+    if let Some((name, path)) = skill {
+        input.push(json!({ "type": "skill", "name": name, "path": path }));
+    }
+    input.push(json!({ "type": "text", "text": prompt, "text_elements": [] }));
+    let mut params = json!({
+        "threadId": thread_id,
+        "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd],
+        "model": model_id,
+        "approvalPolicy": "on-request",
+        "input": input
+    });
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
+    }
+    json!({ "id": request_id, "method": "turn/start", "params": params })
+}
+
+pub fn app_server_response(request_id: Value, result: Value) -> Value {
+    json!({ "id": request_id, "result": result })
+}
+
+pub fn parse_app_server_message(line: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(line)
+        .map_err(|_| "Codex app-server emitted malformed JSON.".to_string())?;
+    if !value.is_object()
+        || value
+            .get("jsonrpc")
+            .is_some_and(|version| version.as_str() != Some("2.0"))
+    {
+        return Err("Codex app-server emitted an invalid protocol message.".into());
+    }
+    if value
+        .get("method")
+        .is_some_and(|method| !method.is_string())
+    {
+        return Err("Codex app-server emitted an invalid protocol method.".into());
+    }
+    Ok(value)
+}
+
+pub fn normalize_app_server_message(message: &Value) -> Option<CodexEvent> {
+    let method = message.get("method")?.as_str()?;
+    let params = message.get("params").unwrap_or(&Value::Null);
+    match method {
+        "item/agentMessage/delta" => Some(CodexEvent {
+            kind: "output".into(),
+            text: params.get("delta")?.as_str()?.into(),
+            terminal_state: None,
+        }),
+        "item/completed" => {
+            let item = params.get("item")?;
+            if item.get("type")?.as_str()? != "agentMessage" {
+                return None;
+            }
+            Some(CodexEvent {
+                kind: "finalOutput".into(),
+                text: item.get("text")?.as_str()?.into(),
+                terminal_state: None,
+            })
+        }
+        "turn/completed" => {
+            let status = params.get("turn")?.get("status")?.as_str()?;
+            let state = match status {
+                "completed" => "completed",
+                "interrupted" => "cancelled",
+                _ => "failed",
+            };
+            let message = params
+                .get("turn")
+                .and_then(|turn| turn.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(CodexEvent {
+                kind: if state == "failed" {
+                    "providerError"
+                } else {
+                    "state"
+                }
+                .into(),
+                text: if state == "failed" {
+                    if is_authentication_error(message) {
+                        "Codex authentication is required or expired.".into()
+                    } else {
+                        "Codex reported that the turn failed.".into()
+                    }
+                } else {
+                    state.into()
+                },
+                terminal_state: Some(state.into()),
+            })
+        }
+        "error" => {
+            let message = params.get("message").and_then(Value::as_str).unwrap_or("");
+            Some(CodexEvent {
+                kind: "providerError".into(),
+                text: if is_authentication_error(message) {
+                    "Codex authentication is required or expired.".into()
+                } else {
+                    "Codex app-server reported an error.".into()
+                },
+                terminal_state: Some("failed".into()),
+            })
+        }
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => Some(CodexEvent {
+            kind: "approvalRequest".into(),
+            text: serde_json::to_string(&json!({
+                "requestId": message.get("id"),
+                "method": method,
+                "params": {
+                    "kind": params.get("kind"),
+                    "reason": params.get("reason"),
+                    "command": params.get("command"),
+                    "cwd": params.get("cwd"),
+                    "permissions": params.get("permissions"),
+                    "availableDecisions": params.get("availableDecisions")
+                }
+            }))
+            .ok()?,
+            terminal_state: None,
+        }),
+        "item/tool/requestUserInput" => Some(CodexEvent {
+            kind: "userInputRequest".into(),
+            text: serde_json::to_string(&json!({
+                "requestId": message.get("id"),
+                "method": method,
+                "questions": params.get("questions")
+            }))
+            .ok()?,
+            terminal_state: None,
+        }),
+        _ => None,
+    }
+}
+
+fn is_authentication_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "unauthorized",
+        "authentication",
+        "sign in",
+        "login required",
+        "401",
+        "invalid api key",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+pub fn normalize_codex_stderr(message: &str) -> Option<CodexEvent> {
+    is_authentication_error(message).then(|| CodexEvent {
+        kind: "providerError".into(),
+        text: "Codex authentication is required or expired.".into(),
+        terminal_state: Some("failed".into()),
+    })
+}
+
 /// Provider implementations must explicitly declare each operation they support.
 /// The initial phase ships the contract and local executable preflight only; no
 /// provider process is launched until a concrete adapter is implemented.
@@ -216,17 +423,36 @@ pub fn inspect(
     path_value: Option<&std::ffi::OsStr>,
 ) -> ProviderAvailability {
     let executable_path = find_executable(&profile.executable, path_value);
+    let capabilities = match profile.kind {
+        ProviderKind::Codex => AdapterCapabilities {
+            run_start: true,
+            run_cancel: true,
+            event_stream: true,
+            approval_requests: true,
+            interactive_input: true,
+            ..AdapterCapabilities::local_preflight()
+        },
+        _ => AdapterCapabilities::local_preflight(),
+    };
     ProviderAvailability {
         provider_id: profile.id.clone(),
         executable_found: executable_path.is_some(),
         executable_path: executable_path.map(|path| path.to_string_lossy().into_owned()),
-        authentication_reference: if profile.secret_ref.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        authentication_reference: if profile
+            .secret_ref
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             AuthenticationReferenceStatus::ReferenceConfigured
         } else {
             AuthenticationReferenceStatus::Missing
         },
-        capabilities: AdapterCapabilities::local_preflight(),
-        note: "Executable presence is checked without launching it. Authentication validity and provider operations are not implemented by this adapter.".into(),
+        capabilities,
+        note: if profile.kind == ProviderKind::Codex {
+            "Codex app-server runs are supported with streamed output, on-request approvals, and user input. Authentication is checked when a run starts; this check never launches the provider.".into()
+        } else {
+            "Executable presence is checked without launching it. Authentication validity and provider operations are not implemented by this adapter.".into()
+        },
     }
 }
 
@@ -388,9 +614,13 @@ mod tests {
             AuthenticationReferenceStatus::ReferenceConfigured
         );
         assert!(status.capabilities.discovery);
-        assert!(!status.capabilities.run_start);
+        assert!(status.capabilities.run_start);
+        assert!(status.capabilities.run_cancel);
+        assert!(status.capabilities.event_stream);
+        assert!(status.capabilities.approval_requests);
+        assert!(status.capabilities.interactive_input);
         assert!(!status.capabilities.checkpoints);
-        assert!(status.note.contains("without launching"));
+        assert!(status.note.contains("never launches"));
     }
 
     #[test]
@@ -412,5 +642,125 @@ mod tests {
         let value = serde_json::to_value(profile()).unwrap();
         assert_eq!(value["secretRef"], "credential-store:codex-session");
         assert!(value.get("secret").is_none());
+    }
+
+    #[test]
+    fn app_server_requests_pin_project_model_effort_and_skill() {
+        let start = app_server_thread_start(2, r"C:\Projects\sample", "model-a");
+        assert_eq!(start["method"], "thread/start");
+        assert!(start.get("jsonrpc").is_none());
+        assert_eq!(start["params"]["cwd"], r"C:\Projects\sample");
+        assert_eq!(
+            start["params"]["runtimeWorkspaceRoots"][0],
+            r"C:\Projects\sample"
+        );
+        assert_eq!(start["params"]["model"], "model-a");
+        assert_eq!(start["params"]["approvalPolicy"], "on-request");
+        let turn = app_server_turn_start(
+            3,
+            "thread-id",
+            r"C:\Projects\sample",
+            "model-a",
+            Some("high"),
+            "Make this change",
+            Some(("dev-work", r"C:\Users\me\.codex\skills\dev-work\SKILL.md")),
+        );
+        assert!(turn.get("jsonrpc").is_none());
+        assert_eq!(turn["params"]["effort"], "high");
+        assert_eq!(turn["params"]["input"][0]["type"], "skill");
+        assert_eq!(turn["params"]["input"][1]["text"], "Make this change");
+    }
+
+    #[test]
+    fn app_server_stream_normalizes_deltas_final_output_failures_and_requests() {
+        let delta = serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": { "delta": "Hello" }
+        });
+        let event = normalize_app_server_message(&delta).unwrap();
+        assert_eq!(event.kind, "output");
+        assert_eq!(event.text, "Hello");
+
+        let final_message = serde_json::json!({
+            "method": "item/completed",
+            "params": { "item": { "type": "agentMessage", "text": "Final answer" } }
+        });
+        assert_eq!(
+            normalize_app_server_message(&final_message).unwrap().kind,
+            "finalOutput"
+        );
+
+        let auth_error = serde_json::json!({
+            "method": "turn/completed",
+            "params": { "turn": { "status": "failed", "error": { "message": "401 unauthorized" } } }
+        });
+        let event = normalize_app_server_message(&auth_error).unwrap();
+        assert_eq!(event.terminal_state.as_deref(), Some("failed"));
+        assert_eq!(event.text, "Codex authentication is required or expired.");
+
+        let request = serde_json::json!({
+            "id": 42,
+            "method": "item/commandExecution/requestApproval",
+            "params": { "command": "git status", "availableDecisions": ["accept", "decline"] }
+        });
+        let event = normalize_app_server_message(&request).unwrap();
+        assert_eq!(event.kind, "approvalRequest");
+        let display: serde_json::Value = serde_json::from_str(&event.text).unwrap();
+        assert_eq!(display["requestId"], 42);
+        assert_eq!(display["params"]["availableDecisions"][0], "accept");
+
+        let permission_request = serde_json::json!({
+            "id": 43,
+            "method": "item/permissions/requestApproval",
+            "params": { "reason": "Allow a workspace root", "permissions": { "fileSystem": { "write": ["/workspace"] } } }
+        });
+        let event = normalize_app_server_message(&permission_request).unwrap();
+        let display: serde_json::Value = serde_json::from_str(&event.text).unwrap();
+        assert_eq!(display["method"], "item/permissions/requestApproval");
+        assert_eq!(
+            display["params"]["permissions"]["fileSystem"]["write"][0],
+            "/workspace"
+        );
+    }
+
+    #[test]
+    fn app_server_parser_accepts_codex_wire_messages_without_jsonrpc() {
+        assert!(parse_app_server_message("not-json").is_err());
+        assert!(parse_app_server_message("[]").is_err());
+        assert!(
+            parse_app_server_message(r#"{"jsonrpc":"1.0","method":"turn/completed"}"#).is_err()
+        );
+        assert!(
+            parse_app_server_message(r#"{"id":1,"result":{"userAgent":"codex_cli/0.162.1"}}"#)
+                .is_ok()
+        );
+        assert!(parse_app_server_message(
+            r#"{"method":"turn/completed","params":{"turn":{"status":"completed"}}}"#
+        )
+        .is_ok());
+        assert!(parse_app_server_message(
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{}}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn app_server_messages_follow_codex_wire_shape() {
+        let initialize = app_server_initialize(1, "0.14.0");
+        let thread = app_server_thread_start(2, "/workspace", "model-a");
+        let response = app_server_response(serde_json::json!(3), json!({}));
+        assert!(initialize.get("jsonrpc").is_none());
+        assert!(thread.get("jsonrpc").is_none());
+        assert!(response.get("jsonrpc").is_none());
+        assert_eq!(response["id"], 3);
+    }
+
+    #[test]
+    fn normalizes_authentication_failures_from_runtime_stderr() {
+        let event = normalize_codex_stderr("Unauthorized: please sign in").unwrap();
+        assert_eq!(event.kind, "providerError");
+        assert_eq!(event.terminal_state.as_deref(), Some("failed"));
+        assert_eq!(event.text, "Codex authentication is required or expired.");
+        assert!(normalize_codex_stderr("temporary filesystem warning").is_none());
     }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-codex-workflow-run"
+description = "Starts a Codex app-server run scoped to the selected project and configured model."
+commands.allow = ["start_codex_workflow_run"]
+
+[[permission]]
+identifier = "deny-start-codex-workflow-run"
+description = "Denies starting Codex app-server runs."
+commands.deny = ["start_codex_workflow_run"]

@@ -10,6 +10,7 @@
     "allow-start-project-scan",
     "allow-cancel-project-scan",
     "allow-inspect-providers",
+    "allow-start-codex-workflow-run",
     "allow-get-cached-github-activity",
     "allow-refresh-github-activity",
     "allow-list-github-issues",
@@ -19,6 +20,8 @@
     "allow-cancel-workflow-run",
     "allow-mark-workflow-run-needs-input",
     "allow-write-workflow-run-input",
+    "allow-respond-codex-approval",
+    "allow-respond-codex-user-input",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

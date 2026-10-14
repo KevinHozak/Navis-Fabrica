@@ -23,7 +23,8 @@ const executableDefaults: Record<ProviderKind, string> = {
 
 const capabilityLabels: [keyof ProviderAvailability["capabilities"], string][] = [
   ["discovery", "Executable discovery"], ["health", "Health"], ["modelListing", "Model listing"],
-  ["runStart", "Start runs"], ["runCancel", "Cancel runs"], ["eventStream", "Events"], ["checkpoints", "Checkpoints"],
+  ["runStart", "Start runs"], ["runCancel", "Cancel runs"], ["eventStream", "Events"],
+  ["approvalRequests", "Approval requests"], ["interactiveInput", "User input"], ["checkpoints", "Checkpoints"],
 ];
 
 export function ProvidersPanel() {
@@ -145,7 +146,7 @@ export function ProvidersPanel() {
           </label>
           <label className="settings-field" htmlFor="runtime-id"><span>Runtime ID</span>
             <input id="runtime-id" value={runtimeId} maxLength={160} placeholder="e.g. codex-cli" onChange={(event) => setRuntimeId(event.target.value)} onBlur={() => settings && void persist({ ...settings, providerSelection: { ...settings.providerSelection, runtimeId: runtimeId.trim() || null } })} />
-            <small>Stored separately from the provider and model. No runtime is launched in this phase.</small>
+            <small>Stored separately from the provider and model. Choose codex-app-server to run Codex from the Runs view.</small>
           </label>
         </div>
         <div className="provider-feedback" role={saveState === "error" ? "alert" : "status"} aria-live="polite">{message || (desktop ? "Configuration is local to this app." : "Browser preview stores configuration in this browser.")}</div>
@@ -193,7 +194,7 @@ export function ProvidersPanel() {
             <label className="settings-field" htmlFor="model-name"><span>Model display name</span><input id="model-name" maxLength={100} required value={modelName} onChange={(event) => setModelName(event.target.value)} /></label>
           </div>
           <label className="settings-field" htmlFor="model-efforts"><span>Supported reasoning effort labels</span><input id="model-efforts" value={efforts} onChange={(event) => setEfforts(event.target.value)} /><small>Comma-separated manual labels, for example low, medium, high.</small></label>
-          <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Provider operations remain disabled until a tested adapter is available."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
+          <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Codex runs are available from the Runs view; other provider operations remain unsupported."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
         </form>
       </section>
     </div>

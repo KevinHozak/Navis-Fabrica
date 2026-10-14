@@ -3,8 +3,10 @@ import type { KeyboardEvent } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import { GitHubIssuePicker } from "./GitHubIssuePicker";
+import { actionDisabledReason, workflowActions, WorkflowEffect, WorkflowSkillStatus } from "./actions";
 import {
   cancelProjectScan,
+  discoverWorkflowSkills,
   getCachedGitHubActivity,
   GitHubActivity,
   isDesktopApp,
@@ -48,6 +50,7 @@ function App() {
   const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
   const [workIssue, setWorkIssue] = useState<GitHubIssue | null>(null);
+  const [workflowSkills, setWorkflowSkills] = useState<WorkflowSkillStatus[]>([]);
   const activeScanId = useRef("");
   const cancelRequested = useRef(false);
   const refreshAfterScan = useRef(false);
@@ -61,6 +64,17 @@ function App() {
     window.addEventListener("hashchange", handleNavigation);
     return () => window.removeEventListener("hashchange", handleNavigation);
   }, []);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let active = true;
+    discoverWorkflowSkills().then((skills) => {
+      if (active) setWorkflowSkills(skills);
+    }).catch(() => {
+      if (active) setWorkflowSkills(["dev-work", "dev-push", "dev-build"].map((id) => ({ id: id as WorkflowSkillStatus["id"], status: "unavailable" })));
+    });
+    return () => { active = false; };
+  }, [desktop]);
 
   useEffect(() => {
     document.title = `Navis-Fabrica · v${__APP_VERSION__}`;
@@ -148,6 +162,7 @@ function App() {
   }, [projects]);
 
   const current = sections.find((item) => item.id === section) ?? sections[0];
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Work context" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
 
@@ -244,7 +259,8 @@ function App() {
           ) : section === "runs" ? (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading"><div><h2 id="project-list-title">Work context</h2><p>Issue details selected from a repository. Selection never edits GitHub.</p></div></div><div className="panel-rule" />
-              {workIssue ? <div className="work-context"><p className="eyebrow">READY FOR WORK</p><h3><a href={workIssue.url} target="_blank" rel="noreferrer">#{workIssue.number} · {workIssue.title} ↗</a></h3><p>{workIssue.body}</p>{workIssue.acceptanceCriteria.length > 0 && <div><strong>Acceptance criteria</strong><ul>{workIssue.acceptanceCriteria.map((criterion, index) => <li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{workIssue.blockedBy.length > 0 && <div><strong>Blockers</strong>{workIssue.blockedBy.map((blocker) => <a key={blocker.number} href={blocker.url} target="_blank" rel="noreferrer">#{blocker.number} · {blocker.title} ({blocker.state})</a>)}</div>}{workIssue.parentEpic && <div><strong>Parent epic</strong><a href={workIssue.parentEpic.url} target="_blank" rel="noreferrer">#{workIssue.parentEpic.number} · {workIssue.parentEpic.title}</a></div>}{workIssue.pullRequestUrls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">PR context: {url}</a>)}<small>Bounded read-only context · {workIssue.acceptanceCriteria.length} acceptance criteria · {workIssue.blockedBy.length} blockers</small><p className="issue-feedback">Workflow execution will be available in a later phase.</p></div> : <div className="empty-state"><h3>No issue context yet</h3><p>Choose an issue in a project’s GitHub activity panel to prepare its work context.</p><a href="#projects">Browse projects</a></div>}
+              {workIssue ? <div className="work-context"><p className="eyebrow">READY FOR WORK</p><h3><a href={workIssue.url} target="_blank" rel="noreferrer">#{workIssue.number} · {workIssue.title} ↗</a></h3><p>{workIssue.body}</p>{workIssue.acceptanceCriteria.length > 0 && <div><strong>Acceptance criteria</strong><ul>{workIssue.acceptanceCriteria.map((criterion, index) => <li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{workIssue.blockedBy.length > 0 && <div><strong>Blockers</strong>{workIssue.blockedBy.map((blocker) => <a key={blocker.number} href={blocker.url} target="_blank" rel="noreferrer">#{blocker.number} · {blocker.title} ({blocker.state})</a>)}</div>}{workIssue.parentEpic && <div><strong>Parent epic</strong><a href={workIssue.parentEpic.url} target="_blank" rel="noreferrer">#{workIssue.parentEpic.number} · {workIssue.parentEpic.title}</a></div>}{workIssue.pullRequestUrls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">PR context: {url}</a>)}<small>Bounded read-only context · {workIssue.acceptanceCriteria.length} acceptance criteria · {workIssue.blockedBy.length} blockers</small></div> : <div className="empty-state"><h3>No issue context yet</h3><p>Choose an issue in a project’s GitHub activity panel to prepare its work context.</p><a href="#projects">Browse projects</a></div>}
+              <WorkflowRegistry project={selectedProject} issue={workIssue} skills={workflowSkills} />
             </section>
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
@@ -290,6 +306,48 @@ function App() {
 }
 
 export default App;
+
+function WorkflowRegistry({ project, issue, skills }: {
+  project: ProjectEntry | null;
+  issue: GitHubIssue | null;
+  skills: WorkflowSkillStatus[];
+}) {
+  return <section className="workflow-registry" aria-labelledby="workflow-registry-title">
+    <div className="workflow-registry-heading">
+      <div><p className="eyebrow">PROJECT ACTIONS</p><h3 id="workflow-registry-title">Workflow registry</h3></div>
+      <span className="registry-phase">Registry only</span>
+    </div>
+    <p className="workflow-registry-intro">Actions describe their inputs, checks, and outputs. Skill files are discovered by reference and never executed as Markdown.</p>
+    {!project && <p className="registry-context-note">Select a project in Projects to check stack and tool compatibility.</p>}
+    {workflowActions.map((action) => {
+      const disabledReason = actionDisabledReason(action, project, issue, skills);
+      const skill = skills.find((entry) => entry.id === action.id);
+      return <article className="workflow-action" key={action.id}>
+        <div className="workflow-action-top">
+          <div><h4>{action.title}</h4><p>{action.summary}</p></div>
+          <button className="button button-secondary workflow-run-button" type="button" disabled aria-describedby={`${action.id}-disabled`}>Prepare</button>
+        </div>
+        <p className="workflow-disabled-reason" id={`${action.id}-disabled`}>{disabledReason}</p>
+        <div className="workflow-meta-grid">
+          <div><strong>Registry entry</strong><span>v{action.version} · {action.skillReference} · {skill?.status ?? "checking"}</span></div>
+          <div><strong>Supported stacks</strong><span>{action.supportedStacks === "all" ? "Any detected stack" : action.supportedStacks.join(", ")}</span></div>
+          {action.defaultBuildProfile && <div><strong>Build default</strong><span>{action.defaultBuildProfile}</span></div>}
+        </div>
+        <details className="workflow-details"><summary>Inputs, checks, effects, and outputs</summary>
+          <div className="workflow-detail-columns">
+            <div><strong>Inputs</strong><ul>{action.inputs.map((input) => <li key={input.id}>{input.label}{input.required ? " · required" : " · optional"}{input.defaultValue ? ` · default ${input.defaultValue}` : ""}{input.options ? ` · ${input.options.join(" / ")}` : ""}</li>)}</ul></div>
+            <div><strong>Checks</strong><ul>{action.checks.map((check) => <li key={check}>{check}</li>)}</ul></div>
+            <div><strong>Effect scope</strong><ul>
+              {(["commit", "push", "createPullRequest"] as WorkflowEffect[]).map((effect) => <li key={effect}>{effect === "createPullRequest" ? "Create PR" : effect} · {action.effectScope.permitted.includes(effect) ? "requires explicit opt-in" : "not permitted"}</li>)}
+              <li>Requested by default · {action.effectScope.defaultRequested.length ? action.effectScope.defaultRequested.join(", ") : "none"}</li>
+            </ul></div>
+            <div><strong>Expected artifacts</strong><ul>{action.outputArtifacts.map((artifact) => <li key={artifact}>{artifact}</li>)}</ul></div>
+          </div>
+        </details>
+      </article>;
+    })}
+  </section>;
+}
 
 function gitStatusLabel(status: string): string {
   switch (status) {

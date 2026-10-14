@@ -613,6 +613,62 @@ fn get_settings(app: AppHandle) -> Result<Settings, String> {
     load_settings(&settings_path(&app)?)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowSkillStatus {
+    id: String,
+    status: &'static str,
+}
+
+const WORKFLOW_SKILL_IDS: [&str; 3] = ["dev-work", "dev-push", "dev-build"];
+
+fn workflow_skills_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(root).join("skills"));
+    }
+    std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".codex").join("skills"))
+}
+
+fn workflow_skill_status(skills_root: &Path, id: &str) -> &'static str {
+    if !WORKFLOW_SKILL_IDS.contains(&id) {
+        return "missing";
+    }
+    let root = match fs::canonicalize(skills_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "missing",
+        Err(_) => return "unavailable",
+    };
+    let skill_file = skills_root.join(id).join("SKILL.md");
+    match fs::metadata(&skill_file) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return "missing",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "missing",
+        Err(_) => return "unavailable",
+    }
+    match fs::canonicalize(&skill_file) {
+        Ok(resolved) if resolved.starts_with(root) => "available",
+        Ok(_) => "unavailable",
+        Err(_) => "unavailable",
+    }
+}
+
+#[tauri::command]
+fn discover_workflow_skills() -> Vec<WorkflowSkillStatus> {
+    let root = workflow_skills_root();
+    WORKFLOW_SKILL_IDS
+        .iter()
+        .map(|id| WorkflowSkillStatus {
+            id: (*id).to_owned(),
+            status: root
+                .as_deref()
+                .map(|path| workflow_skill_status(path, id))
+                .unwrap_or("unavailable"),
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, String> {
     providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
@@ -945,6 +1001,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            discover_workflow_skills,
             save_settings,
             inspect_providers,
             get_cached_github_activity,
@@ -967,6 +1024,24 @@ mod tests {
         assert!(!can_restore_github_cache("available", false));
         assert!(can_restore_github_cache("available", true));
         assert!(can_restore_github_cache("notConfigured", false));
+    }
+
+    #[test]
+    fn discovers_only_known_skill_references_inside_the_codex_skills_root() {
+        let folder = tempfile::tempdir().unwrap();
+        let skill = folder.path().join("dev-work");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: dev-work\n---\n").unwrap();
+
+        assert_eq!(
+            workflow_skill_status(folder.path(), "dev-work"),
+            "available"
+        );
+        assert_eq!(workflow_skill_status(folder.path(), "dev-push"), "missing");
+        assert_eq!(
+            workflow_skill_status(folder.path(), "../../outside"),
+            "missing"
+        );
     }
 
     #[test]

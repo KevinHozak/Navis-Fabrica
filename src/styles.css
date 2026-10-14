@@ -304,3 +304,23 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
   .project-details { flex-basis: calc(100% - 50px); }
   .project-tags { margin-left: 47px; justify-content: flex-start; }
 }
+
+.workflow-registry { border-top: 1px solid #2a3543; margin-top: 24px; padding-top: 22px; }
+.workflow-registry-heading, .workflow-action-top { align-items: flex-start; display: flex; gap: 16px; justify-content: space-between; }
+.workflow-registry-heading h3, .workflow-action h4 { margin: 0; }
+.workflow-registry-intro, .workflow-action-top p { color: #8995a5; margin: 5px 0 12px; }
+.registry-phase, .registry-context-note { background: #172433; border: 1px solid #30465d; border-radius: 999px; color: #a4d2ff; font-size: 10px; padding: 5px 9px; }
+.registry-context-note { border-radius: 8px; margin: 12px 0; }
+.workflow-action { background: #111720; border: 1px solid #2a3543; border-radius: 10px; margin-top: 12px; padding: 15px; }
+.workflow-run-button { flex: 0 0 auto; }
+.workflow-disabled-reason { color: #e6bd79; font-size: 11px; margin: 3px 0 12px; }
+.workflow-meta-grid, .workflow-detail-columns { display: grid; gap: 12px 17px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+.workflow-meta-grid > div, .workflow-detail-columns > div { display: grid; gap: 4px; }
+.workflow-meta-grid strong, .workflow-detail-columns strong { color: #dce5f0; font-size: 10px; }
+.workflow-meta-grid span { color: #8995a5; font-size: 10px; overflow-wrap: anywhere; }
+.workflow-details { margin-top: 13px; }
+.workflow-details summary { cursor: pointer; font-size: 10px; }
+.workflow-detail-columns { margin-top: 12px; }
+.workflow-detail-columns ul { color: #8995a5; font-size: 10px; margin: 3px 0 0; padding-left: 16px; }
+.workflow-detail-columns li + li { margin-top: 3px; }
+@media (max-width: 600px) { .workflow-action-top { flex-direction: column; } }

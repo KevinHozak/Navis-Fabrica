@@ -50,7 +50,7 @@ All roadmap items start in Backlog. Foundation-P1 is the suggested first impleme
 - Standalone Tauri 2/Rust application, React/TypeScript with Vite; no always-running Python or Next server is required.
 - Local application settings/history use app-specific storage; credentials use provider-managed auth or Windows credential storage.
 - Treat GitHub as optional: offline/local projects remain useful.
-- Validate installed Antigravity entry points before selecting a CLI/SDK integration; discovery in this session found Codex and Ollama on PATH, but not Antigravity.
+- Antigravity's installed `agy` CLI was validated at version 1.0.10. Its installed help's headless flags are integrated; model discovery remains unavailable until the CLI is signed in. See `docs/verification.md` for evidence and limitations.
 - Select an Ollama-compatible coding harness during its phase; raw model inference is insufficient.
 - Calibrate complexity/latency against the user's own tasks; do not hard-code specific model names or pretend tokens determine difficulty.
 - Windows first; portability can follow after process management and paths have verified behavior.
@@ -61,5 +61,5 @@ Inspected `C:\Projects\Navis-Protocol\frontend\src\app\globals.css`, frontend pa
 
 - [Tauri project setup](https://v2.tauri.app/start/create-project/) and [capabilities](https://tauri.app/security/capabilities/).
 - [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) and [Codex SDK](https://learn.chatgpt.com/docs/codex-sdk): candidate integration surfaces; exact supported behavior must be verified against the installed version.
-- [Antigravity CLI reference](https://www.antigravity.google/docs/cli/reference/): candidate adapter surface, not locally verified availability.
+- [Antigravity CLI headless documentation](https://www.antigravity.google/docs/cli/headless/): reference surface; installed-version support and auth limits are recorded in `docs/verification.md`.
 - [Ollama model list API](https://docs.ollama.com/api/tags): local discovery surface; coding tool execution is a separate design responsibility.

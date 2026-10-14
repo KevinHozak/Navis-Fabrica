@@ -94,6 +94,14 @@ pub struct CodexStartRequest {
     pub timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AntigravityStartRequest {
+    pub cwd: String,
+    pub prompt: String,
+    pub timeout_seconds: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexRunConfig {
     pub executable: PathBuf,
@@ -103,6 +111,15 @@ pub struct CodexRunConfig {
     pub prompt: String,
     pub skill_id: Option<String>,
     pub skill_path: Option<PathBuf>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AntigravityRunConfig {
+    pub executable: PathBuf,
+    pub cwd: PathBuf,
+    pub model_id: String,
+    pub prompt: String,
     pub timeout_seconds: u64,
 }
 
@@ -1083,7 +1100,7 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
 
 #[tauri::command]
 pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRecord, String> {
-    start_run(app, request, None)
+    start_run(app, request, None, None)
 }
 
 pub fn start_codex_workflow_run(
@@ -1118,13 +1135,52 @@ pub fn start_codex_workflow_run(
         timeout_seconds,
         mutating: true,
     };
-    start_run(app, request, Some(config))
+    start_run(app, request, Some(config), Some("codex"))
+}
+
+pub fn start_antigravity_workflow_run(
+    app: AppHandle,
+    config: AntigravityRunConfig,
+) -> Result<RunRecord, String> {
+    if config.prompt.trim().is_empty()
+        || config.prompt.len() > 60_000
+        || config.prompt.contains('\0')
+    {
+        return Err("Enter a prompt of 1 to 60,000 characters for Antigravity.".into());
+    }
+    if config.model_id.trim().is_empty()
+        || config.model_id.len() > 160
+        || config.model_id.chars().any(char::is_control)
+    {
+        return Err("Select a valid configured Antigravity model.".into());
+    }
+    let cwd = config
+        .cwd
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() {
+        return Err("The selected project must be an existing folder.".into());
+    }
+    ensure_clean_git_worktree(&cwd)?;
+    let request = StartRequest {
+        executable: config.executable.to_string_lossy().into_owned(),
+        arguments: crate::providers::antigravity_arguments(
+            &config.model_id,
+            &config.prompt,
+            config.timeout_seconds,
+        ),
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds: config.timeout_seconds,
+        mutating: true,
+    };
+    start_run(app, request, None, Some("antigravity"))
 }
 
 fn start_run(
     app: AppHandle,
     request: StartRequest,
     codex: Option<CodexRunConfig>,
+    provider: Option<&'static str>,
 ) -> Result<RunRecord, String> {
     let codex_run = codex.is_some();
     let (executable, cwd, host) = validate_request(&request)?;
@@ -1163,7 +1219,7 @@ fn start_run(
     let record = RunRecord {
         id: id.clone(),
         executable: executable.to_string_lossy().into_owned(),
-        provider: codex.as_ref().map(|_| "codex".into()),
+        provider: provider.map(str::to_owned),
         cwd: cwd.to_string_lossy().into_owned(),
         thread_id: None,
         mutating: request.mutating,

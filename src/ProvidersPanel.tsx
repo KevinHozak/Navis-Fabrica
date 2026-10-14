@@ -4,25 +4,28 @@ import {
   loadSettings,
   ModelProfile,
   ProviderAvailability,
+  AntigravityProbe,
   ProviderKind,
   ProviderProfile,
   ProviderSelection,
   saveSettings,
   Settings,
   inspectProviders,
+  probeAntigravityCli,
 } from "./settings";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
 const executableDefaults: Record<ProviderKind, string> = {
   codex: "codex",
-  antigravity: "antigravity",
+  antigravity: "agy",
   ollama: "ollama",
   custom: "",
 };
 
 const capabilityLabels: [keyof ProviderAvailability["capabilities"], string][] = [
   ["discovery", "Executable discovery"], ["health", "Health"], ["modelListing", "Model listing"],
+  ["skillSupport", "Skills"],
   ["runStart", "Start runs"], ["runCancel", "Cancel runs"], ["eventStream", "Events"],
   ["approvalRequests", "Approval requests"], ["interactiveInput", "User input"], ["checkpoints", "Checkpoints"],
 ];
@@ -30,6 +33,8 @@ const capabilityLabels: [keyof ProviderAvailability["capabilities"], string][] =
 export function ProvidersPanel() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [availability, setAvailability] = useState<ProviderAvailability[]>([]);
+  const [probes, setProbes] = useState<Record<string, AntigravityProbe>>({});
+  const [probingId, setProbingId] = useState<string | null>(null);
   const [kind, setKind] = useState<ProviderKind>("codex");
   const [name, setName] = useState("Codex");
   const [executable, setExecutable] = useState("codex");
@@ -94,6 +99,16 @@ export function ProvidersPanel() {
     }
   }
 
+  async function probeAntigravity(providerId: string) {
+    setProbingId(providerId);
+    try {
+      const result = await probeAntigravityCli(providerId);
+      setProbes((current) => ({ ...current, [providerId]: result }));
+    } catch (error) {
+      setProbes((current) => ({ ...current, [providerId]: { version: null, state: "unavailable", models: [], note: error instanceof Error ? error.message : String(error) } }));
+    } finally { setProbingId(null); }
+  }
+
   function addProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!settings || !name.trim() || !executable.trim() || !modelId.trim() || !modelName.trim()) return;
@@ -107,7 +122,7 @@ export function ProvidersPanel() {
       kind,
       name: name.trim(),
       executable: executable.trim(),
-      secretRef: secretRef.trim() || null,
+      secretRef: kind === "antigravity" ? null : secretRef.trim() || null,
       models: [model],
     };
     const providers = [...settings.providers, provider];
@@ -146,7 +161,7 @@ export function ProvidersPanel() {
           </label>
           <label className="settings-field" htmlFor="runtime-id"><span>Runtime ID</span>
             <input id="runtime-id" value={runtimeId} maxLength={160} placeholder="e.g. codex-cli" onChange={(event) => setRuntimeId(event.target.value)} onBlur={() => settings && void persist({ ...settings, providerSelection: { ...settings.providerSelection, runtimeId: runtimeId.trim() || null } })} />
-            <small>Stored separately from the provider and model. Choose codex-app-server to run Codex from the Runs view.</small>
+            <small>Stored separately from the provider and model. Choose codex-app-server or agy-cli to select the Runs adapter.</small>
           </label>
         </div>
         <div className="provider-feedback" role={saveState === "error" ? "alert" : "status"} aria-live="polite">{message || (desktop ? "Configuration is local to this app." : "Browser preview stores configuration in this browser.")}</div>
@@ -167,12 +182,16 @@ export function ProvidersPanel() {
             <p className="provider-models">Manual models: {provider.models.map((model) => `${model.name} (${model.id})`).join(", ")}</p>
             <div className="provider-status-grid">
               <span className={status?.executableFound ? "status-supported" : "status-unsupported"}>Executable: {status ? status.executableFound ? status.executablePath : "missing" : desktop ? "not checked" : "desktop check unavailable"}</span>
-              <span className="status-unsupported">Authentication: {status ? status.authenticationReference === "referenceConfigured" ? "reference configured; validity unknown" : "reference missing" : provider.secretRef ? "reference configured; validity unknown" : "reference missing"}</span>
+              <span className="status-unsupported">Authentication: {provider.kind === "antigravity" ? probes[provider.id]?.state ?? "CLI sign-in not probed" : status ? status.authenticationReference === "referenceConfigured" ? "reference configured; validity unknown" : "reference missing" : provider.secretRef ? "reference configured; validity unknown" : "reference missing"}</span>
             </div>
             <div className="provider-capabilities" aria-label="Provider adapter capabilities">{capabilityLabels.map(([key, label]) => {
               const support = status ? status.capabilities[key] ? "supported" : "unsupported" : desktop ? "not checked" : "desktop check unavailable";
               return <span key={key} className={status ? status.capabilities[key] ? "status-supported" : "status-unsupported" : ""}>{label}: {support}</span>;
             })}</div>
+            {provider.kind === "antigravity" && <div className="settings-actions">
+              <button className="button button-secondary" type="button" disabled={!desktop || probingId === provider.id} onClick={() => { void probeAntigravity(provider.id); }}>{probingId === provider.id ? "Probing…" : "Probe agy CLI"}</button>
+              {probes[provider.id] && <div className="provider-feedback" role="status"><strong>{probes[provider.id].version ?? "Version unavailable"}</strong> · {probes[provider.id].state}: {probes[provider.id].note}{probes[provider.id].models.length > 0 && <p>Available model IDs: {probes[provider.id].models.join(", ")}</p>}</div>}
+            </div>}
           </li>;
         })}</ul> : <div className="provider-empty">No provider profiles yet. Add one below to configure a manual choice.</div>}
       </section>
@@ -185,16 +204,17 @@ export function ProvidersPanel() {
             setKind(nextKind);
             setName(nextKind === "custom" ? "Custom runtime" : nextKind[0].toUpperCase() + nextKind.slice(1));
             setExecutable(executableDefaults[nextKind]);
+            setEfforts(nextKind === "antigravity" ? "" : "low, medium, high");
           }}><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="ollama">Ollama</option><option value="custom">Custom runtime</option></select></label>
           <label className="settings-field" htmlFor="provider-name"><span>Display name</span><input id="provider-name" maxLength={100} required value={name} onChange={(event) => setName(event.target.value)} /></label>
-          <label className="settings-field" htmlFor="provider-executable"><span>Executable name or path</span><input id="provider-executable" maxLength={260} required value={executable} onChange={(event) => setExecutable(event.target.value)} /><small>Checked for presence only. Nothing is executed.</small></label>
-          <label className="settings-field" htmlFor="provider-secret-ref"><span>Authentication secret reference</span><input id="provider-secret-ref" maxLength={260} value={secretRef} onChange={(event) => setSecretRef(event.target.value)} placeholder="credential-store:provider-name" /><small>Use credential-store:key or provider-managed:key. Never enter a token or password here.</small></label>
+          <label className="settings-field" htmlFor="provider-executable"><span>Executable name or path</span><input id="provider-executable" maxLength={260} required value={executable} onChange={(event) => setExecutable(event.target.value)} /><small>Presence checks do not execute it. Use “Probe agy CLI” on a saved Antigravity profile to check version and model sign-in status.</small></label>
+          <label className="settings-field" htmlFor="provider-secret-ref"><span>Authentication secret reference</span><input id="provider-secret-ref" maxLength={260} value={secretRef} onChange={(event) => setSecretRef(event.target.value)} placeholder={kind === "antigravity" ? "Not used by the agy adapter" : "credential-store:provider-name"} /><small>{kind === "antigravity" ? "Sign-in is managed by the installed agy CLI; do not enter a token here." : "Use credential-store:key or provider-managed:key. Never enter a token or password here."}</small></label>
           <div className="provider-inline-fields">
             <label className="settings-field" htmlFor="model-id"><span>Model ID</span><input id="model-id" maxLength={160} required value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="provider model identifier" /></label>
             <label className="settings-field" htmlFor="model-name"><span>Model display name</span><input id="model-name" maxLength={100} required value={modelName} onChange={(event) => setModelName(event.target.value)} /></label>
           </div>
-          <label className="settings-field" htmlFor="model-efforts"><span>Supported reasoning effort labels</span><input id="model-efforts" value={efforts} onChange={(event) => setEfforts(event.target.value)} /><small>Comma-separated manual labels, for example low, medium, high.</small></label>
-          <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Codex runs are available from the Runs view; other provider operations remain unsupported."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
+          <label className="settings-field" htmlFor="model-efforts"><span>{kind === "antigravity" ? "Reasoning effort labels (unsupported by installed CLI)" : "Supported reasoning effort labels"}</span><input id="model-efforts" value={efforts} disabled={kind === "antigravity"} onChange={(event) => setEfforts(event.target.value)} /><small>{kind === "antigravity" ? "The installed agy CLI help does not expose an effort flag." : "Comma-separated manual labels, for example low, medium, high."}</small></label>
+          <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Codex and Antigravity headless runs are available from Runs; other provider operations remain unsupported."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
         </form>
       </section>
     </div>

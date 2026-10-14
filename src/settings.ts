@@ -46,6 +46,7 @@ export type ProviderAvailability = {
     discovery: boolean;
     health: boolean;
     modelListing: boolean;
+    skillSupport: boolean;
     runStart: boolean;
     runCancel: boolean;
     eventStream: boolean;
@@ -55,6 +56,7 @@ export type ProviderAvailability = {
   };
   note: string;
 };
+export type AntigravityProbe = { version: string | null; state: "ready" | "authenticationRequired" | "unavailable"; models: string[]; note: string };
 
 export type ProjectEntry = {
   id: string;
@@ -102,6 +104,7 @@ export type WorkflowRun = {
   nextSequence: number; events: WorkflowRunEvent[];
 };
 export type CodexStartRequest = { cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number };
+export type AntigravityStartRequest = { cwd: string; prompt: string; timeoutSeconds: number };
 export type WorkflowRunRequest = {
   executable: string; arguments: string[]; cwd: string; timeoutSeconds: number; mutating: boolean;
 };
@@ -193,6 +196,8 @@ export const cancelProjectScan = (scanId: string) =>
 
 export const inspectProviders = (profiles: ProviderProfile[]) =>
   invoke<ProviderAvailability[]>("inspect_providers", { profiles });
+export const probeAntigravityCli = (providerId: string) =>
+  invoke<AntigravityProbe>("probe_antigravity_cli", { providerId });
 
 export const getCachedGitHubActivity = (owner: string, repository: string) =>
   invoke<GitHubActivity>("get_cached_github_activity", { owner, repository });
@@ -211,6 +216,8 @@ export const startWorkflowRun = (request: WorkflowRunRequest) =>
   invoke<WorkflowRun>("start_workflow_run", { request });
 export const startCodexWorkflowRun = (request: CodexStartRequest) =>
   invoke<WorkflowRun>("start_codex_workflow_run", { request });
+export const startAntigravityWorkflowRun = (request: AntigravityStartRequest) =>
+  invoke<WorkflowRun>("start_antigravity_workflow_run", { request });
 export const respondCodexApproval = (runId: string, requestId: string, decision: string) =>
   invoke<boolean>("respond_codex_approval", { runId, requestId, decision });
 export const respondCodexUserInput = (runId: string, requestId: string, answers: Record<string, string[]>) =>

@@ -810,6 +810,27 @@ fn inspect_providers(
 }
 
 #[tauri::command]
+fn probe_antigravity_cli(
+    app: AppHandle,
+    provider_id: String,
+) -> Result<providers::AntigravityProbe, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    let profile = settings
+        .providers
+        .iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or("The Antigravity provider profile no longer exists.")?;
+    if profile.kind != providers::ProviderKind::Antigravity {
+        return Err("Choose an Antigravity provider to probe.".into());
+    }
+    let path = std::env::var_os("PATH");
+    let executable = providers::find_executable(&profile.executable, path.as_deref()).ok_or(
+        "The configured Antigravity executable is not available on PATH or at its saved path.",
+    )?;
+    Ok(providers::probe_antigravity(&executable))
+}
+
+#[tauri::command]
 fn start_codex_workflow_run(
     app: AppHandle,
     request: runs::CodexStartRequest,
@@ -880,6 +901,79 @@ fn start_codex_workflow_run(
             prompt: request.prompt,
             skill_id: request.skill_id,
             skill_path,
+            timeout_seconds: request.timeout_seconds,
+        },
+    )
+}
+
+#[tauri::command]
+fn start_antigravity_workflow_run(
+    app: AppHandle,
+    request: runs::AntigravityStartRequest,
+) -> Result<runs::RunRecord, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
+    let selection = &settings.provider_selection;
+    let provider_id = selection
+        .provider_id
+        .as_deref()
+        .ok_or("Choose an Antigravity provider in Providers first.")?;
+    let provider = settings
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or("The selected provider is no longer configured.")?;
+    if provider.kind != providers::ProviderKind::Antigravity {
+        return Err("The selected provider is not Antigravity.".into());
+    }
+    if selection.reasoning_effort.is_some() {
+        return Err("The installed Antigravity CLI does not expose a reasoning-effort flag; clear the selected effort to run.".into());
+    }
+    if selection.runtime_id.as_deref().is_some_and(|runtime| {
+        !runtime.is_empty() && runtime != "agy-cli" && runtime != "antigravity-cli"
+    }) {
+        return Err("This phase supports the Antigravity CLI runtime only.".into());
+    }
+    let model_id = selection
+        .model_id
+        .as_deref()
+        .ok_or("Choose a configured Antigravity model in Providers first.")?;
+    let model = provider
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or("The selected model is not configured for this Antigravity provider.")?;
+    if selection.reasoning_effort.as_deref().is_some_and(|effort| {
+        !model
+            .reasoning_efforts
+            .iter()
+            .any(|supported| supported == effort)
+    }) {
+        return Err("The selected reasoning effort is not supported by this model profile.".into());
+    }
+    let root = Path::new(&settings.project_root)
+        .canonicalize()
+        .map_err(|_| "The configured project root could not be resolved.".to_string())?;
+    let cwd = Path::new(&request.cwd)
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() || !cwd.starts_with(&root) {
+        return Err(
+            "Antigravity can only run in a project folder inside the configured project root."
+                .into(),
+        );
+    }
+    let path = std::env::var_os("PATH");
+    let executable = providers::find_executable(&provider.executable, path.as_deref()).ok_or(
+        "The configured Antigravity executable is not available on PATH or at its saved path.",
+    )?;
+    runs::start_antigravity_workflow_run(
+        app,
+        runs::AntigravityRunConfig {
+            executable,
+            cwd,
+            model_id: model.id.clone(),
+            prompt: request.prompt,
             timeout_seconds: request.timeout_seconds,
         },
     )
@@ -1132,7 +1226,9 @@ pub fn run() {
             discover_workflow_skills,
             save_settings,
             inspect_providers,
+            probe_antigravity_cli,
             start_codex_workflow_run,
+            start_antigravity_workflow_run,
             get_cached_github_activity,
             refresh_github_activity,
             list_github_issues,

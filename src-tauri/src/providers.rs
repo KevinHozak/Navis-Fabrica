@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::Receiver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +26,7 @@ impl ProviderKind {
     pub fn default_executable(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Antigravity => "antigravity",
+            Self::Antigravity => "agy",
             Self::Ollama => "ollama",
             Self::Custom => "",
         }
@@ -77,6 +78,7 @@ pub struct AdapterCapabilities {
     pub discovery: bool,
     pub health: bool,
     pub model_listing: bool,
+    pub skill_support: bool,
     pub run_start: bool,
     pub run_cancel: bool,
     pub event_stream: bool,
@@ -103,6 +105,111 @@ pub struct ProviderAvailability {
     pub authentication_reference: AuthenticationReferenceStatus,
     pub capabilities: AdapterCapabilities,
     pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityProbe {
+    pub version: Option<String>,
+    pub state: String,
+    pub models: Vec<String>,
+    pub note: String,
+}
+
+pub fn probe_antigravity(executable: &Path) -> AntigravityProbe {
+    let temp = match tempfile::tempdir() {
+        Ok(temp) => temp,
+        Err(_) => {
+            return AntigravityProbe {
+                version: None,
+                state: "unavailable".into(),
+                models: Vec::new(),
+                note: "Could not create a temporary directory for the provider probe.".into(),
+            }
+        }
+    };
+    let version = Command::new(executable)
+        .current_dir(temp.path())
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })
+        .filter(|value| !value.is_empty());
+    if version.is_none() {
+        return AntigravityProbe {
+            version: None,
+            state: "unavailable".into(),
+            models: Vec::new(),
+            note: "The Antigravity CLI version probe could not complete.".into(),
+        };
+    }
+    let models = Command::new(executable)
+        .current_dir(temp.path())
+        .arg("models")
+        .output();
+    match models {
+        Ok(output) if output.status.success() => {
+            let models = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| name.starts_with("gemini-"))
+                .map(str::to_owned)
+                .take(200)
+                .collect::<Vec<_>>();
+            AntigravityProbe {
+                version,
+                state: "ready".into(),
+                note: if models.is_empty() {
+                    "The CLI is available, but it returned no model identifiers.".into()
+                } else {
+                    "Authenticated CLI; model IDs were read from agy models.".into()
+                },
+                models,
+            }
+        }
+        Ok(output) => {
+            let diagnostic = format!(
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .to_ascii_lowercase();
+            let authentication_required = [
+                "sign in",
+                "not logged",
+                "authentication required",
+                "auth required",
+            ]
+            .iter()
+            .any(|marker| diagnostic.contains(marker));
+            AntigravityProbe {
+                version,
+                state: if authentication_required {
+                    "authenticationRequired"
+                } else {
+                    "unavailable"
+                }
+                .into(),
+                models: Vec::new(),
+                note: if authentication_required {
+                    "The CLI is installed, but model discovery requires an Antigravity sign-in. No credentials were read into Navis-Fabrica.".into()
+                } else {
+                    "The CLI is installed, but model discovery is unavailable. Diagnostics were omitted to avoid exposing credential data.".into()
+                },
+            }
+        }
+        Err(_) => AntigravityProbe {
+            version,
+            state: "unavailable".into(),
+            models: Vec::new(),
+            note: "The Antigravity model-list command could not start.".into(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +274,19 @@ pub struct CodexEvent {
     pub kind: String,
     pub text: String,
     pub terminal_state: Option<String>,
+}
+
+pub fn antigravity_arguments(model_id: &str, prompt: &str, timeout_seconds: u64) -> Vec<String> {
+    let arguments = vec![
+        "--sandbox".into(),
+        "--print-timeout".into(),
+        format!("{timeout_seconds}s"),
+        "--model".into(),
+        model_id.into(),
+        "--print".into(),
+        prompt.into(),
+    ];
+    arguments
 }
 
 pub fn app_server_initialize(request_id: u64, app_version: &str) -> Value {
@@ -428,8 +548,18 @@ pub fn inspect(
             run_start: true,
             run_cancel: true,
             event_stream: true,
+            skill_support: true,
             approval_requests: true,
             interactive_input: true,
+            ..AdapterCapabilities::local_preflight()
+        },
+        ProviderKind::Antigravity => AdapterCapabilities {
+            health: true,
+            model_listing: true,
+            run_start: true,
+            run_cancel: true,
+            event_stream: true,
+            skill_support: true,
             ..AdapterCapabilities::local_preflight()
         },
         _ => AdapterCapabilities::local_preflight(),
@@ -450,6 +580,8 @@ pub fn inspect(
         capabilities,
         note: if profile.kind == ProviderKind::Codex {
             "Codex app-server runs are supported with streamed output, on-request approvals, and user input. Authentication is checked when a run starts; this check never launches the provider.".into()
+        } else if profile.kind == ProviderKind::Antigravity {
+            "Antigravity uses the installed agy --print CLI with process output and cancellation. This version does not expose structured progress or reasoning-effort flags; model listing requires sign-in. Headless approvals, interactive input, and resumable checkpoints are unavailable.".into()
         } else {
             "Executable presence is checked without launching it. Authentication validity and provider operations are not implemented by this adapter.".into()
         },
@@ -642,6 +774,43 @@ mod tests {
         let value = serde_json::to_value(profile()).unwrap();
         assert_eq!(value["secretRef"], "credential-store:codex-session");
         assert!(value.get("secret").is_none());
+    }
+
+    #[test]
+    fn antigravity_command_uses_documented_flags_and_keeps_prompt_as_one_argument() {
+        let args = antigravity_arguments("gemini-test", "echo `danger`", 90);
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox",
+                "--print-timeout",
+                "90s",
+                "--model",
+                "gemini-test",
+                "--print",
+                "echo `danger`"
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_capabilities_do_not_claim_interaction_support() {
+        let mut profile = profile();
+        profile.kind = ProviderKind::Antigravity;
+        let status = inspect(&profile, None);
+        assert!(status.capabilities.health);
+        assert!(status.capabilities.model_listing);
+        assert!(status.capabilities.skill_support);
+        assert!(
+            status.capabilities.run_start
+                && status.capabilities.run_cancel
+                && status.capabilities.event_stream
+        );
+        assert!(
+            !status.capabilities.approval_requests
+                && !status.capabilities.interactive_input
+                && !status.capabilities.checkpoints
+        );
     }
 
     #[test]

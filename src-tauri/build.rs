@@ -6,6 +6,8 @@ fn main() {
             "start_project_scan",
             "cancel_project_scan",
             "inspect_providers",
+            "probe_antigravity_cli",
+            "start_antigravity_workflow_run",
             "list_github_issues",
             "get_github_issue",
         ]),

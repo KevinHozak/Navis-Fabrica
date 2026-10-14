@@ -18,6 +18,8 @@ const MAX_EVENTS: usize = 2_000;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_CHUNK: usize = 4 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_EVENT_BYTES: usize = 32 * 1024;
+const MAX_PENDING_CODEX_REQUESTS: usize = 16;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -211,6 +213,25 @@ fn mutation_scope(cwd: &Path) -> String {
         .unwrap_or(cwd)
         .to_string_lossy()
         .to_lowercase()
+}
+
+pub fn ensure_clean_git_worktree(cwd: &Path) -> Result<(), String> {
+    let Some(repo_root) = cwd.ancestors().find(|folder| folder.join(".git").exists()) else {
+        return Ok(());
+    };
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map_err(|_| "Could not verify Git status; Codex was not started.".to_string())?;
+    if !status.status.success() {
+        return Err("Could not verify Git status; Codex was not started.".into());
+    }
+    if !status.stdout.is_empty() {
+        return Err("Codex requires a clean Git worktree to protect existing changes. Commit or stash your changes, or select a clean worktree.".into());
+    }
+    Ok(())
 }
 
 fn command_for(
@@ -413,22 +434,29 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
     if !store.records.iter().any(|record| record.id == id) {
         return;
     }
-    if *store.output_bytes.get(id).unwrap_or(&0) >= MAX_OUTPUT_BYTES {
+    let uses_output_budget = output_budget_applies(kind);
+    if uses_output_budget && *store.output_bytes.get(id).unwrap_or(&0) >= MAX_OUTPUT_BYTES {
         return;
     }
     let secrets = store.redaction_values.get(id).cloned().unwrap_or_default();
     let safe_text = redact(text, &secrets);
     let output_bytes = store.output_bytes.entry(id.to_owned()).or_default();
-    let accepted = safe_text
-        .len()
-        .min(MAX_OUTPUT_BYTES.saturating_sub(*output_bytes));
+    let accepted = if uses_output_budget {
+        safe_text
+            .len()
+            .min(MAX_OUTPUT_BYTES.saturating_sub(*output_bytes))
+    } else {
+        safe_text.len()
+    };
     let truncated = accepted < safe_text.len();
     let mut end = accepted;
     while !safe_text.is_char_boundary(end) {
         end -= 1;
     }
     let text = safe_text[..end].to_owned();
-    *output_bytes += accepted;
+    if uses_output_budget {
+        *output_bytes += accepted;
+    }
     let run_id = id.to_owned();
     let Some(record) = store.records.iter_mut().find(|record| record.id == id) else {
         return;
@@ -461,6 +489,15 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
     }
     let _ = persist_records(path, &store.records);
     let _ = app.emit("workflow-run-event", (run_id, event));
+}
+
+fn emit_control_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
+    debug_assert!(matches!(kind, "approvalRequest" | "userInputRequest"));
+    emit_event(app, path, id, kind, text);
+}
+
+fn output_budget_applies(kind: &str) -> bool {
+    !matches!(kind, "approvalRequest" | "userInputRequest")
 }
 
 fn set_state(app: &AppHandle, path: &Path, id: &str, state: &str, exit_code: Option<i32>) {
@@ -650,12 +687,7 @@ fn drive_codex_protocol(
         finish_codex_run(&app, &path, &run_id, "failed", "providerError", &message);
         return;
     }
-    if send_codex_message(
-        &writer,
-        &serde_json::json!({ "jsonrpc": "2.0", "method": "initialized" }),
-    )
-    .is_err()
-    {
+    if send_codex_message(&writer, &serde_json::json!({ "method": "initialized" })).is_err() {
         finish_codex_run(
             &app,
             &path,
@@ -898,12 +930,81 @@ fn handle_codex_message(
                 | "item/permissions/requestApproval"
                 | "item/tool/requestUserInput"
         ) {
+            let Some(event) = crate::providers::normalize_app_server_message(message) else {
+                finish_codex_run(
+                    app,
+                    path,
+                    run_id,
+                    "failed",
+                    "providerError",
+                    "Codex sent an invalid approval or input request.",
+                );
+                if let Ok(mut child) = child.lock() {
+                    terminate_process_tree(&mut child);
+                }
+                return;
+            };
+            if event.text.len() > MAX_CONTROL_EVENT_BYTES {
+                finish_codex_run(
+                    app,
+                    path,
+                    run_id,
+                    "failed",
+                    "providerError",
+                    "Codex sent an approval or input request that exceeds the size limit.",
+                );
+                if let Ok(mut child) = child.lock() {
+                    terminate_process_tree(&mut child);
+                }
+                return;
+            }
             let Some(request_id) = message.get("id").cloned() else {
+                finish_codex_run(
+                    app,
+                    path,
+                    run_id,
+                    "failed",
+                    "providerError",
+                    "Codex sent an approval or input request without an identifier.",
+                );
+                if let Ok(mut child) = child.lock() {
+                    terminate_process_tree(&mut child);
+                }
                 return;
             };
             let Some(key) = codex_request_key(&request_id) else {
+                finish_codex_run(
+                    app,
+                    path,
+                    run_id,
+                    "failed",
+                    "providerError",
+                    "Codex sent an unsupported approval or input request identifier.",
+                );
+                if let Ok(mut child) = child.lock() {
+                    terminate_process_tree(&mut child);
+                }
                 return;
             };
+            let pending_count = store()
+                .lock()
+                .ok()
+                .and_then(|state| state.codex_requests.get(run_id).map(HashMap::len))
+                .unwrap_or(0);
+            if pending_count >= MAX_PENDING_CODEX_REQUESTS {
+                finish_codex_run(
+                    app,
+                    path,
+                    run_id,
+                    "failed",
+                    "providerError",
+                    "Codex has too many unresolved approval or input requests.",
+                );
+                if let Ok(mut child) = child.lock() {
+                    terminate_process_tree(&mut child);
+                }
+                return;
+            }
             let params = message
                 .get("params")
                 .cloned()
@@ -916,16 +1017,14 @@ fn handle_codex_message(
                     .insert(
                         key,
                         PendingCodexRequest {
-                            request_id: request_id.clone(),
+                            request_id,
                             method: method.to_owned(),
                             params,
                         },
                     );
             }
-            if let Some(event) = crate::providers::normalize_app_server_message(message) {
-                set_state(app, path, run_id, "needsInput", None);
-                emit_event(app, path, run_id, &event.kind, &event.text);
-            }
+            set_state(app, path, run_id, "needsInput", None);
+            emit_control_event(app, path, run_id, &event.kind, &event.text);
             return;
         }
     }
@@ -1010,6 +1109,7 @@ pub fn start_codex_workflow_run(
     if !cwd.is_dir() {
         return Err("The selected project must be an existing folder.".into());
     }
+    ensure_clean_git_worktree(&cwd)?;
     let timeout_seconds = config.timeout_seconds;
     let request = StartRequest {
         executable: config.executable.to_string_lossy().into_owned(),
@@ -1375,32 +1475,62 @@ pub fn respond_codex_approval(
     ) {
         return Err("This Codex request is not an approval request.".into());
     }
+    let response = codex_approval_response(&pending, &decision)?;
+    send_codex_message(
+        &writer,
+        &crate::providers::app_server_response(pending.request_id.clone(), response),
+    )?;
+    clear_pending_codex_request(&app, &run_id, &request_id)?;
+    Ok(true)
+}
+
+fn codex_approval_response(
+    pending: &PendingCodexRequest,
+    decision: &str,
+) -> Result<serde_json::Value, String> {
+    if pending.method == "item/permissions/requestApproval" {
+        return match decision {
+            "accept" => {
+                let permissions = pending
+                    .params
+                    .get("permissions")
+                    .cloned()
+                    .ok_or("Codex sent a permission request without a permission profile.")?;
+                Ok(serde_json::json!({
+                    "permissions": permissions,
+                    "scope": "turn"
+                }))
+            }
+            "decline" => Ok(serde_json::json!({
+                "permissions": {},
+                "scope": "turn"
+            })),
+            _ => Err("Choose whether to grant or decline the requested permissions.".into()),
+        };
+    }
+
     let allowed = pending
         .params
         .get("availableDecisions")
         .and_then(serde_json::Value::as_array);
-    let permitted = allowed.is_some_and(|choices| {
+    let allowed_by_server = allowed.is_some_and(|choices| {
         choices
             .iter()
-            .any(|choice| choice.as_str() == Some(&decision))
+            .any(|choice| choice.as_str() == Some(decision))
     });
-    if !permitted
-        || !matches!(
-            decision.as_str(),
-            "accept" | "acceptForSession" | "decline" | "cancel"
-        )
-    {
+    let has_renderable_choice =
+        allowed.is_some_and(|choices| choices.iter().any(serde_json::Value::is_string));
+    let safe_legacy_choice = !has_renderable_choice && matches!(decision, "decline" | "cancel");
+    if !allowed_by_server && !safe_legacy_choice {
         return Err("Choose an approval decision offered by Codex.".into());
     }
-    send_codex_message(
-        &writer,
-        &crate::providers::app_server_response(
-            pending.request_id.clone(),
-            serde_json::json!({ "decision": decision }),
-        ),
-    )?;
-    clear_pending_codex_request(&app, &run_id, &request_id)?;
-    Ok(true)
+    if !matches!(
+        decision,
+        "accept" | "acceptForSession" | "decline" | "cancel"
+    ) {
+        return Err("Choose an approval decision offered by Codex.".into());
+    }
+    Ok(serde_json::json!({ "decision": decision }))
 }
 
 #[tauri::command]
@@ -1426,12 +1556,23 @@ pub fn respond_codex_user_input(
         .iter()
         .filter_map(|question| question.get("id").and_then(serde_json::Value::as_str))
         .collect::<HashSet<_>>();
-    if answers.keys().any(|key| !allowed.contains(key.as_str()))
-        || allowed.iter().any(|key| {
-            answers.get(*key).is_none_or(|values| {
-                values.is_empty() || values.iter().any(|value| value.trim().is_empty())
-            })
-        })
+    let response = codex_user_input_response(questions, &allowed, &answers)?;
+    send_codex_message(
+        &writer,
+        &crate::providers::app_server_response(pending.request_id.clone(), response),
+    )?;
+    clear_pending_codex_request(&app, &run_id, &request_id)?;
+    Ok(true)
+}
+
+fn codex_user_input_response(
+    questions: &[serde_json::Value],
+    allowed: &HashSet<&str>,
+    answers: &HashMap<String, Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    if allowed.len() != questions.len()
+        || allowed.contains("")
+        || answers.keys().any(|key| !allowed.contains(key.as_str()))
         || answers.values().any(|values| {
             values.len() > 10
                 || values
@@ -1443,19 +1584,14 @@ pub fn respond_codex_user_input(
             "The Codex answers do not match the requested fields or exceed their limits.".into(),
         );
     }
-    let response_answers = answers
-        .into_iter()
-        .map(|(key, values)| (key, serde_json::json!({ "answers": values })))
+    let response_answers = allowed
+        .iter()
+        .map(|key| {
+            let values = answers.get(*key).cloned().unwrap_or_default();
+            ((*key).to_owned(), serde_json::json!({ "answers": values }))
+        })
         .collect::<HashMap<_, _>>();
-    send_codex_message(
-        &writer,
-        &crate::providers::app_server_response(
-            pending.request_id.clone(),
-            serde_json::json!({ "answers": response_answers }),
-        ),
-    )?;
-    clear_pending_codex_request(&app, &run_id, &request_id)?;
-    Ok(true)
+    Ok(serde_json::json!({ "answers": response_answers }))
 }
 
 fn get_pending_codex_request(
@@ -1567,6 +1703,95 @@ mod tests {
         let value = redact("token=ghp_0123456789abcdefghijklmnop", &[]);
         assert!(!value.contains("ghp_"));
         assert!(value.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn codex_preflight_allows_clean_repositories_and_rejects_dirty_ones() {
+        let fixture = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(fixture.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        ensure_clean_git_worktree(fixture.path()).unwrap();
+
+        fs::write(fixture.path().join("unrelated.txt"), "local work").unwrap();
+        let error = ensure_clean_git_worktree(fixture.path()).unwrap_err();
+        assert!(error.contains("clean Git worktree"));
+    }
+
+    #[test]
+    fn codex_preflight_allows_non_git_project_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        ensure_clean_git_worktree(fixture.path()).unwrap();
+    }
+
+    #[test]
+    fn codex_permission_approval_uses_permission_profile_response() {
+        let requested = serde_json::json!({
+            "fileSystem": { "write": ["/workspace", "/shared"] },
+            "network": { "enabled": true }
+        });
+        let pending = PendingCodexRequest {
+            request_id: serde_json::json!(61),
+            method: "item/permissions/requestApproval".into(),
+            params: serde_json::json!({ "permissions": requested }),
+        };
+        assert_eq!(
+            codex_approval_response(&pending, "accept").unwrap(),
+            serde_json::json!({ "permissions": requested, "scope": "turn" })
+        );
+        assert_eq!(
+            codex_approval_response(&pending, "decline").unwrap(),
+            serde_json::json!({ "permissions": {}, "scope": "turn" })
+        );
+        assert!(codex_approval_response(&pending, "acceptForSession").is_err());
+    }
+
+    #[test]
+    fn codex_command_approval_allows_safe_decline_when_choices_are_omitted() {
+        let pending = PendingCodexRequest {
+            request_id: serde_json::json!(62),
+            method: "item/commandExecution/requestApproval".into(),
+            params: serde_json::json!({}),
+        };
+        assert_eq!(
+            codex_approval_response(&pending, "decline").unwrap(),
+            serde_json::json!({ "decision": "decline" })
+        );
+        assert!(codex_approval_response(&pending, "accept").is_err());
+    }
+
+    #[test]
+    fn approval_and_input_events_bypass_the_output_budget() {
+        assert!(!output_budget_applies("approvalRequest"));
+        assert!(!output_budget_applies("userInputRequest"));
+        assert!(output_budget_applies("output"));
+        assert!(output_budget_applies("providerError"));
+    }
+
+    #[test]
+    fn codex_user_input_allows_skips_and_returns_each_requested_question() {
+        let questions = vec![
+            serde_json::json!({ "id": "choice" }),
+            serde_json::json!({ "id": "freeform" }),
+        ];
+        let allowed = ["choice", "freeform"].into_iter().collect::<HashSet<_>>();
+        let answers = HashMap::from([("choice".to_owned(), vec!["Option A".to_owned()])]);
+        let response = codex_user_input_response(&questions, &allowed, &answers).unwrap();
+        assert_eq!(response["answers"]["choice"]["answers"][0], "Option A");
+        assert_eq!(
+            response["answers"]["freeform"]["answers"],
+            serde_json::json!([])
+        );
+        assert!(codex_user_input_response(
+            &questions,
+            &allowed,
+            &HashMap::from([("unknown".to_owned(), vec!["value".to_owned()])])
+        )
+        .is_err());
     }
 
     #[cfg(windows)]

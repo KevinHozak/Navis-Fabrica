@@ -171,7 +171,6 @@ pub struct CodexEvent {
 
 pub fn app_server_initialize(request_id: u64, app_version: &str) -> Value {
     json!({
-        "jsonrpc": "2.0",
         "id": request_id,
         "method": "initialize",
         "params": {
@@ -183,7 +182,6 @@ pub fn app_server_initialize(request_id: u64, app_version: &str) -> Value {
 
 pub fn app_server_thread_start(request_id: u64, cwd: &str, model_id: &str) -> Value {
     json!({
-        "jsonrpc": "2.0",
         "id": request_id,
         "method": "thread/start",
         "params": {
@@ -223,17 +221,21 @@ pub fn app_server_turn_start(
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
     }
-    json!({ "jsonrpc": "2.0", "id": request_id, "method": "turn/start", "params": params })
+    json!({ "id": request_id, "method": "turn/start", "params": params })
 }
 
 pub fn app_server_response(request_id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": request_id, "result": result })
+    json!({ "id": request_id, "result": result })
 }
 
 pub fn parse_app_server_message(line: &str) -> Result<Value, String> {
     let value: Value = serde_json::from_str(line)
         .map_err(|_| "Codex app-server emitted malformed JSON.".to_string())?;
-    if !value.is_object() || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+    if !value.is_object()
+        || value
+            .get("jsonrpc")
+            .is_some_and(|version| version.as_str() != Some("2.0"))
+    {
         return Err("Codex app-server emitted an invalid protocol message.".into());
     }
     if value
@@ -321,6 +323,7 @@ pub fn normalize_app_server_message(message: &Value) -> Option<CodexEvent> {
                     "reason": params.get("reason"),
                     "command": params.get("command"),
                     "cwd": params.get("cwd"),
+                    "permissions": params.get("permissions"),
                     "availableDecisions": params.get("availableDecisions")
                 }
             }))
@@ -645,6 +648,7 @@ mod tests {
     fn app_server_requests_pin_project_model_effort_and_skill() {
         let start = app_server_thread_start(2, r"C:\Projects\sample", "model-a");
         assert_eq!(start["method"], "thread/start");
+        assert!(start.get("jsonrpc").is_none());
         assert_eq!(start["params"]["cwd"], r"C:\Projects\sample");
         assert_eq!(
             start["params"]["runtimeWorkspaceRoots"][0],
@@ -661,6 +665,7 @@ mod tests {
             "Make this change",
             Some(("dev-work", r"C:\Users\me\.codex\skills\dev-work\SKILL.md")),
         );
+        assert!(turn.get("jsonrpc").is_none());
         assert_eq!(turn["params"]["effort"], "high");
         assert_eq!(turn["params"]["input"][0]["type"], "skill");
         assert_eq!(turn["params"]["input"][1]["text"], "Make this change");
@@ -669,7 +674,6 @@ mod tests {
     #[test]
     fn app_server_stream_normalizes_deltas_final_output_failures_and_requests() {
         let delta = serde_json::json!({
-            "jsonrpc": "2.0",
             "method": "item/agentMessage/delta",
             "params": { "delta": "Hello" }
         });
@@ -678,7 +682,6 @@ mod tests {
         assert_eq!(event.text, "Hello");
 
         let final_message = serde_json::json!({
-            "jsonrpc": "2.0",
             "method": "item/completed",
             "params": { "item": { "type": "agentMessage", "text": "Final answer" } }
         });
@@ -688,7 +691,6 @@ mod tests {
         );
 
         let auth_error = serde_json::json!({
-            "jsonrpc": "2.0",
             "method": "turn/completed",
             "params": { "turn": { "status": "failed", "error": { "message": "401 unauthorized" } } }
         });
@@ -697,7 +699,6 @@ mod tests {
         assert_eq!(event.text, "Codex authentication is required or expired.");
 
         let request = serde_json::json!({
-            "jsonrpc": "2.0",
             "id": 42,
             "method": "item/commandExecution/requestApproval",
             "params": { "command": "git status", "availableDecisions": ["accept", "decline"] }
@@ -707,16 +708,51 @@ mod tests {
         let display: serde_json::Value = serde_json::from_str(&event.text).unwrap();
         assert_eq!(display["requestId"], 42);
         assert_eq!(display["params"]["availableDecisions"][0], "accept");
+
+        let permission_request = serde_json::json!({
+            "id": 43,
+            "method": "item/permissions/requestApproval",
+            "params": { "reason": "Allow a workspace root", "permissions": { "fileSystem": { "write": ["/workspace"] } } }
+        });
+        let event = normalize_app_server_message(&permission_request).unwrap();
+        let display: serde_json::Value = serde_json::from_str(&event.text).unwrap();
+        assert_eq!(display["method"], "item/permissions/requestApproval");
+        assert_eq!(
+            display["params"]["permissions"]["fileSystem"]["write"][0],
+            "/workspace"
+        );
     }
 
     #[test]
-    fn app_server_parser_rejects_malformed_and_non_jsonrpc_messages() {
+    fn app_server_parser_accepts_codex_wire_messages_without_jsonrpc() {
         assert!(parse_app_server_message("not-json").is_err());
-        assert!(parse_app_server_message(r#"{"method":"turn/completed"}"#).is_err());
+        assert!(parse_app_server_message("[]").is_err());
+        assert!(
+            parse_app_server_message(r#"{"jsonrpc":"1.0","method":"turn/completed"}"#).is_err()
+        );
+        assert!(
+            parse_app_server_message(r#"{"id":1,"result":{"userAgent":"codex_cli/0.162.1"}}"#)
+                .is_ok()
+        );
+        assert!(parse_app_server_message(
+            r#"{"method":"turn/completed","params":{"turn":{"status":"completed"}}}"#
+        )
+        .is_ok());
         assert!(parse_app_server_message(
             r#"{"jsonrpc":"2.0","method":"turn/completed","params":{}}"#
         )
         .is_ok());
+    }
+
+    #[test]
+    fn app_server_messages_follow_codex_wire_shape() {
+        let initialize = app_server_initialize(1, "0.14.0");
+        let thread = app_server_thread_start(2, "/workspace", "model-a");
+        let response = app_server_response(serde_json::json!(3), json!({}));
+        assert!(initialize.get("jsonrpc").is_none());
+        assert!(thread.get("jsonrpc").is_none());
+        assert!(response.get("jsonrpc").is_none());
+        assert_eq!(response["id"], 3);
     }
 
     #[test]

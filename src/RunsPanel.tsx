@@ -115,7 +115,7 @@ export function RunsPanel({ defaultCwd }: { defaultCwd: string }) {
         <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder="Describe the work for Codex…" /></label>
         <div className="run-launch-options">
           <label>Timeout (seconds)<input type="number" min={1} max={86400} value={codexTimeout} onChange={(event) => setCodexTimeout(Number(event.target.value))} /></label>
-          <p className="registry-context-note">Writes are limited to this project. Codex approval requests pause for your decision.</p>
+          <p className="registry-context-note">Writes are limited to this project. Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision.</p>
           <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim()}>{busy ? "Starting…" : "Start Codex"}</button>
         </div>
       </form>
@@ -164,7 +164,9 @@ export function RunsPanel({ defaultCwd }: { defaultCwd: string }) {
 }
 
 type CodexQuestion = { id: string; header: string; question: string; isOther: boolean; isSecret: boolean; options: { label: string; description: string }[] | null };
-type CodexRequest = { requestId: string | number; params?: { kind?: string; reason?: string | null; command?: string | null; availableDecisions?: (string | Record<string, unknown>)[] | null }; questions?: CodexQuestion[] };
+type CodexRequest = { requestId: string | number; method?: string; params?: { kind?: string; reason?: string | null; command?: string | null; permissions?: Record<string, unknown> | null; availableDecisions?: (string | Record<string, unknown>)[] | null }; questions?: CodexQuestion[] };
+
+const OTHER_OPTION_VALUE = "__navis_codex_other_option__";
 
 function CodexRequestCard({ runId, event, onResolved, isResolved }: {
   runId: string;
@@ -173,6 +175,8 @@ function CodexRequestCard({ runId, event, onResolved, isResolved }: {
   isResolved: (requestId: string) => boolean;
 }) {
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [otherSelected, setOtherSelected] = useState<Record<string, boolean>>({});
+  const [otherAnswers, setOtherAnswers] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   let request: CodexRequest;
@@ -193,7 +197,12 @@ function CodexRequestCard({ runId, event, onResolved, isResolved }: {
     setBusy(true);
     try {
       const values: Record<string, string[]> = {};
-      Object.entries(answers).forEach(([key, value]) => { values[key] = value ? [value] : []; });
+      (request.questions ?? []).forEach((question) => {
+        const selectedOther = question.isOther && otherSelected[question.id];
+        const value = selectedOther ? otherAnswers[question.id] ?? "" : answers[question.id] ?? "";
+        const trimmed = value.trim();
+        values[question.id] = trimmed ? [selectedOther ? `user_note: ${trimmed}` : trimmed] : [];
+      });
       await respondCodexUserInput(runId, requestId, values);
       onResolved(requestId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false); }
@@ -201,22 +210,32 @@ function CodexRequestCard({ runId, event, onResolved, isResolved }: {
 
   if (event.kind === "approvalRequest") {
     const choices = (request.params?.availableDecisions ?? []).filter((value): value is string => typeof value === "string");
-    const safeChoices = choices.length ? choices : ["decline"];
+    const permissionRequest = request.method === "item/permissions/requestApproval";
+    const safeChoices = permissionRequest ? ["accept", "decline"] : choices.length ? choices : ["decline"];
     return <section className="run-input-form" aria-label="Codex approval request">
-      <strong>Codex is waiting for approval</strong>
+      <strong>{permissionRequest ? "Codex requests additional permissions" : "Codex is waiting for approval"}</strong>
       {request.params?.reason && <p>{request.params.reason}</p>}
       {request.params?.command && <pre>{request.params.command}</pre>}
+      {permissionRequest && request.params?.permissions && <pre aria-label="Requested permissions">{JSON.stringify(request.params.permissions, null, 2)}</pre>}
       {error && <p role="alert">{error}</p>}
-      <div className="settings-actions">{safeChoices.map((choice) => <button key={choice} className={choice === "accept" ? "button button-primary" : "button button-secondary"} type="button" disabled={busy} onClick={() => { void approve(choice); }}>{choice === "accept" ? "Approve once" : choice === "decline" ? "Decline" : choice === "acceptForSession" ? "Approve for session" : choice}</button>)}</div>
+      <div className="settings-actions">{safeChoices.map((choice) => <button key={choice} className={choice === "accept" ? "button button-primary" : "button button-secondary"} type="button" disabled={busy} onClick={() => { void approve(choice); }}>{permissionRequest && choice === "accept" ? "Grant requested permissions" : choice === "accept" ? "Approve once" : choice === "decline" ? "Decline" : choice === "acceptForSession" ? "Approve for session" : choice}</button>)}</div>
     </section>;
   }
   if (event.kind !== "userInputRequest") return null;
   return <form className="run-input-form" aria-label="Codex input request" onSubmit={(event) => { void answer(event); }}>
     <strong>Codex needs your input</strong>
     {(request.questions ?? []).map((question) => <label key={question.id}>{question.header}: {question.question}
-      {question.options?.length ? <select required value={answers[question.id] ?? ""} onChange={(event) => setAnswers((prior) => ({ ...prior, [question.id]: event.target.value }))}>
-        <option value="">Choose an answer</option>{question.options.map((option) => <option key={option.label} value={option.label}>{option.label}</option>)}
-      </select> : <input required type={question.isSecret ? "password" : "text"} value={answers[question.id] ?? ""} onChange={(event) => setAnswers((prior) => ({ ...prior, [question.id]: event.target.value }))} />}
+      {question.options?.length ? <>
+        <select value={otherSelected[question.id] ? OTHER_OPTION_VALUE : answers[question.id] ?? ""} onChange={(event) => {
+          const isOther = event.target.value === OTHER_OPTION_VALUE;
+          setOtherSelected((prior) => ({ ...prior, [question.id]: isOther }));
+          if (!isOther) setAnswers((prior) => ({ ...prior, [question.id]: event.target.value }));
+        }}>
+          <option value="">Choose an answer</option>{question.options.map((option) => <option key={option.label} value={option.label}>{option.label}</option>)}
+          {question.isOther && <option value={OTHER_OPTION_VALUE}>Other</option>}
+        </select>
+        {question.isOther && otherSelected[question.id] && <input type={question.isSecret ? "password" : "text"} aria-label={`${question.header} other answer`} placeholder="Enter another answer" value={otherAnswers[question.id] ?? ""} onChange={(event) => setOtherAnswers((prior) => ({ ...prior, [question.id]: event.target.value }))} />}
+      </> : <input type={question.isSecret ? "password" : "text"} value={answers[question.id] ?? ""} onChange={(event) => setAnswers((prior) => ({ ...prior, [question.id]: event.target.value }))} />}
     </label>)}
     {error && <p role="alert">{error}</p>}
     <button className="button button-secondary" type="submit" disabled={busy}>Send answers</button>

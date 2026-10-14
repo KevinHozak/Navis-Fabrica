@@ -228,24 +228,7 @@ fn detailed_issue(value: &Value, owner: &str, repository: &str) -> Option<Reposi
         url: format!("https://github.com/{owner}/{repository}/issues/{number}"),
         state: "unknown".into(),
     });
-    let pull_request_urls = body
-        .split_whitespace()
-        .filter(|token| token.starts_with("https://github.com/") && token.contains("/pull/"))
-        .map(|token| {
-            token
-                .trim_matches(|ch: char| {
-                    !ch.is_ascii_alphanumeric()
-                        && ch != ':'
-                        && ch != '/'
-                        && ch != '.'
-                        && ch != '-'
-                        && ch != '_'
-                })
-                .to_owned()
-        })
-        .filter(|url| url.starts_with(&format!("https://github.com/{owner}/{repository}/pull/")))
-        .take(10)
-        .collect();
+    let pull_request_urls = body_pull_requests(&body, owner, repository);
     Some(RepositoryIssue {
         number: summary.number,
         title: summary.title,
@@ -288,12 +271,50 @@ fn timeline_pull_requests(events: &[Value], owner: &str, repository: &str) -> Ve
                 .get("html_url")?
                 .as_str()
         })
-        .filter(|url| {
-            url.starts_with(&prefix) && url[prefix.len()..].chars().all(|ch| ch.is_ascii_digit())
-        })
+        .filter(|url| pull_request_number(url, &prefix).is_some())
         .take(10)
-        .map(str::to_owned)
+        .filter_map(|url| {
+            pull_request_number(url, &prefix).map(|number| format!("{prefix}{number}"))
+        })
         .collect()
+}
+
+fn body_pull_requests(body: &str, owner: &str, repository: &str) -> Vec<String> {
+    let prefix = format!("https://github.com/{owner}/{repository}/pull/");
+    let marker = "https://github.com/";
+    let mut remaining = body;
+    let mut urls = Vec::new();
+    while let Some(start) = remaining.find(marker) {
+        let candidate = remaining[start..]
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ')' | ']' | '>' | '"' | '\''))
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(|ch: char| matches!(ch, ',' | '.' | ';' | ':' | '!' | '?'));
+        if let Some(number) = pull_request_number(candidate, &prefix) {
+            let url = format!("{prefix}{number}");
+            if !urls.contains(&url) {
+                urls.push(url);
+                if urls.len() == 10 {
+                    break;
+                }
+            }
+        }
+        remaining = &remaining[start + marker.len()..];
+    }
+    urls
+}
+
+fn pull_request_number<'a>(url: &'a str, prefix: &str) -> Option<&'a str> {
+    let tail = strip_prefix_ascii_case_insensitive(url, prefix)?;
+    let number = tail.split(['?', '#']).next()?;
+    (!number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())).then_some(number)
+}
+
+fn strip_prefix_ascii_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -312,7 +333,7 @@ pub fn parse_issue_reference(owner: &str, repository: &str, input: &str) -> Resu
         trimmed
     } else {
         let prefix = format!("https://github.com/{owner}/{repository}/issues/");
-        let Some(path) = trimmed.strip_prefix(&prefix) else {
+        let Some(path) = strip_prefix_ascii_case_insensitive(trimmed, &prefix) else {
             return Err("Enter an issue number or a URL for this repository.".into());
         };
         path.split(['?', '#']).next().unwrap_or_default()
@@ -686,6 +707,15 @@ mod tests {
                 .unwrap(),
             7
         );
+        assert_eq!(
+            parse_issue_reference(
+                "owner",
+                "repo",
+                "https://GitHub.com/OWNER/REPO/ISSUES/9?x=1"
+            )
+            .unwrap(),
+            9
+        );
         assert!(parse_issue_reference(
             "owner",
             "repo",
@@ -733,6 +763,29 @@ mod tests {
         assert!(!bounded.selectable);
         assert_eq!(bounded.title.chars().count(), MAX_ISSUE_TITLE_CHARS + 1);
         assert_eq!(bounded.body.chars().count(), MAX_ISSUE_BODY_CHARS + 1);
+    }
+
+    #[test]
+    fn issue_context_extracts_markdown_wrapped_pull_request_links() {
+        let issue = detailed_issue(
+            &serde_json::json!({
+                "number": 8,
+                "title": "A scoped issue",
+                "html_url": "https://github.com/owner/repo/issues/8",
+                "state": "open",
+                "body": "See [the fix](https://github.com/owner/repo/pull/12), (https://github.com/OWNER/REPO/pull/13). Also https://github.com/other/repo/pull/14"
+            }),
+            "owner",
+            "repo",
+        )
+        .unwrap();
+        assert_eq!(
+            issue.pull_request_urls,
+            vec![
+                "https://github.com/owner/repo/pull/12",
+                "https://github.com/owner/repo/pull/13"
+            ]
+        );
     }
 
     #[test]

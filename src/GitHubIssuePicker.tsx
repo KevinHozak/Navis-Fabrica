@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getGitHubIssue, GitHubIssue, GitHubIssueSummary, listGitHubIssues } from "./settings";
 
 export function GitHubIssuePicker({ owner, repository, onWork }: { owner: string; repository: string; onWork: (issue: GitHubIssue) => void }) {
@@ -7,20 +7,36 @@ export function GitHubIssuePicker({ owner, repository, onWork }: { owner: string
   const [selected, setSelected] = useState<GitHubIssue | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const issueRequestId = useRef(0);
 
   useEffect(() => {
     let active = true;
+    issueRequestId.current += 1;
     setIssues([]); setSelected(null); setReference(""); setError("");
     listGitHubIssues(owner, repository).then((items) => { if (active) setIssues(items); })
       .catch((reason: unknown) => { if (active) setError(errorMessage(reason)); });
-    return () => { active = false; };
+    return () => { active = false; issueRequestId.current += 1; };
   }, [owner, repository]);
 
   async function loadIssue(value: string) {
+    const requestId = ++issueRequestId.current;
     setLoading(true); setError(""); setSelected(null);
-    try { setSelected(await getGitHubIssue(owner, repository, value)); }
-    catch (reason) { setError(errorMessage(reason)); }
-    finally { setLoading(false); }
+    try {
+      const issue = await getGitHubIssue(owner, repository, value);
+      if (issueRequestId.current === requestId) setSelected(issue);
+    } catch (reason) {
+      if (issueRequestId.current === requestId) setError(errorMessage(reason));
+    } finally {
+      if (issueRequestId.current === requestId) setLoading(false);
+    }
+  }
+
+  function updateReference(value: string) {
+    issueRequestId.current += 1;
+    setReference(value);
+    setSelected(null);
+    setLoading(false);
+    setError("");
   }
 
   return <section className="issue-picker" aria-label={`Issues for ${owner}/${repository}`}>
@@ -28,10 +44,10 @@ export function GitHubIssuePicker({ owner, repository, onWork }: { owner: string
     <p>Pick an open issue from this repository or enter its number or GitHub issue URL.</p>
     <div className="issue-picker-entry">
       <label className="sr-only" htmlFor="issue-reference">Issue number or URL</label>
-      <input id="issue-reference" value={reference} onChange={(event) => setReference(event.target.value)} placeholder="Issue number or URL" onKeyDown={(event) => { if (event.key === "Enter" && reference.trim()) void loadIssue(reference); }} />
+      <input id="issue-reference" value={reference} onChange={(event) => updateReference(event.target.value)} placeholder="Issue number or URL" onKeyDown={(event) => { if (event.key === "Enter" && reference.trim()) void loadIssue(reference); }} />
       <button className="button button-secondary" type="button" disabled={loading || !reference.trim()} onClick={() => { void loadIssue(reference); }}>{loading ? "Loading…" : "Open issue"}</button>
     </div>
-    {issues.length > 0 && <div className="issue-picker-list" role="list" aria-label="Open repository issues">{issues.map((issue) => <div role="listitem" key={issue.number}><button type="button" onClick={() => { setReference(String(issue.number)); void loadIssue(String(issue.number)); }}><span>#{issue.number} · {issue.title}</span><span aria-hidden="true">↗</span></button></div>)}</div>}
+    {issues.length > 0 && <div className="issue-picker-list" role="list" aria-label="Open repository issues">{issues.map((issue) => <div role="listitem" key={issue.number}><button type="button" onClick={() => { updateReference(String(issue.number)); void loadIssue(String(issue.number)); }}><span>#{issue.number} · {issue.title}</span><span aria-hidden="true">↗</span></button></div>)}</div>}
     {error && <p className="issue-feedback error" role="alert">{error}</p>}
     {selected && <IssueDetails issue={selected} onWork={() => onWork(selected)} />}
   </section>;

@@ -64,7 +64,7 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 ### Fixture and build verification
 
 - `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked github::tests`: 7 passed. Fixtures cover repository-scoped issue references, parent and checklist extraction, linked PR filtering, bounded fields, plus existing GitHub parsing and status behavior.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked github::tests`: 8 passed. Fixtures cover case-insensitive repository-scoped issue references, parent and checklist extraction, Markdown-wrapped linked PRs restricted to the selected repository, timeline PR filtering, bounded fields, plus existing GitHub parsing and status behavior.
 - `cargo test --manifest-path src-tauri/Cargo.toml --locked`: 34 passed, 2 failed outside issue #16. The rename fixture hit Windows access denied; the 100-project benchmark measured 6.10 seconds against its 5-second target.
 - `npm run build`: blocked because this worktree does not have the TypeScript compiler installed (`tsc` was not recognized). `npm ci --ignore-scripts --prefer-offline --no-audit --no-fund` failed with npm's internal `Exit handler never called!`; frontend typecheck/build remains unverified.
 - `git diff --check`: passed.

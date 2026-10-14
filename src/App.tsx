@@ -469,7 +469,7 @@ function ProjectDetails({ project, onWork }: { project: ProjectEntry | null; onW
       {activity?.remoteStatus === "unauthorized" && <span role="status">GitHub did not provide repository activity. Private data stays hidden.</span>}
       {activity?.remoteStatus === "unavailable" && <span role="status">Remote activity is unavailable. Local project details are still available.</span>}
       {activity?.recentCommits.map((commit) => <a className="github-commit" key={commit.hash} href={commit.url} target="_blank" rel="noreferrer"><code>{commit.hash}</code> · {commit.subject}</a>)}
-      {isDesktopApp() && <GitHubIssuePicker owner={remote.owner} repository={remote.repository} onWork={onWork} />}
+      {isDesktopApp() && <GitHubIssuePicker key={`${remote.owner.toLowerCase()}/${remote.repository.toLowerCase()}`} owner={remote.owner} repository={remote.repository} onWork={onWork} />}
       {activityError && <span role="status">{activityError}</span>}
       {isDesktopApp() && <button className="text-button" type="button" onClick={() => { void refreshActivity(); }} disabled={activityLoading}>{activityLoading ? "Refreshing GitHub…" : "Refresh GitHub activity"}</button>}
     </div>}

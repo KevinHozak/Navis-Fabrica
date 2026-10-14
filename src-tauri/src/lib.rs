@@ -203,12 +203,22 @@ fn recover_settings(value: Value) -> Settings {
         .cloned()
         .and_then(|value| serde_json::from_value::<providers::ProviderSelection>(value).ok())
         .unwrap_or_default();
-    let (providers, provider_selection) =
-        if providers::validate_profiles(&provider_profiles, &provider_selection).is_ok() {
-            (provider_profiles, provider_selection)
-        } else {
-            (defaults.providers, defaults.provider_selection)
-        };
+    // Profile validity is independent of the remembered selection. Preserve
+    // usable profiles when a stale provider/model selection needs to recover.
+    let profiles_valid =
+        providers::validate_profiles(&provider_profiles, &providers::ProviderSelection::default())
+            .is_ok();
+    let (providers, provider_selection) = if profiles_valid {
+        let selection =
+            if providers::validate_profiles(&provider_profiles, &provider_selection).is_ok() {
+                provider_selection
+            } else {
+                defaults.provider_selection
+            };
+        (provider_profiles, selection)
+    } else {
+        (defaults.providers, defaults.provider_selection)
+    };
 
     Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
@@ -471,6 +481,35 @@ mod tests {
         assert_eq!(settings.exclusions, vec![".git"]);
         assert!(settings.preferences.include_hidden);
         assert_eq!(settings.preferences.scan_depth, 3);
+    }
+
+    #[test]
+    fn preserves_valid_provider_profiles_when_selection_is_stale() {
+        let value = serde_json::json!({
+            "schemaVersion": 2,
+            "providers": [{
+                "id": "codex-local",
+                "kind": "codex",
+                "name": "Codex",
+                "executable": "codex",
+                "secretRef": "credential-store:codex-session",
+                "models": [{ "id": "gpt", "name": "GPT", "reasoningEfforts": ["medium"] }]
+            }],
+            "providerSelection": {
+                "providerId": "removed-provider",
+                "modelId": "removed-model",
+                "reasoningEffort": "high",
+                "runtimeId": null
+            }
+        });
+
+        let settings = recover_settings(value);
+        assert_eq!(settings.providers.len(), 1);
+        assert_eq!(settings.providers[0].id, "codex-local");
+        assert_eq!(
+            settings.provider_selection,
+            providers::ProviderSelection::default()
+        );
     }
 
     #[test]

@@ -86,6 +86,28 @@ export const defaultSettings: Settings = {
 
 const previewStorageKey = "navis-fabrica.settings.v1";
 
+function validatePreviewSecretReferences(providers: ProviderProfile[]): void {
+  for (const provider of providers) {
+    const reference = provider.secretRef;
+    if (reference == null) continue;
+
+    const key = reference.startsWith("credential-store:")
+      ? reference.slice("credential-store:".length)
+      : reference.startsWith("provider-managed:")
+        ? reference.slice("provider-managed:".length)
+        : null;
+    if (
+      reference.length > 260 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(reference) ||
+      key === null ||
+      key.length === 0 ||
+      !/^[a-zA-Z0-9.:/_-]+$/.test(key)
+    ) {
+      throw new Error("Use an opaque secret reference such as credential-store:provider-name; secret values are not accepted.");
+    }
+  }
+}
+
 export const isDesktopApp = () => isTauri();
 
 export const startProjectScan = (scanId: string) =>
@@ -137,6 +159,7 @@ export async function loadSettings(): Promise<Settings> {
 export async function saveSettings(settings: SettingsInput): Promise<Settings> {
   if (isDesktopApp()) return invoke<Settings>("save_settings", { settings });
 
+  validatePreviewSecretReferences(settings.providers);
   const saved = { schemaVersion: 2, ...settings };
   localStorage.setItem(previewStorageKey, JSON.stringify(saved));
   return saved;

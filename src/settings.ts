@@ -127,8 +127,8 @@ function validatePreviewSecretReferences(providers: ProviderProfile[]): void {
 
 export const isDesktopApp = () => isTauri();
 
-export const startProjectScan = (scanId: string) =>
-  invoke<void>("start_project_scan", { scanId });
+export const startProjectScan = (scanId: string, forceRefresh: boolean) =>
+  invoke<void>("start_project_scan", { scanId, forceRefresh });
 
 export const cancelProjectScan = (scanId: string) =>
   invoke<boolean>("cancel_project_scan", { scanId });
@@ -141,6 +141,12 @@ export const onProjectScanProgress = (handler: (progress: ProjectScanProgress) =
 
 export const onProjectScanFinished = (handler: (result: ProjectScanFinished) => void) =>
   listen<ProjectScanFinished>("project-scan-finished", (event) => handler(event.payload));
+
+export const onProjectScanInvalidated = (handler: () => void) =>
+  listen<void>("project-scan-invalidated", handler);
+
+export const onProjectWatchError = (handler: (message: string) => void) =>
+  listen<string>("project-watch-error", (event) => handler(event.payload));
 
 export async function loadSettings(): Promise<Settings> {
   if (isDesktopApp()) return invoke<Settings>("get_settings");

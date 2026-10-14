@@ -7,7 +7,9 @@ import {
   isDesktopApp,
   loadSettings,
   onProjectScanFinished,
+  onProjectScanInvalidated,
   onProjectScanProgress,
+  onProjectWatchError,
   ProjectEntry,
   ProjectScanFinished,
   ProjectScanProgress,
@@ -38,9 +40,12 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
   const [scanError, setScanError] = useState("");
+  const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
   const activeScanId = useRef("");
   const cancelRequested = useRef(false);
+  const refreshAfterScan = useRef(false);
+  const beginScanRef = useRef<(forceRefresh: boolean) => void>(() => undefined);
   const desktop = isDesktopApp();
 
   useEffect(() => {
@@ -59,6 +64,8 @@ function App() {
     let active = true;
     let unlistenProgress: (() => void) | undefined;
     let unlistenFinished: (() => void) | undefined;
+    let unlistenInvalidated: (() => void) | undefined;
+    let unlistenWatchError: (() => void) | undefined;
 
     onProjectScanProgress((next) => {
       if (active && next.scanId === activeScanId.current) setProgress(next);
@@ -73,10 +80,22 @@ function App() {
     });
     onProjectScanFinished((result) => {
       if (!active || result.scanId !== activeScanId.current) return;
+      activeScanId.current = "";
       setScanResult(result);
-      if (!result.fatalError || result.projects.length > 0) setProjects(result.projects);
+      if (!result.fatalError || result.projects.length > 0) {
+        setProjects((previous) => {
+          if (!result.errors.length && !result.cancelled) return result.projects;
+          const merged = new Map(previous.map((project) => [project.id, project]));
+          result.projects.forEach((project) => merged.set(project.id, project));
+          return [...merged.values()];
+        });
+      }
       setScanError(result.fatalError ?? "");
       setScanStatus(result.fatalError ? "error" : result.cancelled ? "cancelled" : "complete");
+      if (refreshAfterScan.current) {
+        refreshAfterScan.current = false;
+        window.setTimeout(() => beginScanRef.current(false), 0);
+      }
     }).then((stop) => {
       if (active) unlistenFinished = stop;
       else stop();
@@ -87,10 +106,30 @@ function App() {
       }
     });
 
+    onProjectScanInvalidated(() => {
+      if (activeScanId.current) refreshAfterScan.current = true;
+      else beginScanRef.current(false);
+    }).then((stop) => {
+      if (active) unlistenInvalidated = stop;
+      else stop();
+    }).catch((error: unknown) => {
+      if (active) setWatchError(error instanceof Error ? error.message : String(error));
+    });
+    onProjectWatchError((message) => {
+      if (active) setWatchError(message);
+    }).then((stop) => {
+      if (active) unlistenWatchError = stop;
+      else stop();
+    }).catch((error: unknown) => {
+      if (active) setWatchError(error instanceof Error ? error.message : String(error));
+    });
+
     return () => {
       active = false;
       unlistenProgress?.();
       unlistenFinished?.();
+      unlistenInvalidated?.();
+      unlistenWatchError?.();
     };
   }, [desktop]);
 
@@ -102,7 +141,7 @@ function App() {
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Recent runs" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
 
-  async function beginScan() {
+  async function beginScan(forceRefresh = true) {
     if (!desktop) {
       setScanStatus("error");
       setScanError("Project scanning is available in the Navis-Fabrica desktop app.");
@@ -119,9 +158,10 @@ function App() {
     try {
       const settings = await loadSettings();
       setProjectRoot(settings.projectRoot);
-      await startProjectScan(id);
+      await startProjectScan(id, forceRefresh);
       if (cancelRequested.current) await cancelProjectScan(id);
     } catch (error) {
+      activeScanId.current = "";
       setScanStatus("error");
       setScanError(error instanceof Error ? error.message : String(error));
     }
@@ -138,6 +178,8 @@ function App() {
       setScanError(error instanceof Error ? error.message : String(error));
     }
   }
+
+  beginScanRef.current = (forceRefresh) => { void beginScan(forceRefresh); };
 
   return (
     <div className="app-shell">
@@ -180,8 +222,8 @@ function App() {
               <h1>{section === "projects" ? "Projects" : current.label}</h1>
               <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : `${current.label} will live here as the foundation grows.`}</p>
             </div>
-            {section === "projects" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : beginScan} disabled={scanStatus === "cancelling"}>
-              <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : "Scan projects"}
+            {section === "projects" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
+              <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Refresh projects" : "Scan projects"}
             </button>}
           </div>
 
@@ -197,12 +239,14 @@ function App() {
               </div>
               <div className="panel-rule" />
 
+              {watchError && section === "projects" && <div className="scan-notice">Automatic project refresh is unavailable: {watchError} <span>Use Refresh projects to update the list.</span></div>}
+
               {section !== "projects" ? (
                 <div className="empty-state"><h3>A little room to grow</h3><p>This section is ready for a future phase.</p></div>
               ) : projects.length > 0 ? (
                 <>
                   {scanning && <div className="scan-progress" role="status"><span className="spinner" aria-hidden="true" /><span>{scanStatus === "cancelling" ? "Stopping the scan" : progress ? `Refreshing · scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Refreshing projects…"}</span></div>}
-                  {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={beginScan}>Try again</button></div>}
+                  {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div>}
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
                   {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
                   <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} />
@@ -210,14 +254,14 @@ function App() {
               ) : scanning ? (
                 <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
               ) : scanStatus === "error" ? (
-                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t scan this folder</strong><p>{scanError}</p><button className="text-button" type="button" onClick={beginScan}>Try again</button></div></div>
+                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t scan this folder</strong><p>{scanError}</p><button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div></div>
               ) : (
                 <div className="empty-state">
                   <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="orbit orbit-three" /><span className="empty-spark spark-one">✦</span><span className="empty-spark spark-two">·</span><span className="folder-shape"><span /></span></div>
                   <h3>{scanStatus === "complete" ? scanResult?.errors.length ? "Scan partly complete" : "No projects found" : scanStatus === "cancelled" ? "Scan cancelled" : "Ready when you are"}</h3>
                   <p>{scanStatus === "complete" ? scanResult?.errors.length ? `Some folders under ${projectRoot} could not be inspected.` : `No coding projects were found under ${projectRoot}.` : scanStatus === "cancelled" ? `The scan stopped after checking ${scanResult?.directoriesScanned ?? 0} folders.` : "Scan your configured workspace to find coding projects and repositories."}</p>
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Show scan issues ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul></details> : null}
-                  {scanStatus === "idle" && <button className="button button-secondary" type="button" onClick={beginScan}>↻ Scan workspace</button>}
+                  {scanStatus === "idle" && <button className="button button-secondary" type="button" onClick={() => { void beginScan(); }}>↻ Scan workspace</button>}
                 </div>
               )}
             </section>

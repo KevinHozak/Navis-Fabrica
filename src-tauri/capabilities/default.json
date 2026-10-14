@@ -11,6 +11,8 @@
     "allow-inspect-providers",
     "allow-get-cached-github-activity",
     "allow-refresh-github-activity",
+    "allow-list-github-issues",
+    "allow-get-github-issue",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

@@ -79,6 +79,20 @@ export type GitHubActivity = {
   authentication: "notConfigured" | "available" | "expired";
 };
 
+export type GitHubIssueSummary = { number: number; title: string; url: string; state: string };
+export type GitHubIssueLink = { number: number; title: string; url: string; state: string };
+export type GitHubIssue = GitHubIssueSummary & {
+  body: string;
+  acceptanceCriteria: string[];
+  blockedBy: GitHubIssueLink[];
+  blockersTruncated: boolean;
+  blockersAvailable: boolean;
+  parentEpic: GitHubIssueLink | null;
+  pullRequestUrls: string[];
+  selectable: boolean;
+  blocked: boolean;
+};
+
 export type GitFacts = {
   status: "available" | "detached" | "unborn" | "unsafeOwnership" | "gitUnavailable" | "notRepository" | "error";
   branch: string | null;
@@ -161,6 +175,12 @@ export const getCachedGitHubActivity = (owner: string, repository: string) =>
 
 export const refreshGitHubActivity = (owner: string, repository: string) =>
   invoke<GitHubActivity>("refresh_github_activity", { owner, repository });
+
+export const listGitHubIssues = (owner: string, repository: string) =>
+  invoke<GitHubIssueSummary[]>("list_github_issues", { owner, repository });
+
+export const getGitHubIssue = (owner: string, repository: string, reference: string) =>
+  invoke<GitHubIssue>("get_github_issue", { owner, repository, reference });
 
 export const onProjectScanProgress = (handler: (progress: ProjectScanProgress) => void) =>
   listen<ProjectScanProgress>("project-scan-progress", (event) => handler(event.payload));

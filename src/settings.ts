@@ -57,6 +57,23 @@ export type ProjectEntry = {
   isGitRepository: boolean;
   isWorktree: boolean;
   detectedStacks: string[];
+  git: GitFacts;
+  workflowPrerequisites: WorkflowPrerequisite[];
+};
+
+export type GitFacts = {
+  status: "available" | "detached" | "unborn" | "unsafeOwnership" | "gitUnavailable" | "notRepository" | "error";
+  branch: string | null;
+  dirty: boolean | null;
+  latestCommit: { shortHash: string; subject: string } | null;
+  remotes: { name: string; url: string | null }[];
+  upstream: { status: "tracking" | "noUpstream" | "unavailable"; ahead: number | null; behind: number | null };
+};
+
+export type WorkflowPrerequisite = {
+  name: string;
+  requiredFor: string[];
+  available: boolean;
 };
 
 export type ProjectScanProgress = {

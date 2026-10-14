@@ -92,7 +92,7 @@ function App() {
       }
       setScanError(result.fatalError ?? "");
       setScanStatus(result.fatalError ? "error" : result.cancelled ? "cancelled" : "complete");
-      if (refreshAfterScan.current) {
+      if (!result.cancelled && refreshAfterScan.current) {
         refreshAfterScan.current = false;
         window.setTimeout(() => beginScanRef.current(false), 0);
       }

@@ -1,0 +1,15 @@
+[package]
+name = "navis-fabrica"
+version = "0.1.0"
+description = "Navis-Fabrica desktop workshop"
+edition = "2021"
+
+[lib]
+name = "navis_fabrica_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

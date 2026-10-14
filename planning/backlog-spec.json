@@ -1,0 +1,367 @@
+{
+  "repo": "KevinHozak/Navis-Fabrica",
+  "projectNumber": 9,
+  "scope": "Planning and basic scaffold only; all functionality is future work.",
+  "epics": [
+    {
+      "key": "Foundation",
+      "name": "Desktop foundation and Navis UI",
+      "objective": "Build the responsive desktop shell, reusable UI, and persisted configuration.",
+      "phases": [
+        {
+          "key": "Foundation-P1",
+          "title": "Foundation-P1: Desktop shell and design system",
+          "criteria": [
+            "Implement sidebar, toolbar, panel/button tokens and app version in the title based on the product plan.",
+            "Keyboard focus, contrast and reduced motion work; browser and Windows Tauri navigation agree.",
+            "Loading/empty/error states are demonstrable with fixtures."
+          ],
+          "deps": [],
+          "priority": "High"
+        },
+        {
+          "key": "Foundation-P2",
+          "title": "Foundation-P2: Settings and typed native boundary",
+          "criteria": [
+            "Save schema-versioned root (default C:\\Projects), exclusions and preferences atomically in app-specific storage.",
+            "Validate paths and typed IPC inputs; malformed config recovers without losing valid settings.",
+            "Add only scoped capabilities; no frontend secrets or unrestricted shell."
+          ],
+          "deps": [
+            "Foundation-P1"
+          ],
+          "priority": "High"
+        },
+        {
+          "key": "Foundation-P3",
+          "title": "Foundation-P3: Responsive dashboard interactions",
+          "criteria": [
+            "Implement searchable/filterable project list and details panel with stable selection.",
+            "Virtualize large lists, avoid main-thread scanning, preserve selection on refresh.",
+            "Verify narrow window, keyboard navigation, reduced motion and partial errors."
+          ],
+          "deps": [
+            "Foundation-P1",
+            "Discovery-P2"
+          ],
+          "priority": "High"
+        }
+      ]
+    },
+    {
+      "key": "Discovery",
+      "name": "Local project and Git inventory",
+      "objective": "Discover coding projects and repositories under a configurable root without changing them.",
+      "phases": [
+        {
+          "key": "Discovery-P1",
+          "title": "Discovery-P1: Bounded project scanner",
+          "criteria": [
+            "Scan canonical configured roots with cancellation/progress, depth and exclusion limits.",
+            "Detect non-Git coding projects, nested repos, .git files/worktrees; prevent junction cycles.",
+            "Test missing/inaccessible roots, paths with spaces, duplicate worktrees and partial results."
+          ],
+          "deps": [
+            "Foundation-P2"
+          ],
+          "priority": "High"
+        },
+        {
+          "key": "Discovery-P2",
+          "title": "Discovery-P2: Git facts and stack detection",
+          "criteria": [
+            "Read branch, dirty state, latest commit, remotes and upstream divergence without Git mutations.",
+            "Detect Tauri/mobile/other stack manifests and available workflow prerequisites.",
+            "Handle detached HEAD, unborn repos, unsafe ownership, missing git and no upstream with explicit states."
+          ],
+          "deps": [
+            "Discovery-P1"
+          ],
+          "priority": "High"
+        },
+        {
+          "key": "Discovery-P3",
+          "title": "Discovery-P3: Incremental refresh and discovery performance",
+          "criteria": [
+            "Debounce watchers, cache facts and support manual refresh/cancellation.",
+            "Reconcile added/removed/renamed projects and worktrees without duplicate identities.",
+            "Benchmark 100-project fixture against documented targets and retain partial failures."
+          ],
+          "deps": [
+            "Discovery-P2"
+          ],
+          "priority": "High"
+        }
+      ]
+    },
+    {
+      "key": "GitHub",
+      "name": "Optional GitHub project context",
+      "objective": "Enrich local projects with repository activity and issue selection while preserving offline use.",
+      "phases": [
+        {
+          "key": "GitHub-P1",
+          "title": "GitHub-P1: Auth and remote association",
+          "criteria": [
+            "Associate verified GitHub remotes (HTTPS/SSH) with the correct owner/repo and optional selected account.",
+            "Use provider-managed auth or credential references; no tokens in frontend/logs/repo.",
+            "Disconnected, non-GitHub and unauthorized repos remain usable locally."
+          ],
+          "deps": [
+            "Discovery-P2"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "GitHub-P2",
+          "title": "GitHub-P2: Cached repository activity",
+          "criteria": [
+            "Show open issue/PR counts, commit summary and direct links with separate remote freshness.",
+            "Handle pagination, rate limits, auth expiry, unavailable fields and explicit refresh.",
+            "Network failure cannot block local project list or expose unauthorized data."
+          ],
+          "deps": [
+            "GitHub-P1",
+            "Foundation-P3"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "GitHub-P3",
+          "title": "GitHub-P3: Issue picker and workflow context",
+          "criteria": [
+            "Pick a repository issue or enter a URL/number; validate repository scope and closed/blocked states.",
+            "Display acceptance criteria and blockers, link parent epic and PR context.",
+            "Pass bounded issue context to Work action without altering the issue at selection time."
+          ],
+          "deps": [
+            "GitHub-P2"
+          ],
+          "priority": "Medium"
+        }
+      ]
+    },
+    {
+      "key": "Workflows",
+      "name": "Coding actions and recoverable runs",
+      "objective": "Provide dev-work/dev-push/dev-build style actions with reliable execution and visible progress.",
+      "phases": [
+        {
+          "key": "Workflows-P1",
+          "title": "Workflows-P1: Project-aware action registry",
+          "criteria": [
+            "Declare action inputs, supported stacks, skill reference or versioned script, checks and output artifacts.",
+            "Discover compatible skills explicitly; show disabled reasons rather than executing Markdown.",
+            "Define effect scope so requested commit/push/PR work is explicit; default builds to release."
+          ],
+          "deps": [
+            "Discovery-P2",
+            "Foundation-P2"
+          ],
+          "priority": "High"
+        },
+        {
+          "key": "Workflows-P2",
+          "title": "Workflows-P2: Managed execution and streamed runs",
+          "criteria": [
+            "Run configured executables with validated cwd/argument arrays; test Windows cmd/ps1 quoting and paths with spaces.",
+            "Stream sequence-numbered output with bounded buffers, input-needed state, timeout and process-tree cancellation.",
+            "Persist states and prevent concurrent mutating runs on one repository/worktree."
+          ],
+          "deps": [
+            "Workflows-P1"
+          ],
+          "priority": "High"
+        },
+        {
+          "key": "Workflows-P3",
+          "title": "Workflows-P3: Agent-backed work and push actions",
+          "criteria": [
+            "Execute dev-work/dev-push with selected compatible runtime, issue and intentional change scope.",
+            "Preflight dirty repos/auth/dependencies and isolate work where needed without automatic broad staging/stashing.",
+            "Verify commits, remote push and PR URLs; record side effects to prevent duplicate retry."
+          ],
+          "deps": [
+            "Workflows-P2",
+            "Providers-P2",
+            "GitHub-P3"
+          ],
+          "priority": "High"
+        },
+        {
+          "key": "Workflows-P4",
+          "title": "Workflows-P4: Build artifacts and interrupted-run recovery",
+          "criteria": [
+            "Invoke stack-specific build profiles and verify release artifact path/version; label debug explicitly.",
+            "Persist checkpoints, reconcile orphaned processes after restart and offer safe retry.",
+            "Verify failures/cancellation leave unrelated files intact and never repeat a completed remote side effect."
+          ],
+          "deps": [
+            "Workflows-P3"
+          ],
+          "priority": "High"
+        }
+      ]
+    },
+    {
+      "key": "Providers",
+      "name": "Configurable coding agents and local models",
+      "objective": "Support manual provider/model choice with explicit tested capabilities and safe handoff.",
+      "phases": [
+        {
+          "key": "Providers-P1",
+          "title": "Providers-P1: Provider contract and configuration",
+          "criteria": [
+            "Define capability-based adapter interface for discovery, health, models, start/cancel/events and checkpoints.",
+            "Keep provider, model, reasoning effort and runtime separate; store secret references only.",
+            "Show missing executable/auth/unsupported settings; never install or download models implicitly."
+          ],
+          "deps": [
+            "Foundation-P2"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Providers-P2",
+          "title": "Providers-P2: Codex coding adapter",
+          "criteria": [
+            "Validate installed CLI/SDK surface and version; normalize streamed events, final output, auth failures and cancellation.",
+            "Honor project scope, skill discovery, supported reasoning/model settings and approval/input states.",
+            "Complete opt-in temp-repo smoke run; fixture-test malformed streams and provider failures without remote mutation."
+          ],
+          "deps": [
+            "Providers-P1",
+            "Workflows-P2"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Providers-P3",
+          "title": "Providers-P3: Antigravity coding adapter",
+          "criteria": [
+            "Probe installed executable/SDK and documented noninteractive entry point; choose tested integration surface.",
+            "Map available settings, skill support, streamed progress and input/cancel semantics into adapter contract.",
+            "Document unsupported/missing capabilities honestly and verify Windows temp-repo run or explicit unavailable state."
+          ],
+          "deps": [
+            "Providers-P2"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Providers-P4",
+          "title": "Providers-P4: Ollama coding harness and portable handoff",
+          "criteria": [
+            "Discover configured local models and endpoint health; evaluate explicit compatible agent harness for tools/edit/test execution.",
+            "Enforce local-only profile, context/tool capability eligibility and hardware-aware timeout behavior.",
+            "Manual switching checkpoints goal/scope/diff/checks/pending work; no silent mid-run switch or duplicated side effects."
+          ],
+          "deps": [
+            "Providers-P3",
+            "Workflows-P4"
+          ],
+          "priority": "Medium"
+        }
+      ]
+    },
+    {
+      "key": "Routing",
+      "name": "Usage-aware model routing and pace",
+      "objective": "Select eligible models transparently using complexity, pace and trustworthy measured usage.",
+      "phases": [
+        {
+          "key": "Routing-P1",
+          "title": "Routing-P1: Usage and latency signals",
+          "criteria": [
+            "Represent subscription windows, API spend, context limits and local resource metrics separately with units/source/timestamps.",
+            "Collect supported signals; unknown/stale values remain unknown and manual estimates are labelled.",
+            "Normalize reset times, test stale/unavailable/rate-limit signals and record per-task latency without secrets."
+          ],
+          "deps": [
+            "Providers-P2",
+            "Workflows-P2"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Routing-P2",
+          "title": "Routing-P2: Explainable complexity and pace policy",
+          "criteria": [
+            "Implement deterministic requirements/complexity rules and Fast/Balanced/Thorough/Economy preferences.",
+            "Filter required tools/context/privacy first, then fresh quota/latency/quality preferences; support manual override.",
+            "Show selected model and rejected alternatives; desired completion time is a preference with no false guarantee."
+          ],
+          "deps": [
+            "Routing-P1",
+            "Providers-P4"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Routing-P3",
+          "title": "Routing-P3: Checkpoint fallback and routing calibration",
+          "criteria": [
+            "Switch only at safe checkpoint on configured failure/quota boundary; preserve privacy and user override.",
+            "Record decision/policy version and handoff, prevent routing loops and duplicate external mutations.",
+            "Evaluate representative task outcomes/latency/usage to tune rules; test unknown usage and exhausted eligible providers."
+          ],
+          "deps": [
+            "Routing-P2",
+            "Workflows-P4"
+          ],
+          "priority": "Medium"
+        }
+      ]
+    },
+    {
+      "key": "Release",
+      "name": "Windows reliability and release delivery",
+      "objective": "Ship a smooth, recoverable Windows application with verified artifacts and bounded data handling.",
+      "phases": [
+        {
+          "key": "Release-P1",
+          "title": "Release-P1: Cross-feature regression and security checks",
+          "criteria": [
+            "Test scanner/Git/IPC/process/adapter/routing failures using disposable repos and recorded fixtures.",
+            "Verify no command injection, root escape, leaked credentials or duplicate mutation; audit capability scopes and CSP.",
+            "Document live integration checks separately from fixture coverage; offline and missing-provider paths work."
+          ],
+          "deps": [
+            "Foundation-P3",
+            "Discovery-P3",
+            "Workflows-P4",
+            "Providers-P4",
+            "Routing-P3"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Release-P2",
+          "title": "Release-P2: Performance accessibility and diagnostics",
+          "criteria": [
+            "Measure startup, scan/list responsiveness and output floods against documented machine/fixture baselines.",
+            "Verify keyboard/contrast/reduced-motion and large-list responsiveness; capture regressions.",
+            "Add redacted diagnostics/export and bounded log retention with clear deletion controls."
+          ],
+          "deps": [
+            "Release-P1"
+          ],
+          "priority": "Medium"
+        },
+        {
+          "key": "Release-P3",
+          "title": "Release-P3: Windows installer and verified release process",
+          "criteria": [
+            "Add app icons, NSIS packaging, synchronized versions and repeatable locked release commands.",
+            "Verify executable/installer metadata, clean-machine WebView2 setup, launch and upgrade data preservation.",
+            "Publish release checklist and recovery instructions; signing/update strategy documented, distribution separately authorized."
+          ],
+          "deps": [
+            "Release-P2"
+          ],
+          "priority": "Medium"
+        }
+      ]
+    }
+  ]
+}

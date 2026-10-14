@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+/.worktrees/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+planning/github-state.json

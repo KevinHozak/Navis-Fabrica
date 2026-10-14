@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Basic desktop window only. Future features must add scoped permissions.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

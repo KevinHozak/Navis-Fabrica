@@ -189,6 +189,25 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .scan-notice summary { cursor: pointer; font-weight: 600; }
 .scan-notice ul { display: grid; gap: 5px; max-height: 180px; overflow: auto; padding-left: 18px; }
 .scan-notice p { margin: 5px 0 0; }
+
+.provider-layout { display: grid; gap: 18px; }
+.provider-form { display: grid; gap: 17px; padding: 0 23px 22px; }
+.provider-feedback { padding: 0 23px 18px; color: #9eacbd; font-size: 10px; }
+.provider-list { display: grid; gap: 12px; margin: 0; padding: 0 23px 22px; list-style: none; }
+.provider-card { display: grid; gap: 12px; padding: 15px; border: 1px solid #2a3543; border-radius: 10px; background: #111720; }
+.provider-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.provider-card-heading > div { display: grid; gap: 4px; }
+.provider-card-heading strong { color: #e0e8f2; font-size: 12px; }
+.provider-card-heading span, .provider-models { color: #8995a5; font-size: 10px; overflow-wrap: anywhere; }
+.provider-card .text-button { margin-top: 0; }
+.provider-models { margin: 0; }
+.provider-status-grid, .provider-capabilities { display: flex; flex-wrap: wrap; gap: 7px; }
+.provider-status-grid > span, .provider-capabilities > span { padding: 5px 7px; border: 1px solid #303b49; border-radius: 7px; font-size: 9px; overflow-wrap: anywhere; }
+.status-supported { color: #9adabb; background: #15251f; }
+.status-unsupported { color: #d5b6a0; background: #241d19; }
+.provider-empty { padding: 5px 23px 24px; color: #8995a5; font-size: 11px; }
+.provider-inline-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 520px) { .provider-inline-fields { grid-template-columns: 1fr; } .provider-form { padding-right: 17px; padding-left: 17px; } .provider-list { padding-right: 17px; padding-left: 17px; } .provider-feedback { padding-right: 17px; padding-left: 17px; } }
 @media (max-width: 650px) {
   .project-list { padding-right: 17px; padding-left: 17px; }
   .project-row { align-items: flex-start; flex-wrap: wrap; }

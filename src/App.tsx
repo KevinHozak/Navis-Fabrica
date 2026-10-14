@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { SettingsPanel } from "./SettingsPanel";
+import { ProvidersPanel } from "./ProvidersPanel";
 import {
   cancelProjectScan,
   isDesktopApp,
@@ -172,7 +173,7 @@ function App() {
             <div>
               <p className="eyebrow">YOUR WORKSPACE</p>
               <h1>{section === "projects" ? "Projects" : current.label}</h1>
-              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : `${current.label} will live here as the foundation grows.`}</p>
+              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : `${current.label} will live here as the foundation grows.`}</p>
             </div>
             {section === "projects" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : beginScan} disabled={scanStatus === "cancelling"}>
               <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : "Scan projects"}
@@ -181,6 +182,8 @@ function App() {
 
           {section === "settings" ? (
             <SettingsPanel />
+          ) : section === "providers" ? (
+            <ProvidersPanel />
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">

@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
-  cancelWorkflowRun, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
-  startWorkflowRun, WorkflowRun, writeWorkflowRunInput,
+  cancelWorkflowRun, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
+  respondCodexApproval, respondCodexUserInput, startCodexWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
 } from "./settings";
 
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
@@ -18,6 +18,12 @@ export function RunsPanel({ defaultCwd }: { defaultCwd: string }) {
   const [input, setInput] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [codexPrompt, setCodexPrompt] = useState("");
+  const [codexSkill, setCodexSkill] = useState("");
+  const [codexTimeout, setCodexTimeout] = useState(3600);
+  const [skills, setSkills] = useState<WorkflowSkillStatus[]>([]);
+  const [respondedRequests, setRespondedRequests] = useState<Set<string>>(() => new Set());
+  const [codexAnswers, setCodexAnswers] = useState<Record<string, Record<string, string>>>({});
 
   useEffect(() => {
     let active = true;
@@ -40,7 +46,21 @@ export function RunsPanel({ defaultCwd }: { defaultCwd: string }) {
   }, []);
 
   useEffect(() => setCwd(defaultCwd), [defaultCwd]);
+  useEffect(() => { discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
   const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0] ?? null, [runs, selectedId]);
+
+  async function startCodex(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const run = await startCodexWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, skillId: codexSkill || null, timeoutSeconds: codexTimeout });
+      setRuns((items) => [run, ...items.filter((item) => item.id !== run.id)].slice(0, 100));
+      setSelectedId(run.id);
+      setCodexPrompt("");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusy(false); }
+  }
 
   async function start(event: FormEvent) {
     event.preventDefault();
@@ -84,6 +104,23 @@ export function RunsPanel({ defaultCwd }: { defaultCwd: string }) {
   }
 
   return <div className="runs-workspace">
+    <section className="panel run-launch-panel" aria-labelledby="codex-run-title">
+      <div className="panel-heading"><div><h2 id="codex-run-title">Start Codex in this project</h2><p>Uses the selected Codex provider, model, and supported reasoning effort.</p></div></div>
+      <div className="panel-rule" />
+      <form className="run-launch-form" onSubmit={(event) => { void startCodex(event); }}>
+        <label>Project scope<input value={defaultCwd} readOnly aria-readonly="true" /></label>
+        <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
+          <option value="">No skill</option>{skills.filter((skill) => skill.status === "available" && skill.compatibleAgents.includes("Codex")).map((skill) => <option key={skill.id} value={skill.id}>{skill.id}</option>)}
+        </select></label>
+        <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder="Describe the work for Codex…" /></label>
+        <div className="run-launch-options">
+          <label>Timeout (seconds)<input type="number" min={1} max={86400} value={codexTimeout} onChange={(event) => setCodexTimeout(Number(event.target.value))} /></label>
+          <p className="registry-context-note">Writes are limited to this project. Codex approval requests pause for your decision.</p>
+          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim()}>{busy ? "Starting…" : "Start Codex"}</button>
+        </div>
+      </form>
+      {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
+    </section>
     <section className="panel run-launch-panel" aria-labelledby="run-launch-title">
       <div className="panel-heading"><div><h2 id="run-launch-title">Start a configured executable</h2><p>Arguments are passed as separate values to the native process runner.</p></div></div>
       <div className="panel-rule" />
@@ -113,14 +150,75 @@ export function RunsPanel({ defaultCwd }: { defaultCwd: string }) {
         </div><div className="panel-rule" />
         {selected ? <>
           <pre className="run-output" aria-live="polite">{selected.events.map((item) => `[${item.sequence}] ${item.kind}: ${item.text}`).join("\n") || "Waiting for process output…"}</pre>
-          {selected.state === "needsInput" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>
+          {selected.state === "needsInput" && selected.events.filter((item) => item.kind === "approvalRequest" || item.kind === "userInputRequest").map((item) => <CodexRequestCard key={`${item.sequence}-${item.kind}`} runId={selected.id} event={item} onResolved={(requestId) => setRespondedRequests((prior) => new Set(prior).add(requestId))} isResolved={(requestId) => respondedRequests.has(requestId)} />)}
+          {selected.state === "needsInput" && selected.provider !== "codex" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>
             <label>Send process input (one line)<input value={input} onChange={(event) => setInput(event.target.value)} /></label>
             <button className="button button-secondary" type="submit" disabled={!input}>Send input</button>
           </form>}
-          {activeStates.has(selected.state) && selected.state !== "needsInput" && <button className="text-button" type="button" onClick={() => { void markNeedsInput(); }}>Mark as waiting for input</button>}
+          {activeStates.has(selected.state) && selected.state !== "needsInput" && selected.provider !== "codex" && <button className="text-button" type="button" onClick={() => { void markNeedsInput(); }}>Mark as waiting for input</button>}
           {selected.exitCode !== null && <p className="registry-context-note">Exit code {selected.exitCode}</p>}
         </> : <div className="empty-state"><h3>Nothing running yet</h3><p>Start a configured executable to see sequence-numbered output here.</p></div>}
       </section>
     </div>
   </div>;
+}
+
+type CodexQuestion = { id: string; header: string; question: string; isOther: boolean; isSecret: boolean; options: { label: string; description: string }[] | null };
+type CodexRequest = { requestId: string | number; params?: { kind?: string; reason?: string | null; command?: string | null; availableDecisions?: (string | Record<string, unknown>)[] | null }; questions?: CodexQuestion[] };
+
+function CodexRequestCard({ runId, event, onResolved, isResolved }: {
+  runId: string;
+  event: { kind: string; text: string };
+  onResolved: (requestId: string) => void;
+  isResolved: (requestId: string) => boolean;
+}) {
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  let request: CodexRequest;
+  try { request = JSON.parse(event.text) as CodexRequest; } catch { return null; }
+  const requestId = String(request.requestId);
+  if (isResolved(requestId)) return null;
+
+  async function approve(decision: string) {
+    setBusy(true);
+    try {
+      await respondCodexApproval(runId, requestId, decision);
+      onResolved(requestId);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false); }
+  }
+
+  async function answer(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const values: Record<string, string[]> = {};
+      Object.entries(answers).forEach(([key, value]) => { values[key] = value ? [value] : []; });
+      await respondCodexUserInput(runId, requestId, values);
+      onResolved(requestId);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false); }
+  }
+
+  if (event.kind === "approvalRequest") {
+    const choices = (request.params?.availableDecisions ?? []).filter((value): value is string => typeof value === "string");
+    const safeChoices = choices.length ? choices : ["decline"];
+    return <section className="run-input-form" aria-label="Codex approval request">
+      <strong>Codex is waiting for approval</strong>
+      {request.params?.reason && <p>{request.params.reason}</p>}
+      {request.params?.command && <pre>{request.params.command}</pre>}
+      {error && <p role="alert">{error}</p>}
+      <div className="settings-actions">{safeChoices.map((choice) => <button key={choice} className={choice === "accept" ? "button button-primary" : "button button-secondary"} type="button" disabled={busy} onClick={() => { void approve(choice); }}>{choice === "accept" ? "Approve once" : choice === "decline" ? "Decline" : choice === "acceptForSession" ? "Approve for session" : choice}</button>)}</div>
+    </section>;
+  }
+  if (event.kind !== "userInputRequest") return null;
+  return <form className="run-input-form" aria-label="Codex input request" onSubmit={(event) => { void answer(event); }}>
+    <strong>Codex needs your input</strong>
+    {(request.questions ?? []).map((question) => <label key={question.id}>{question.header}: {question.question}
+      {question.options?.length ? <select required value={answers[question.id] ?? ""} onChange={(event) => setAnswers((prior) => ({ ...prior, [question.id]: event.target.value }))}>
+        <option value="">Choose an answer</option>{question.options.map((option) => <option key={option.label} value={option.label}>{option.label}</option>)}
+      </select> : <input required type={question.isSecret ? "password" : "text"} value={answers[question.id] ?? ""} onChange={(event) => setAnswers((prior) => ({ ...prior, [question.id]: event.target.value }))} />}
+    </label>)}
+    {error && <p role="alert">{error}</p>}
+    <button className="button button-secondary" type="submit" disabled={busy}>Send answers</button>
+  </form>;
 }

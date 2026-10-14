@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-respond-codex-approval"
+description = "Responds to a pending Codex approval request."
+commands.allow = ["respond_codex_approval"]
+
+[[permission]]
+identifier = "deny-respond-codex-approval"
+description = "Denies responding to a Codex approval request."
+commands.deny = ["respond_codex_approval"]

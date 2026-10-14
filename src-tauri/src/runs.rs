@@ -2,10 +2,11 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,7 +48,11 @@ pub struct RunEvent {
 pub struct RunRecord {
     pub id: String,
     pub executable: String,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub cwd: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
     pub mutating: bool,
     pub state: String,
     pub started_at_ms: u128,
@@ -65,6 +70,38 @@ struct RunStore {
     output_bytes: HashMap<String, usize>,
     cancelled: HashSet<String>,
     redaction_values: HashMap<String, Vec<String>>,
+    codex_writers: HashMap<String, Arc<Mutex<ChildStdin>>>,
+    codex_thread_ids: HashMap<String, String>,
+    codex_requests: HashMap<String, HashMap<String, PendingCodexRequest>>,
+    adapter_terminal: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCodexRequest {
+    request_id: serde_json::Value,
+    method: String,
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexStartRequest {
+    pub cwd: String,
+    pub prompt: String,
+    pub skill_id: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexRunConfig {
+    pub executable: PathBuf,
+    pub cwd: PathBuf,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+    pub prompt: String,
+    pub skill_id: Option<String>,
+    pub skill_path: Option<PathBuf>,
+    pub timeout_seconds: u64,
 }
 
 fn store() -> &'static Mutex<RunStore> {
@@ -497,6 +534,442 @@ fn pump_output(
     });
 }
 
+fn pump_codex_stderr(
+    app: AppHandle,
+    path: PathBuf,
+    id: String,
+    child: Arc<Mutex<Child>>,
+    reader: impl Read + Send + 'static,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Some(event) = crate::providers::normalize_codex_stderr(&line) {
+                        finish_codex_run(&app, &path, &id, "failed", &event.kind, &event.text);
+                        if let Ok(mut child) = child.lock() {
+                            terminate_process_tree(&mut child);
+                        }
+                    } else {
+                        emit_event(&app, &path, &id, "stderr", line.trim_end());
+                    }
+                }
+                Err(_) => {
+                    emit_event(
+                        &app,
+                        &path,
+                        &id,
+                        "system",
+                        "Could not read Codex app-server diagnostics.",
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn start_codex_protocol(
+    app: AppHandle,
+    path: PathBuf,
+    id: String,
+    child: Arc<Mutex<Child>>,
+    writer: Arc<Mutex<ChildStdin>>,
+    stdout: ChildStdout,
+    config: CodexRunConfig,
+) {
+    let (sender, receiver) = mpsc::channel::<Result<String, String>>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if line.len() > 256 * 1024 => {
+                    let _ = sender.send(Err(
+                        "Codex app-server message exceeded the size limit.".into()
+                    ));
+                }
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = sender.send(Err("Could not read Codex app-server output.".into()));
+                    break;
+                }
+            }
+        }
+    });
+    thread::spawn(move || {
+        drive_codex_protocol(app, path, id, child, writer, receiver, config);
+    });
+}
+
+fn send_codex_message(
+    writer: &Arc<Mutex<ChildStdin>>,
+    message: &serde_json::Value,
+) -> Result<(), String> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "Could not access the Codex app-server input.".to_string())?;
+    serde_json::to_writer(&mut *writer, message)
+        .map_err(|_| "Could not encode a Codex app-server message.".to_string())?;
+    writer
+        .write_all(b"\n")
+        .and_then(|_| writer.flush())
+        .map_err(|_| "Could not send a message to the Codex app-server.".to_string())
+}
+
+fn drive_codex_protocol(
+    app: AppHandle,
+    path: PathBuf,
+    run_id: String,
+    child: Arc<Mutex<Child>>,
+    writer: Arc<Mutex<ChildStdin>>,
+    receiver: Receiver<Result<String, String>>,
+    config: CodexRunConfig,
+) {
+    let initialize = crate::providers::app_server_initialize(1, env!("CARGO_PKG_VERSION"));
+    if let Err(error) = send_codex_message(&writer, &initialize) {
+        finish_codex_run(&app, &path, &run_id, "failed", "providerError", &error);
+        return;
+    }
+    let Some(initialize_result) =
+        wait_for_codex_response(&app, &path, &run_id, &receiver, &child, 1)
+    else {
+        return;
+    };
+    if let Err(error) = initialize_result {
+        let message = codex_rpc_error_message(error);
+        finish_codex_run(&app, &path, &run_id, "failed", "providerError", &message);
+        return;
+    }
+    if send_codex_message(
+        &writer,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "initialized" }),
+    )
+    .is_err()
+    {
+        finish_codex_run(
+            &app,
+            &path,
+            &run_id,
+            "failed",
+            "providerError",
+            "Could not initialize the Codex app-server connection.",
+        );
+        return;
+    }
+    let cwd = config.cwd.to_string_lossy().into_owned();
+    let thread_start = crate::providers::app_server_thread_start(2, &cwd, &config.model_id);
+    if send_codex_message(&writer, &thread_start).is_err() {
+        finish_codex_run(
+            &app,
+            &path,
+            &run_id,
+            "failed",
+            "providerError",
+            "Could not start a scoped Codex thread.",
+        );
+        return;
+    }
+    let Some(thread_result) = wait_for_codex_response(&app, &path, &run_id, &receiver, &child, 2)
+    else {
+        return;
+    };
+    let thread_id = match thread_result {
+        Ok(value) => value
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        Err(error) => {
+            let message = codex_rpc_error_message(error);
+            finish_codex_run(&app, &path, &run_id, "failed", "providerError", &message);
+            return;
+        }
+    };
+    let Some(thread_id) = thread_id else {
+        finish_codex_run(
+            &app,
+            &path,
+            &run_id,
+            "failed",
+            "providerError",
+            "Codex did not return a thread identifier.",
+        );
+        return;
+    };
+    set_codex_thread_id(&app, &path, &run_id, &thread_id);
+    let skill = config
+        .skill_id
+        .as_deref()
+        .zip(config.skill_path.as_deref())
+        .map(|(name, path)| (name, path.to_string_lossy()));
+    let skill = skill.as_ref().map(|(name, path)| (*name, path.as_ref()));
+    let turn_start = crate::providers::app_server_turn_start(
+        3,
+        &thread_id,
+        &cwd,
+        &config.model_id,
+        config.reasoning_effort.as_deref(),
+        &config.prompt,
+        skill,
+    );
+    if send_codex_message(&writer, &turn_start).is_err() {
+        finish_codex_run(
+            &app,
+            &path,
+            &run_id,
+            "failed",
+            "providerError",
+            "Could not start the Codex turn.",
+        );
+        return;
+    }
+    if let Some(turn_result) = wait_for_codex_response(&app, &path, &run_id, &receiver, &child, 3) {
+        if let Err(error) = turn_result {
+            let message = codex_rpc_error_message(error);
+            finish_codex_run(&app, &path, &run_id, "failed", "providerError", &message);
+            return;
+        }
+    } else {
+        return;
+    }
+    loop {
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(Ok(line)) => match crate::providers::parse_app_server_message(&line) {
+                Ok(message) => handle_codex_message(&app, &path, &run_id, &child, &message),
+                Err(error) => emit_event(&app, &path, &run_id, "providerError", &error),
+            },
+            Ok(Err(error)) => emit_event(&app, &path, &run_id, "providerError", &error),
+            Err(RecvTimeoutError::Timeout) => {
+                let exited = child
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| child.try_wait().ok())
+                    .flatten()
+                    .is_some();
+                if exited {
+                    break;
+                }
+                let terminal = store()
+                    .lock()
+                    .map(|state| state.adapter_terminal.contains(&run_id))
+                    .unwrap_or(true);
+                if terminal {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        let terminal = store()
+            .lock()
+            .map(|state| state.adapter_terminal.contains(&run_id))
+            .unwrap_or(true);
+        if terminal {
+            break;
+        }
+    }
+    let terminal = store()
+        .lock()
+        .map(|state| state.adapter_terminal.contains(&run_id))
+        .unwrap_or(false);
+    if !terminal {
+        let current_state = store().lock().ok().and_then(|state| {
+            state
+                .records
+                .iter()
+                .find(|record| record.id == run_id)
+                .map(|record| record.state.clone())
+        });
+        if current_state.as_deref() != Some("cancelling")
+            && current_state.as_deref() != Some("timedOut")
+        {
+            finish_codex_run(
+                &app,
+                &path,
+                &run_id,
+                "failed",
+                "providerError",
+                "Codex app-server ended before the turn completed.",
+            );
+        }
+    }
+}
+
+fn wait_for_codex_response(
+    app: &AppHandle,
+    path: &Path,
+    run_id: &str,
+    receiver: &Receiver<Result<String, String>>,
+    child: &Arc<Mutex<Child>>,
+    request_id: u64,
+) -> Option<Result<serde_json::Value, serde_json::Value>> {
+    loop {
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(Ok(line)) => match crate::providers::parse_app_server_message(&line) {
+                Ok(message)
+                    if message.get("id").and_then(serde_json::Value::as_u64)
+                        == Some(request_id) =>
+                {
+                    if let Some(error) = message.get("error") {
+                        return Some(Err(error.clone()));
+                    }
+                    return Some(Ok(message
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)));
+                }
+                Ok(message) => handle_codex_message(app, path, run_id, child, &message),
+                Err(error) => emit_event(app, path, run_id, "providerError", &error),
+            },
+            Ok(Err(error)) => emit_event(app, path, run_id, "providerError", &error),
+            Err(RecvTimeoutError::Timeout) => {
+                let exited = child
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| child.try_wait().ok())
+                    .flatten()
+                    .is_some();
+                if exited {
+                    return None;
+                }
+                let terminal = store()
+                    .lock()
+                    .map(|state| state.adapter_terminal.contains(run_id))
+                    .unwrap_or(true);
+                if terminal {
+                    return None;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+fn codex_rpc_error_message(error: serde_json::Value) -> String {
+    let detail = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if detail.to_ascii_lowercase().contains("auth") || detail.to_ascii_lowercase().contains("401") {
+        "Codex authentication is required or expired.".into()
+    } else {
+        "Codex app-server rejected the request.".into()
+    }
+}
+
+fn set_codex_thread_id(app: &AppHandle, path: &Path, run_id: &str, thread_id: &str) {
+    if let Ok(mut state) = store().lock() {
+        state
+            .codex_thread_ids
+            .insert(run_id.to_owned(), thread_id.to_owned());
+        if let Some(record) = state.records.iter_mut().find(|record| record.id == run_id) {
+            record.thread_id = Some(thread_id.to_owned());
+            let snapshot = record.clone();
+            let _ = persist_records(path, &state.records);
+            let _ = app.emit("workflow-run-updated", snapshot);
+        }
+    }
+}
+
+fn handle_codex_message(
+    app: &AppHandle,
+    path: &Path,
+    run_id: &str,
+    child: &Arc<Mutex<Child>>,
+    message: &serde_json::Value,
+) {
+    if message.get("method").is_none() {
+        return;
+    }
+    if let Some(method) = message.get("method").and_then(serde_json::Value::as_str) {
+        if matches!(
+            method,
+            "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "item/tool/requestUserInput"
+        ) {
+            let Some(request_id) = message.get("id").cloned() else {
+                return;
+            };
+            let Some(key) = codex_request_key(&request_id) else {
+                return;
+            };
+            let params = message
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if let Ok(mut state) = store().lock() {
+                state
+                    .codex_requests
+                    .entry(run_id.to_owned())
+                    .or_default()
+                    .insert(
+                        key,
+                        PendingCodexRequest {
+                            request_id: request_id.clone(),
+                            method: method.to_owned(),
+                            params,
+                        },
+                    );
+            }
+            if let Some(event) = crate::providers::normalize_app_server_message(message) {
+                set_state(app, path, run_id, "needsInput", None);
+                emit_event(app, path, run_id, &event.kind, &event.text);
+            }
+            return;
+        }
+    }
+    let Some(event) = crate::providers::normalize_app_server_message(message) else {
+        if message.get("method").and_then(serde_json::Value::as_str) == Some("turn/started") {
+            emit_event(app, path, run_id, "state", "Codex turn started.");
+        }
+        return;
+    };
+    if !event.text.is_empty() {
+        emit_event(app, path, run_id, &event.kind, &event.text);
+    }
+    if let Some(terminal_state) = event.terminal_state.as_deref() {
+        finish_codex_run(app, path, run_id, terminal_state, "state", &event.text);
+        if let Ok(mut child) = child.lock() {
+            terminate_process_tree(&mut child);
+        }
+    }
+}
+
+fn finish_codex_run(
+    app: &AppHandle,
+    path: &Path,
+    run_id: &str,
+    state_name: &str,
+    event_kind: &str,
+    text: &str,
+) {
+    if let Ok(mut state) = store().lock() {
+        state.adapter_terminal.insert(run_id.to_owned());
+    }
+    if !text.is_empty() && event_kind != "state" {
+        emit_event(app, path, run_id, event_kind, text);
+    }
+    set_state(app, path, run_id, state_name, None);
+}
+
+fn codex_request_key(request_id: &serde_json::Value) -> Option<String> {
+    request_id
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| request_id.as_i64().map(|value| value.to_string()))
+}
+
 #[tauri::command]
 pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
     let path = history_path(&app)?;
@@ -511,6 +984,49 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
 
 #[tauri::command]
 pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRecord, String> {
+    start_run(app, request, None)
+}
+
+pub fn start_codex_workflow_run(
+    app: AppHandle,
+    config: CodexRunConfig,
+) -> Result<RunRecord, String> {
+    if config.prompt.trim().is_empty()
+        || config.prompt.len() > 60_000
+        || config.prompt.contains('\0')
+    {
+        return Err("Enter a prompt of 1 to 60,000 characters for Codex.".into());
+    }
+    if config.model_id.trim().is_empty()
+        || config.model_id.len() > 160
+        || config.model_id.chars().any(char::is_control)
+    {
+        return Err("Select a valid configured Codex model.".into());
+    }
+    let cwd = config
+        .cwd
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() {
+        return Err("The selected project must be an existing folder.".into());
+    }
+    let timeout_seconds = config.timeout_seconds;
+    let request = StartRequest {
+        executable: config.executable.to_string_lossy().into_owned(),
+        arguments: vec!["app-server".into(), "--stdio".into()],
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds,
+        mutating: true,
+    };
+    start_run(app, request, Some(config))
+}
+
+fn start_run(
+    app: AppHandle,
+    request: StartRequest,
+    codex: Option<CodexRunConfig>,
+) -> Result<RunRecord, String> {
+    let codex_run = codex.is_some();
     let (executable, cwd, host) = validate_request(&request)?;
     let canonical_key = mutation_scope(&cwd);
     let path = history_path(&app)?;
@@ -547,7 +1063,9 @@ pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRe
     let record = RunRecord {
         id: id.clone(),
         executable: executable.to_string_lossy().into_owned(),
+        provider: codex.as_ref().map(|_| "codex".into()),
         cwd: cwd.to_string_lossy().into_owned(),
+        thread_id: None,
         mutating: request.mutating,
         state: "queued".into(),
         started_at_ms: now_ms(),
@@ -601,17 +1119,50 @@ pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRe
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let codex_stdin = if codex.is_some() {
+        child.stdin.take()
+    } else {
+        None
+    };
     let child = Arc::new(Mutex::new(child));
     if let Ok(mut state) = store().lock() {
         state.active.insert(id.clone(), child.clone());
+        if let Some(stdin) = codex_stdin {
+            state
+                .codex_writers
+                .insert(id.clone(), Arc::new(Mutex::new(stdin)));
+            state.codex_requests.insert(id.clone(), HashMap::new());
+        }
     }
-    if let Some(stdout) = stdout {
+    set_state(&app, &path, &id, "running", None);
+    if let Some(codex) = codex {
+        if let (Some(stdout), Some(writer)) = (
+            stdout,
+            store()
+                .lock()
+                .ok()
+                .and_then(|state| state.codex_writers.get(&id).cloned()),
+        ) {
+            start_codex_protocol(
+                app.clone(),
+                path.clone(),
+                id.clone(),
+                child.clone(),
+                writer,
+                stdout,
+                codex,
+            );
+        }
+    } else if let Some(stdout) = stdout {
         pump_output(app.clone(), path.clone(), id.clone(), "stdout", stdout);
     }
     if let Some(stderr) = stderr {
-        pump_output(app.clone(), path.clone(), id.clone(), "stderr", stderr);
+        if codex_run {
+            pump_codex_stderr(app.clone(), path.clone(), id.clone(), child.clone(), stderr);
+        } else {
+            pump_output(app.clone(), path.clone(), id.clone(), "stderr", stderr);
+        }
     }
-    set_state(&app, &path, &id, "running", None);
     let worker_app = app.clone();
     let worker_id = id.clone();
     thread::spawn(move || {
@@ -629,6 +1180,13 @@ pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRe
                 .and_then(|mut process| process.try_wait().map_err(|_| ()));
             match result {
                 Ok(Some(status)) => {
+                    let finished_by_adapter = store()
+                        .lock()
+                        .map(|mut state| state.adapter_terminal.remove(&worker_id))
+                        .unwrap_or(false);
+                    if finished_by_adapter {
+                        break "adapterFinished";
+                    }
                     let was_cancelled = store()
                         .lock()
                         .map(|mut state| state.cancelled.remove(&worker_id))
@@ -656,6 +1214,10 @@ pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRe
         }
         if let Ok(mut state) = store().lock() {
             state.active.remove(&worker_id);
+            state.codex_writers.remove(&worker_id);
+            state.codex_requests.remove(&worker_id);
+            state.codex_thread_ids.remove(&worker_id);
+            state.adapter_terminal.remove(&worker_id);
             state.output_bytes.remove(&worker_id);
             state.cancelled.remove(&worker_id);
             state.redaction_values.remove(&worker_id);
@@ -757,12 +1319,16 @@ pub fn write_workflow_run_input(
     if input.len() > 64 * 1024 || input.contains('\0') {
         return Err("The input is invalid or too large.".into());
     }
-    let child = store()
+    let state = store()
         .lock()
-        .map_err(|_| "Could not access workflow runs.".to_string())?
-        .active
-        .get(&run_id)
-        .cloned();
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.codex_writers.contains_key(&run_id) {
+        return Err(
+            "Respond to the pending Codex approval or input request in the run details.".into(),
+        );
+    }
+    let child = state.active.get(&run_id).cloned();
+    drop(state);
     let Some(child) = child else { return Ok(false) };
     let needs_input = store()
         .lock()
@@ -788,6 +1354,160 @@ pub fn write_workflow_run_input(
     set_state(&app, &path, &run_id, "running", None);
     emit_event(&app, &path, &run_id, "inputSent", "Input sent.");
     Ok(true)
+}
+
+#[tauri::command]
+pub fn respond_codex_approval(
+    app: AppHandle,
+    run_id: String,
+    request_id: String,
+    decision: String,
+) -> Result<bool, String> {
+    if request_id.is_empty() || request_id.len() > 160 || request_id.chars().any(char::is_control) {
+        return Err("The Codex approval request identifier is invalid.".into());
+    }
+    let (writer, pending) = get_pending_codex_request(&run_id, &request_id)?;
+    if !matches!(
+        pending.method.as_str(),
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+    ) {
+        return Err("This Codex request is not an approval request.".into());
+    }
+    let allowed = pending
+        .params
+        .get("availableDecisions")
+        .and_then(serde_json::Value::as_array);
+    let permitted = allowed.is_some_and(|choices| {
+        choices
+            .iter()
+            .any(|choice| choice.as_str() == Some(&decision))
+    });
+    if !permitted
+        || !matches!(
+            decision.as_str(),
+            "accept" | "acceptForSession" | "decline" | "cancel"
+        )
+    {
+        return Err("Choose an approval decision offered by Codex.".into());
+    }
+    send_codex_message(
+        &writer,
+        &crate::providers::app_server_response(
+            pending.request_id.clone(),
+            serde_json::json!({ "decision": decision }),
+        ),
+    )?;
+    clear_pending_codex_request(&app, &run_id, &request_id)?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn respond_codex_user_input(
+    app: AppHandle,
+    run_id: String,
+    request_id: String,
+    answers: HashMap<String, Vec<String>>,
+) -> Result<bool, String> {
+    if request_id.is_empty() || request_id.len() > 160 || request_id.chars().any(char::is_control) {
+        return Err("The Codex input request identifier is invalid.".into());
+    }
+    let (writer, pending) = get_pending_codex_request(&run_id, &request_id)?;
+    if pending.method != "item/tool/requestUserInput" {
+        return Err("This Codex request is not asking for user input.".into());
+    }
+    let questions = pending
+        .params
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Codex sent an invalid input request.")?;
+    let allowed = questions
+        .iter()
+        .filter_map(|question| question.get("id").and_then(serde_json::Value::as_str))
+        .collect::<HashSet<_>>();
+    if answers.keys().any(|key| !allowed.contains(key.as_str()))
+        || allowed.iter().any(|key| {
+            answers.get(*key).is_none_or(|values| {
+                values.is_empty() || values.iter().any(|value| value.trim().is_empty())
+            })
+        })
+        || answers.values().any(|values| {
+            values.len() > 10
+                || values
+                    .iter()
+                    .any(|value| value.len() > 10_000 || value.contains('\0'))
+        })
+    {
+        return Err(
+            "The Codex answers do not match the requested fields or exceed their limits.".into(),
+        );
+    }
+    let response_answers = answers
+        .into_iter()
+        .map(|(key, values)| (key, serde_json::json!({ "answers": values })))
+        .collect::<HashMap<_, _>>();
+    send_codex_message(
+        &writer,
+        &crate::providers::app_server_response(
+            pending.request_id.clone(),
+            serde_json::json!({ "answers": response_answers }),
+        ),
+    )?;
+    clear_pending_codex_request(&app, &run_id, &request_id)?;
+    Ok(true)
+}
+
+fn get_pending_codex_request(
+    run_id: &str,
+    request_id: &str,
+) -> Result<(Arc<Mutex<ChildStdin>>, PendingCodexRequest), String> {
+    let state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    let writer = state
+        .codex_writers
+        .get(run_id)
+        .cloned()
+        .ok_or("This Codex run is no longer accepting requests.")?;
+    let pending = state
+        .codex_requests
+        .get(run_id)
+        .and_then(|requests| requests.get(request_id))
+        .cloned()
+        .ok_or("This Codex request is no longer pending.")?;
+    Ok((writer, pending))
+}
+
+fn clear_pending_codex_request(
+    app: &AppHandle,
+    run_id: &str,
+    request_id: &str,
+) -> Result<(), String> {
+    let (no_pending, path) = {
+        let mut state = store()
+            .lock()
+            .map_err(|_| "Could not access workflow runs.".to_string())?;
+        let requests = state
+            .codex_requests
+            .get_mut(run_id)
+            .ok_or("This Codex run is no longer accepting requests.")?;
+        requests.remove(request_id);
+        (requests.is_empty(), history_path(app)?)
+    };
+    if no_pending {
+        let waiting = store()
+            .lock()
+            .map_err(|_| "Could not access workflow runs.".to_string())?
+            .records
+            .iter()
+            .find(|record| record.id == run_id)
+            .is_some_and(|record| record.state == "needsInput");
+        if waiting {
+            set_state(app, &path, run_id, "running", None);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -824,7 +1544,9 @@ mod tests {
         let mut record = RunRecord {
             id: "fixture".into(),
             executable: "test".into(),
+            provider: None,
             cwd: directory.path().display().to_string(),
+            thread_id: None,
             mutating: true,
             state: "running".into(),
             started_at_ms: 1,

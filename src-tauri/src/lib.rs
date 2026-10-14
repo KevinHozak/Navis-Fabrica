@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 
 mod github;
 pub mod providers;
+mod runs;
 mod scanner;
 
 static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
@@ -1049,7 +1050,12 @@ pub fn run() {
             list_github_issues,
             get_github_issue,
             start_project_scan,
-            cancel_project_scan
+            cancel_project_scan,
+            runs::list_workflow_runs,
+            runs::start_workflow_run,
+            runs::cancel_workflow_run,
+            runs::mark_workflow_run_needs_input,
+            runs::write_workflow_run_input
         ])
         .run(tauri::generate_context!())
         .expect("error while running Navis-Fabrica");

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
 
+pub mod providers;
 mod scanner;
 
 static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
@@ -17,7 +18,7 @@ fn active_scans() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     ACTIVE_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const SETTINGS_FILE: &str = "settings.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,8 @@ pub struct Settings {
     pub project_root: String,
     pub exclusions: Vec<String>,
     pub preferences: Preferences,
+    pub providers: Vec<providers::ProviderProfile>,
+    pub provider_selection: providers::ProviderSelection,
 }
 
 impl Default for Settings {
@@ -57,6 +60,8 @@ impl Default for Settings {
                 String::from("target"),
             ],
             preferences: Preferences::default(),
+            providers: Vec::new(),
+            provider_selection: providers::ProviderSelection::default(),
         }
     }
 }
@@ -67,6 +72,10 @@ struct SettingsInput {
     project_root: String,
     exclusions: Vec<String>,
     preferences: PreferencesInput,
+    #[serde(default)]
+    providers: Vec<providers::ProviderProfile>,
+    #[serde(default)]
+    provider_selection: providers::ProviderSelection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +193,33 @@ fn recover_settings(value: Value) -> Settings {
         .map(|depth| depth as u8)
         .unwrap_or(defaults.preferences.scan_depth);
 
+    let provider_profiles = object
+        .get("providers")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<providers::ProviderProfile>>(value).ok())
+        .unwrap_or_default();
+    let provider_selection = object
+        .get("providerSelection")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<providers::ProviderSelection>(value).ok())
+        .unwrap_or_default();
+    // Profile validity is independent of the remembered selection. Preserve
+    // usable profiles when a stale provider/model selection needs to recover.
+    let profiles_valid =
+        providers::validate_profiles(&provider_profiles, &providers::ProviderSelection::default())
+            .is_ok();
+    let (providers, provider_selection) = if profiles_valid {
+        let selection =
+            if providers::validate_profiles(&provider_profiles, &provider_selection).is_ok() {
+                provider_selection
+            } else {
+                defaults.provider_selection
+            };
+        (provider_profiles, selection)
+    } else {
+        (defaults.providers, defaults.provider_selection)
+    };
+
     Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         project_root,
@@ -192,6 +228,8 @@ fn recover_settings(value: Value) -> Settings {
             include_hidden,
             scan_depth,
         },
+        providers,
+        provider_selection,
     }
 }
 
@@ -308,6 +346,7 @@ fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, String> {
+    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
     let settings = Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         project_root: validate_project_root(&settings.project_root)?,
@@ -316,6 +355,8 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
             include_hidden: settings.preferences.include_hidden,
             scan_depth: settings.preferences.scan_depth,
         },
+        providers: settings.providers,
+        provider_selection: settings.provider_selection,
     };
     if !(1..=8).contains(&settings.preferences.scan_depth) {
         return Err("Scan depth must be between 1 and 8.".into());
@@ -323,6 +364,18 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
 
     write_settings_atomic(&settings_path(&app)?, &settings)?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn inspect_providers(
+    profiles: Vec<providers::ProviderProfile>,
+) -> Result<Vec<providers::ProviderAvailability>, String> {
+    providers::validate_profiles(&profiles, &providers::ProviderSelection::default())?;
+    let path = std::env::var_os("PATH");
+    Ok(profiles
+        .iter()
+        .map(|profile| providers::inspect(profile, path.as_deref()))
+        .collect())
 }
 
 #[tauri::command]
@@ -389,6 +442,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            inspect_providers,
             start_project_scan,
             cancel_project_scan
         ])
@@ -403,7 +457,7 @@ mod tests {
     #[test]
     fn defaults_are_schema_versioned_and_windows_friendly() {
         let settings = Settings::default();
-        assert_eq!(settings.schema_version, 1);
+        assert_eq!(settings.schema_version, 2);
         assert_eq!(settings.project_root, r"C:\Projects");
         assert_eq!(settings.preferences.scan_depth, 3);
     }
@@ -430,6 +484,35 @@ mod tests {
     }
 
     #[test]
+    fn preserves_valid_provider_profiles_when_selection_is_stale() {
+        let value = serde_json::json!({
+            "schemaVersion": 2,
+            "providers": [{
+                "id": "codex-local",
+                "kind": "codex",
+                "name": "Codex",
+                "executable": "codex",
+                "secretRef": "credential-store:codex-session",
+                "models": [{ "id": "gpt", "name": "GPT", "reasoningEfforts": ["medium"] }]
+            }],
+            "providerSelection": {
+                "providerId": "removed-provider",
+                "modelId": "removed-model",
+                "reasoningEffort": "high",
+                "runtimeId": null
+            }
+        });
+
+        let settings = recover_settings(value);
+        assert_eq!(settings.providers.len(), 1);
+        assert_eq!(settings.providers[0].id, "codex-local");
+        assert_eq!(
+            settings.provider_selection,
+            providers::ProviderSelection::default()
+        );
+    }
+
+    #[test]
     fn invalid_exclusions_cannot_escape_the_root() {
         assert!(validate_exclusions(vec![String::from(r"..\outside")]).is_err());
         assert_eq!(
@@ -453,11 +536,11 @@ mod tests {
     fn leaves_settings_from_a_newer_schema_untouched() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = folder.path().join(SETTINGS_FILE);
-        fs::write(&path, r#"{"schemaVersion":2,"projectRoot":"C:\\Projects"}"#).unwrap();
+        fs::write(&path, r#"{"schemaVersion":3,"projectRoot":"C:\\Projects"}"#).unwrap();
         assert!(load_settings(&path).unwrap_err().contains("newer version"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            r#"{"schemaVersion":2,"projectRoot":"C:\\Projects"}"#
+            r#"{"schemaVersion":3,"projectRoot":"C:\\Projects"}"#
         );
     }
 

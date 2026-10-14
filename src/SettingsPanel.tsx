@@ -39,6 +39,8 @@ export function SettingsPanel() {
         projectRoot: settings.projectRoot,
         exclusions: settings.exclusions,
         preferences: settings.preferences,
+        providers: settings.providers,
+        providerSelection: settings.providerSelection,
       });
       setSettings(saved);
       setSaveState("saved");

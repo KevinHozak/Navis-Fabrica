@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-providers"
+description = "Enables the inspect_providers command without any pre-configured scope."
+commands.allow = ["inspect_providers"]
+
+[[permission]]
+identifier = "deny-inspect-providers"
+description = "Denies the inspect_providers command without any pre-configured scope."
+commands.deny = ["inspect_providers"]

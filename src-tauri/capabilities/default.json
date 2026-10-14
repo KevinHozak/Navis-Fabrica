@@ -8,6 +8,7 @@
     "allow-save-settings",
     "allow-start-project-scan",
     "allow-cancel-project-scan",
+    "allow-inspect-providers",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

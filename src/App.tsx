@@ -42,6 +42,7 @@ function App() {
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
+  const [selectedGitHubLogin, setSelectedGitHubLogin] = useState<string | null>(null);
   const activeScanId = useRef("");
   const cancelRequested = useRef(false);
   const refreshAfterScan = useRef(false);
@@ -49,14 +50,20 @@ function App() {
   const desktop = isDesktopApp();
 
   useEffect(() => {
-    const handleNavigation = () => setSection(sectionFromHash());
+    const handleNavigation = () => {
+      setSection(sectionFromHash());
+      loadSettings().then((settings) => setSelectedGitHubLogin(settings.githubAccounts.find((account) => account.id === settings.selectedGithubAccountId)?.login ?? null)).catch(() => undefined);
+    };
     window.addEventListener("hashchange", handleNavigation);
     return () => window.removeEventListener("hashchange", handleNavigation);
   }, []);
 
   useEffect(() => {
     document.title = `Navis-Fabrica · v${__APP_VERSION__}`;
-    loadSettings().then((settings) => setProjectRoot(settings.projectRoot)).catch(() => undefined);
+    loadSettings().then((settings) => {
+      setProjectRoot(settings.projectRoot);
+      setSelectedGitHubLogin(settings.githubAccounts.find((account) => account.id === settings.selectedGithubAccountId)?.login ?? null);
+    }).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -249,7 +256,7 @@ function App() {
                   {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div>}
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
                   {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
-                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} />
+                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} selectedGitHubLogin={selectedGitHubLogin} />
                 </>
               ) : scanning ? (
                 <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
@@ -290,10 +297,11 @@ function gitStatusLabel(status: string): string {
 const PROJECT_ROW_HEIGHT = 68;
 const PROJECT_OVERSCAN = 5;
 
-function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
+function ProjectsBrowser({ projects, selectedProjectId, onSelect, selectedGitHubLogin }: {
   projects: ProjectEntry[];
   selectedProjectId: string | null;
   onSelect: (id: string) => void;
+  selectedGitHubLogin: string | null;
 }) {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
@@ -381,12 +389,12 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
           </div>
         </div> : <div className="project-filter-empty">No projects match these filters.</div>}
       </div>
-      <ProjectDetails project={selected} />
+      <ProjectDetails project={selected} selectedGitHubLogin={selectedGitHubLogin} />
     </div>
   </div>;
 }
 
-function ProjectDetails({ project }: { project: ProjectEntry | null }) {
+function ProjectDetails({ project, selectedGitHubLogin }: { project: ProjectEntry | null; selectedGitHubLogin: string | null }) {
   if (!project) return <aside className="project-detail empty-detail"><h3>Select a project</h3><p>Choose a project to see its local details.</p></aside>;
   const git = project.git;
   return <aside className="project-detail" aria-labelledby="project-detail-title">
@@ -400,6 +408,7 @@ function ProjectDetails({ project }: { project: ProjectEntry | null }) {
     </div>
     <div className="detail-group"><strong>Detected stacks</strong><div className="project-detail-tags">{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span>None detected</span>}</div></div>
     {git.remotes.length > 0 && <div className="detail-group"><strong>Remotes</strong>{git.remotes.map((remote) => <span className="detail-break" key={remote.name}>{remote.name}{remote.url ? ` · ${remote.url}` : " · URL unavailable"}</span>)}</div>}
+    {git.remotes.some((remote) => remote.github) && <div className="detail-group"><strong>GitHub association</strong>{git.remotes.filter((remote) => remote.github).map((remote) => <span key={remote.name}>{remote.name} · {remote.github!.owner}/{remote.github!.repository}</span>)}<span>Account · {selectedGitHubLogin ?? "none selected"}</span><span>Remote access · not checked; local project details remain available</span></div>}
     {project.workflowPrerequisites.length > 0 && <div className="detail-group"><strong>Workflow prerequisites</strong>{project.workflowPrerequisites.map((tool) => <span key={tool.name}>{tool.name} · {tool.available ? "available" : "missing"}</span>)}</div>}
   </aside>;
 }

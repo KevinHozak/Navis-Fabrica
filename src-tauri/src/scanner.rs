@@ -58,6 +58,15 @@ pub struct LatestCommit {
 pub struct GitRemote {
     pub name: String,
     pub url: Option<String>,
+    pub github: Option<GitHubRepository>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubRepository {
+    pub owner: String,
+    pub repository: String,
+    pub canonical_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -694,13 +703,15 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
             .lines()
             .filter(|line| !line.is_empty())
             .map(|name| {
-                let url = git_output(path, &["remote", "get-url", name], cancelled)
+                let raw_url = git_output(path, &["remote", "get-url", name], cancelled)
                     .ok()
-                    .flatten()
-                    .map(|url| sanitize_remote(&url));
+                    .flatten();
+                let github = raw_url.as_deref().and_then(parse_github_remote);
+                let url = raw_url.as_deref().map(sanitize_remote);
                 GitRemote {
                     name: name.to_owned(),
                     url,
+                    github,
                 }
             })
             .collect(),
@@ -905,6 +916,44 @@ fn sanitize_remote(value: &str) -> String {
         .to_owned()
 }
 
+fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
+    let trimmed = value.trim();
+    let path = if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        rest
+    } else {
+        return None;
+    };
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repository = parts.next()?.trim_end_matches(".git").trim();
+    if parts.next().is_some()
+        || owner.is_empty()
+        || repository.is_empty()
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || !repository
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return None;
+    }
+    Some(GitHubRepository {
+        owner: owner.to_owned(),
+        repository: repository.to_owned(),
+        canonical_url: format!("https://github.com/{owner}/{repository}"),
+    })
+}
+
 fn push_error(errors: &mut Vec<String>, message: String) {
     if errors.len() < MAX_ERRORS {
         errors.push(message);
@@ -1028,6 +1077,69 @@ mod tests {
 
         run_git(root.path(), &["checkout", "--quiet", "--detach", "HEAD"]);
         assert_eq!(inspect_git_fixture(root.path()).status, "detached");
+    }
+
+    #[test]
+    fn recognizes_canonical_github_https_and_ssh_remotes_only() {
+        for input in [
+            "https://github.com/Owner/Repo.git",
+            "ssh://git@github.com/Owner/Repo.git",
+            "git@github.com:Owner/Repo.git",
+        ] {
+            let repository = parse_github_remote(input).unwrap();
+            assert_eq!(repository.owner, "Owner");
+            assert_eq!(repository.repository, "Repo");
+            assert_eq!(repository.canonical_url, "https://github.com/Owner/Repo");
+        }
+        for input in [
+            "https://example.com/Owner/Repo.git",
+            "http://github.com/Owner/Repo.git",
+            "https://github.com/Owner/Repo/extra",
+            "https://github.com/Owner/../Repo",
+        ] {
+            assert!(parse_github_remote(input).is_none(), "{input}");
+        }
+    }
+
+    #[test]
+    fn scan_detects_github_identity_before_sanitizing_ssh_remotes() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        run_git(root.path(), &["init", "-q"]);
+        run_git(
+            root.path(),
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
+        );
+
+        let facts = inspect_git_fixture(root.path());
+        assert_eq!(
+            facts.remotes[0].url.as_deref(),
+            Some("github.com:Owner/Repo.git")
+        );
+        let github = facts.remotes[0]
+            .github
+            .as_ref()
+            .expect("GitHub remote should be recognized");
+        assert_eq!(github.owner, "Owner");
+        assert_eq!(github.repository, "Repo");
+
+        run_git(
+            root.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@github.com/Owner/Repo.git",
+            ],
+        );
+        let facts = inspect_git_fixture(root.path());
+        assert_eq!(
+            facts.remotes[0].url.as_deref(),
+            Some("ssh://github.com/Owner/Repo.git")
+        );
+        assert!(facts.remotes[0].github.is_some());
     }
 
     #[test]

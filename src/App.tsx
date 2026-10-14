@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import {
@@ -34,6 +35,7 @@ function App() {
   const [scanId, setScanId] = useState("");
   const [progress, setProgress] = useState<ProjectScanProgress | null>(null);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
   const [scanError, setScanError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
@@ -72,7 +74,7 @@ function App() {
     onProjectScanFinished((result) => {
       if (!active || result.scanId !== activeScanId.current) return;
       setScanResult(result);
-      setProjects(result.projects);
+      if (!result.fatalError || result.projects.length > 0) setProjects(result.projects);
       setScanError(result.fatalError ?? "");
       setScanStatus(result.fatalError ? "error" : result.cancelled ? "cancelled" : "complete");
     }).then((stop) => {
@@ -92,6 +94,10 @@ function App() {
     };
   }, [desktop]);
 
+  useEffect(() => {
+    setSelectedProjectId((selected) => projects.some((project) => project.id === selected) ? selected : projects[0]?.id ?? null);
+  }, [projects]);
+
   const current = sections.find((item) => item.id === section) ?? sections[0];
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Recent runs" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
@@ -107,7 +113,6 @@ function App() {
     cancelRequested.current = false;
     setScanId(id);
     setScanStatus("scanning");
-    setProjects([]);
     setScanResult(null);
     setProgress(null);
     setScanError("");
@@ -194,35 +199,18 @@ function App() {
 
               {section !== "projects" ? (
                 <div className="empty-state"><h3>A little room to grow</h3><p>This section is ready for a future phase.</p></div>
-              ) : scanning ? (
-              <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{scanError || (progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…")}</p></div></div>
-              ) : scanStatus === "error" ? (
-                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t scan this folder</strong><p>{scanError}</p><button className="text-button" type="button" onClick={beginScan}>Try again</button></div></div>
               ) : projects.length > 0 ? (
                 <>
+                  {scanning && <div className="scan-progress" role="status"><span className="spinner" aria-hidden="true" /><span>{scanStatus === "cancelling" ? "Stopping the scan" : progress ? `Refreshing · scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Refreshing projects…"}</span></div>}
+                  {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={beginScan}>Try again</button></div>}
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
-                  {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing projects found so far.</div>}
-                  <ul className="project-list">
-                    {projects.map((project) => <li className="project-row" key={project.id}>
-                      <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
-                      <div className="project-details"><strong>{project.name}</strong><span>{project.path}</span>
-                        {project.isGitRepository && <span className="project-facts">
-                          {project.git.status === "available" ? (project.git.branch ? `Branch ${project.git.branch}` : "Branch unavailable") : gitStatusLabel(project.git.status)}
-                          {project.git.dirty === true ? " · Uncommitted changes" : project.git.dirty === false ? " · Clean" : ""}
-                          {project.git.latestCommit ? ` · ${project.git.latestCommit.shortHash} ${project.git.latestCommit.subject}` : ""}
-                          {project.git.upstream.status === "tracking" ? ` · ↑${project.git.upstream.ahead ?? 0} ↓${project.git.upstream.behind ?? 0}` : project.git.upstream.status === "noUpstream" ? " · No upstream" : project.git.upstream.status === "unavailable" && project.git.status === "available" ? " · Upstream status unavailable" : ""}
-                        </span>}
-                        {project.git.remotes.length > 0 && <span className="project-facts">Remotes: {project.git.remotes.map((remote) => remote.url ? `${remote.name} ${remote.url}` : remote.name).join(" · ")}</span>}
-                        {project.workflowPrerequisites.length > 0 && <span className="project-facts">Tools: {project.workflowPrerequisites.map((tool) => `${tool.name} ${tool.available ? "available" : "missing"}`).join(" · ")}</span>}
-                      </div>
-                      <div className="project-tags">
-                        {project.isGitRepository && <span className="project-tag">Git</span>}
-                        {project.isWorktree && <span className="project-tag">Worktree</span>}
-                        {project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>)}
-                      </div>
-                    </li>)}
-                  </ul>
+                  {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
+                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} />
                 </>
+              ) : scanning ? (
+                <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
+              ) : scanStatus === "error" ? (
+                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t scan this folder</strong><p>{scanError}</p><button className="text-button" type="button" onClick={beginScan}>Try again</button></div></div>
               ) : (
                 <div className="empty-state">
                   <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="orbit orbit-three" /><span className="empty-spark spark-one">✦</span><span className="empty-spark spark-two">·</span><span className="folder-shape"><span /></span></div>
@@ -254,3 +242,122 @@ function gitStatusLabel(status: string): string {
     default: return "Git · Inspection unavailable";
   }
 }
+
+const PROJECT_ROW_HEIGHT = 68;
+const PROJECT_OVERSCAN = 5;
+
+function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
+  projects: ProjectEntry[];
+  selectedProjectId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [stackFilter, setStackFilter] = useState("all");
+  const [scrollTop, setScrollTop] = useState(0);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const lastViewRef = useRef({ projects, query, stackFilter, selectedProjectId });
+  const stacks = useMemo(() => [...new Set(projects.flatMap((project) => project.detectedStacks))].sort(), [projects]);
+  const visible = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    return projects.filter((project) =>
+      (stackFilter === "all" || project.detectedStacks.includes(stackFilter)) &&
+      (!normalized || `${project.name} ${project.path} ${project.detectedStacks.join(" ")}`.toLocaleLowerCase().includes(normalized)),
+    );
+  }, [projects, query, stackFilter]);
+  const selected = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const selectedIndex = visible.findIndex((project) => project.id === selectedProjectId);
+  const start = Math.max(0, Math.floor(scrollTop / PROJECT_ROW_HEIGHT) - PROJECT_OVERSCAN);
+  const end = Math.min(visible.length, Math.ceil((scrollTop + 360) / PROJECT_ROW_HEIGHT) + PROJECT_OVERSCAN);
+
+  useLayoutEffect(() => {
+    const previous = lastViewRef.current;
+    lastViewRef.current = { projects, query, stackFilter, selectedProjectId };
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    if (previous.query !== query || previous.stackFilter !== stackFilter) {
+      viewport.scrollTop = 0;
+      setScrollTop(0);
+      return;
+    }
+    if (previous.projects === projects && previous.selectedProjectId === selectedProjectId) return;
+
+    const index = visible.findIndex((project) => project.id === selectedProjectId);
+    if (index < 0) return;
+    const rowTop = index * PROJECT_ROW_HEIGHT;
+    const rowBottom = rowTop + PROJECT_ROW_HEIGHT;
+    let nextScrollTop = viewport.scrollTop;
+    if (rowTop < nextScrollTop) nextScrollTop = rowTop;
+    else if (rowBottom > nextScrollTop + viewport.clientHeight) nextScrollTop = rowBottom - viewport.clientHeight;
+    if (nextScrollTop !== viewport.scrollTop) {
+      viewport.scrollTop = nextScrollTop;
+      setScrollTop(nextScrollTop);
+    }
+  }, [projects, query, stackFilter, selectedProjectId, visible]);
+
+  function choose(index: number) {
+    const bounded = Math.max(0, Math.min(visible.length - 1, index));
+    const project = visible[bounded];
+    if (!project) return;
+    onSelect(project.id);
+    const node = viewportRef.current;
+    if (node) {
+      const top = bounded * PROJECT_ROW_HEIGHT;
+      if (top < node.scrollTop) node.scrollTop = top;
+      else if (top + PROJECT_ROW_HEIGHT > node.scrollTop + node.clientHeight) node.scrollTop = top + PROJECT_ROW_HEIGHT - node.clientHeight;
+    }
+  }
+
+  function handleListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const current = visible.findIndex((project) => project.id === selectedProjectId);
+      choose(event.key === "Home" ? 0 : event.key === "End" ? visible.length - 1 : current + (event.key === "ArrowDown" ? 1 : -1));
+    }
+  }
+
+  return <div className="project-browser">
+    <div className="project-browser-controls">
+      <label className="project-search"><span className="sr-only">Search projects</span><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search projects" /></label>
+      <label className="project-filter"><span className="sr-only">Filter by stack</span><select value={stackFilter} onChange={(event) => setStackFilter(event.target.value)}><option value="all">All stacks</option>{stacks.map((stack) => <option key={stack} value={stack}>{stack}</option>)}</select></label>
+      <span className="project-count">{visible.length} of {projects.length}</span>
+    </div>
+    <div className="project-browser-layout">
+      <div ref={viewportRef} className="project-viewport" role="listbox" aria-label="Projects" aria-activedescendant={selected && selectedIndex >= start && selectedIndex < end ? `project-option-${cssSafeId(selected.id)}` : undefined} tabIndex={0} onKeyDown={handleListKeyDown} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+        {visible.length ? <div className="project-virtual-space" style={{ height: visible.length * PROJECT_ROW_HEIGHT }}>
+          <div className="project-virtual-window" style={{ transform: `translateY(${start * PROJECT_ROW_HEIGHT}px)` }}>
+            {visible.slice(start, end).map((project, offset) => {
+              const index = start + offset;
+              return <div id={`project-option-${cssSafeId(project.id)}`} key={project.id} className={`project-option${selectedProjectId === project.id ? " selected" : ""}`} role="option" aria-selected={selectedProjectId === project.id} aria-posinset={index + 1} aria-setsize={visible.length} onClick={() => onSelect(project.id)}>
+                <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
+                <span className="project-option-copy"><strong>{project.name}</strong><span>{project.path}</span></span>
+                <span className="project-option-tags">{project.detectedStacks.slice(0, 2).map((stack) => <span className="project-tag" key={stack}>{stack}</span>)}</span>
+              </div>;
+            })}
+          </div>
+        </div> : <div className="project-filter-empty">No projects match these filters.</div>}
+      </div>
+      <ProjectDetails project={selected} />
+    </div>
+  </div>;
+}
+
+function ProjectDetails({ project }: { project: ProjectEntry | null }) {
+  if (!project) return <aside className="project-detail empty-detail"><h3>Select a project</h3><p>Choose a project to see its local details.</p></aside>;
+  const git = project.git;
+  return <aside className="project-detail" aria-labelledby="project-detail-title">
+    <p className="eyebrow">PROJECT DETAILS</p><h3 id="project-detail-title">{project.name}</h3><p className="detail-path">{project.path}</p>
+    <div className="detail-group"><strong>Repository</strong><span>{project.isGitRepository ? git.status === "available" ? git.branch ? `Branch ${git.branch}` : "Branch unavailable" : gitStatusLabel(git.status) : "Not a Git repository"}</span>
+      {project.isGitRepository && git.dirty !== null && <span>{git.dirty ? "Uncommitted changes" : "Working tree clean"}</span>}
+      {git.latestCommit && <span>{git.latestCommit.shortHash} · {git.latestCommit.subject}</span>}
+      {git.upstream.status === "tracking" && <span>Upstream · ↑{git.upstream.ahead ?? 0} ↓{git.upstream.behind ?? 0}</span>}
+      {git.upstream.status === "noUpstream" && <span>No upstream configured</span>}
+      {git.upstream.status === "unavailable" && git.status === "available" && <span>Upstream status unavailable</span>}
+    </div>
+    <div className="detail-group"><strong>Detected stacks</strong><div className="project-detail-tags">{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span>None detected</span>}</div></div>
+    {git.remotes.length > 0 && <div className="detail-group"><strong>Remotes</strong>{git.remotes.map((remote) => <span className="detail-break" key={remote.name}>{remote.name}{remote.url ? ` · ${remote.url}` : " · URL unavailable"}</span>)}</div>}
+    {project.workflowPrerequisites.length > 0 && <div className="detail-group"><strong>Workflow prerequisites</strong>{project.workflowPrerequisites.map((tool) => <span key={tool.name}>{tool.name} · {tool.available ? "available" : "missing"}</span>)}</div>}
+  </aside>;
+}
+
+function cssSafeId(value: string): string { return encodeURIComponent(value); }

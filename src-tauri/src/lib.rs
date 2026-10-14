@@ -618,9 +618,40 @@ fn get_settings(app: AppHandle) -> Result<Settings, String> {
 struct WorkflowSkillStatus {
     id: String,
     status: &'static str,
+    compatible_agents: Vec<&'static str>,
 }
 
 const WORKFLOW_SKILL_IDS: [&str; 3] = ["dev-work", "dev-push", "dev-build"];
+const WORKFLOW_SKILL_COMPATIBILITY: [(&str, &[&str]); 3] = [
+    ("dev-work", &["Codex"]),
+    ("dev-push", &["Codex"]),
+    ("dev-build", &["Codex"]),
+];
+
+fn has_valid_skill_contract(contents: &str, expected_id: &str) -> bool {
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+
+    let mut name_matches = false;
+    let mut has_description = false;
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            return name_matches && has_description;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            match key.trim() {
+                "name" => name_matches = value.trim() == expected_id,
+                "description" => has_description = !value.trim().is_empty(),
+                _ => {}
+            }
+        }
+    }
+    false
+}
 
 fn workflow_skills_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
@@ -648,7 +679,11 @@ fn workflow_skill_status(skills_root: &Path, id: &str) -> &'static str {
         Err(_) => return "unavailable",
     }
     match fs::canonicalize(&skill_file) {
-        Ok(resolved) if resolved.starts_with(root) => "available",
+        Ok(resolved) if resolved.starts_with(root) => match fs::read_to_string(resolved) {
+            Ok(contents) if has_valid_skill_contract(&contents, id) => "available",
+            Ok(_) => "incompatible",
+            Err(_) => "unavailable",
+        },
         Ok(_) => "unavailable",
         Err(_) => "unavailable",
     }
@@ -661,6 +696,11 @@ fn discover_workflow_skills() -> Vec<WorkflowSkillStatus> {
         .iter()
         .map(|id| WorkflowSkillStatus {
             id: (*id).to_owned(),
+            compatible_agents: WORKFLOW_SKILL_COMPATIBILITY
+                .iter()
+                .find(|(skill_id, _)| skill_id == id)
+                .map(|(_, agents)| agents.to_vec())
+                .unwrap_or_default(),
             status: root
                 .as_deref()
                 .map(|path| workflow_skill_status(path, id))
@@ -1031,7 +1071,11 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let skill = folder.path().join("dev-work");
         fs::create_dir_all(&skill).unwrap();
-        fs::write(skill.join("SKILL.md"), "---\nname: dev-work\n---\n").unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: dev-work\ndescription: Work on a GitHub issue.\n---\n",
+        )
+        .unwrap();
 
         assert_eq!(
             workflow_skill_status(folder.path(), "dev-work"),
@@ -1041,6 +1085,21 @@ mod tests {
         assert_eq!(
             workflow_skill_status(folder.path(), "../../outside"),
             "missing"
+        );
+
+        fs::write(skill.join("SKILL.md"), "not frontmatter\n").unwrap();
+        assert_eq!(
+            workflow_skill_status(folder.path(), "dev-work"),
+            "incompatible"
+        );
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: another-skill\ndescription: Wrong skill.\n---\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workflow_skill_status(folder.path(), "dev-work"),
+            "incompatible"
         );
     }
 

@@ -49,7 +49,7 @@ function App() {
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
-  const [workIssue, setWorkIssue] = useState<GitHubIssue | null>(null);
+  const [workContext, setWorkContext] = useState<{ projectId: string; issue: GitHubIssue } | null>(null);
   const [workflowSkills, setWorkflowSkills] = useState<WorkflowSkillStatus[]>([]);
   const activeScanId = useRef("");
   const cancelRequested = useRef(false);
@@ -71,7 +71,7 @@ function App() {
     discoverWorkflowSkills().then((skills) => {
       if (active) setWorkflowSkills(skills);
     }).catch(() => {
-      if (active) setWorkflowSkills(["dev-work", "dev-push", "dev-build"].map((id) => ({ id: id as WorkflowSkillStatus["id"], status: "unavailable" })));
+      if (active) setWorkflowSkills(["dev-work", "dev-push", "dev-build"].map((id) => ({ id: id as WorkflowSkillStatus["id"], status: "unavailable", compatibleAgents: [] })));
     });
     return () => { active = false; };
   }, [desktop]);
@@ -163,6 +163,7 @@ function App() {
 
   const current = sections.find((item) => item.id === section) ?? sections[0];
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const workIssue = workContext && selectedProject?.id === workContext.projectId ? workContext.issue : null;
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Work context" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
 
@@ -260,6 +261,7 @@ function App() {
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading"><div><h2 id="project-list-title">Work context</h2><p>Issue details selected from a repository. Selection never edits GitHub.</p></div></div><div className="panel-rule" />
               {workIssue ? <div className="work-context"><p className="eyebrow">READY FOR WORK</p><h3><a href={workIssue.url} target="_blank" rel="noreferrer">#{workIssue.number} · {workIssue.title} ↗</a></h3><p>{workIssue.body}</p>{workIssue.acceptanceCriteria.length > 0 && <div><strong>Acceptance criteria</strong><ul>{workIssue.acceptanceCriteria.map((criterion, index) => <li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{workIssue.blockedBy.length > 0 && <div><strong>Blockers</strong>{workIssue.blockedBy.map((blocker) => <a key={blocker.number} href={blocker.url} target="_blank" rel="noreferrer">#{blocker.number} · {blocker.title} ({blocker.state})</a>)}</div>}{workIssue.parentEpic && <div><strong>Parent epic</strong><a href={workIssue.parentEpic.url} target="_blank" rel="noreferrer">#{workIssue.parentEpic.number} · {workIssue.parentEpic.title}</a></div>}{workIssue.pullRequestUrls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">PR context: {url}</a>)}<small>Bounded read-only context · {workIssue.acceptanceCriteria.length} acceptance criteria · {workIssue.blockedBy.length} blockers</small></div> : <div className="empty-state"><h3>No issue context yet</h3><p>Choose an issue in a project’s GitHub activity panel to prepare its work context.</p><a href="#projects">Browse projects</a></div>}
+              {!workIssue && workContext && <p className="registry-context-note">The selected issue belongs to another project. Choose an issue from the selected project to prepare work.</p>}
               <WorkflowRegistry project={selectedProject} issue={workIssue} skills={workflowSkills} />
             </section>
           ) : (
@@ -280,7 +282,7 @@ function App() {
                   {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div>}
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
                   {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
-                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onWork={(issue) => { setWorkIssue(issue); window.location.hash = "runs"; }} />
+                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onWork={(issue, projectId) => { setWorkContext({ projectId, issue }); window.location.hash = "runs"; }} />
                 </>
               ) : scanning ? (
                 <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
@@ -329,7 +331,7 @@ function WorkflowRegistry({ project, issue, skills }: {
         </div>
         <p className="workflow-disabled-reason" id={`${action.id}-disabled`}>{disabledReason}</p>
         <div className="workflow-meta-grid">
-          <div><strong>Registry entry</strong><span>v{action.version} · {action.skillReference} · {skill?.status ?? "checking"}</span></div>
+          <div><strong>Registry entry</strong><span>v{action.version} · {action.skillReference} · {skill?.status ?? "checking"}{skill?.status === "available" && skill.compatibleAgents.length ? ` · ${skill.compatibleAgents.join(", ")}` : ""}</span></div>
           <div><strong>Supported stacks</strong><span>{action.supportedStacks === "all" ? "Any detected stack" : action.supportedStacks.join(", ")}</span></div>
           {action.defaultBuildProfile && <div><strong>Build default</strong><span>{action.defaultBuildProfile}</span></div>}
         </div>
@@ -367,7 +369,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
   projects: ProjectEntry[];
   selectedProjectId: string | null;
   onSelect: (id: string) => void;
-  onWork: (issue: GitHubIssue) => void;
+  onWork: (issue: GitHubIssue, projectId: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
@@ -455,7 +457,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
           </div>
         </div> : <div className="project-filter-empty">No projects match these filters.</div>}
       </div>
-      <ProjectDetails project={selected} onWork={onWork} />
+      <ProjectDetails project={selected} onWork={(issue) => { if (selected) onWork(issue, selected.id); }} />
     </div>
   </div>;
 }

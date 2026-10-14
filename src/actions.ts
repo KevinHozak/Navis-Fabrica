@@ -11,7 +11,11 @@ export type WorkflowInput = {
 };
 export type WorkflowEffect = "commit" | "push" | "createPullRequest";
 export type WorkflowEffectScope = { permitted: WorkflowEffect[]; defaultRequested: WorkflowEffect[] };
-export type WorkflowSkillStatus = { id: WorkflowActionId; status: "available" | "missing" | "unavailable" };
+export type WorkflowSkillStatus = {
+  id: WorkflowActionId;
+  status: "available" | "missing" | "unavailable" | "incompatible";
+  compatibleAgents: string[];
+};
 export type WorkflowAction = {
   id: WorkflowActionId;
   version: number;
@@ -43,8 +47,9 @@ export const workflowActions: WorkflowAction[] = [
     inputs: [
       { id: "project", label: "Selected project", type: "project-context", required: true },
       { id: "issue", label: "Selected issue", type: "issue-context", required: true },
-      { id: "agent", label: "Agent", type: "select", required: true, options: ["Codex", "Antigravity"] },
+      { id: "agent", label: "Agent", type: "select", required: true, options: ["Codex"] },
       { id: "model", label: "Model", type: "text", required: false },
+      { id: "pace", label: "Pace", type: "select", required: false, options: ["Fast", "Balanced", "Thorough", "Economy"], defaultValue: "Balanced" },
     ],
     checks: ["Issue is open and unblocked", "Project stack is supported", "Compatible skill and execution adapter are available"],
     outputArtifacts: ["Scoped code changes", "Verification results", "Commit and pull request when opted in"],
@@ -103,9 +108,9 @@ export function actionDisabledReason(
   }
   const skill = skills.find((entry) => entry.id === action.id);
   if (!skill || skill.status !== "available") {
-    return skill?.status === "unavailable"
-      ? `The ${action.skillReference} skill location could not be read.`
-      : `Compatible skill ${action.skillReference} was not found. Markdown skill files are never executed.`;
+    if (skill?.status === "unavailable") return `The ${action.skillReference} skill location could not be read.`;
+    if (skill?.status === "incompatible") return `The ${action.skillReference} skill does not match its declared contract or compatible agent.`;
+    return `Compatible skill ${action.skillReference} was not found. Markdown skill files are never executed.`;
   }
   if (action.id === "dev-build") {
     const cargo = project.workflowPrerequisites.find((item) => item.name === "cargo" && item.requiredFor.includes("Tauri"));

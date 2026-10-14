@@ -1,13 +1,18 @@
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_DIRECTORIES: usize = 20_000;
 const MAX_PROJECTS: usize = 10_000;
 const MAX_ERRORS: usize = 500;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -218,6 +223,11 @@ pub fn scan(
                 break;
             } else {
                 project_ids.insert(key);
+                let git = inspect_git(&canonical, is_git_repository, cancelled);
+                if cancelled.load(Ordering::Relaxed) {
+                    was_cancelled = true;
+                    break;
+                }
                 projects.push(ProjectEntry {
                     id: canonical.to_string_lossy().into_owned(),
                     name: canonical
@@ -228,7 +238,7 @@ pub fn scan(
                     is_git_repository,
                     is_worktree,
                     detected_stacks,
-                    git: inspect_git(&canonical, is_git_repository),
+                    git,
                     workflow_prerequisites: workflow_prerequisites(
                         &canonical,
                         &names,
@@ -497,12 +507,27 @@ fn workflow_prerequisites(
         || names.contains("build.gradle.kts")
     {
         required.push(("java", vec!["Java", "Kotlin/Gradle"]));
+        if names.contains("build.gradle") || names.contains("build.gradle.kts") {
+            required.push(("gradle", vec!["Kotlin/Gradle"]));
+        }
     }
     if path.join("ios/Podfile").is_file() {
         required.push(("xcodebuild", vec!["iOS"]));
         required.push(("pod", vec!["iOS"]));
     }
-    required
+    let mut merged: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (name, required_for) in required {
+        if let Some((_, existing)) = merged.iter_mut().find(|(existing, _)| *existing == name) {
+            for stack in required_for {
+                if !existing.contains(&stack) {
+                    existing.push(stack);
+                }
+            }
+        } else {
+            merged.push((name, required_for));
+        }
+    }
+    merged
         .into_iter()
         .map(|(name, required_for)| WorkflowPrerequisite {
             name: name.to_owned(),
@@ -540,19 +565,7 @@ fn executable_available(name: &str) -> bool {
     })
 }
 
-fn inspect_git(path: &Path, is_repository: bool) -> GitFacts {
-    let unavailable = || GitFacts {
-        status: "gitUnavailable".to_owned(),
-        branch: None,
-        dirty: None,
-        latest_commit: None,
-        remotes: Vec::new(),
-        upstream: UpstreamDivergence {
-            status: "unavailable".to_owned(),
-            ahead: None,
-            behind: None,
-        },
-    };
+fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitFacts {
     if !is_repository {
         return GitFacts {
             status: "notRepository".to_owned(),
@@ -567,17 +580,25 @@ fn inspect_git(path: &Path, is_repository: bool) -> GitFacts {
             },
         };
     }
-    if Command::new("git").arg("--version").output().is_err() {
-        return unavailable();
-    }
-
-    let (status, branch) = match git_output(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        Ok(Some(value)) => match git_output(path, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+    let (status, branch) = match git_output(
+        path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cancelled,
+    ) {
+        Ok(Some(value)) => match git_output(
+            path,
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+            cancelled,
+        ) {
             Ok(Some(_)) => ("available", Some(value)),
             Ok(None) => ("unborn", Some(value)),
             Err(status) => return empty_git_facts(&status),
         },
-        Ok(None) => match git_output(path, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(None) => match git_output(
+            path,
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+            cancelled,
+        ) {
             Ok(Some(_)) => ("detached", None),
             Ok(None) => ("unborn", None),
             Err(status) => return empty_git_facts(&status),
@@ -592,12 +613,13 @@ fn inspect_git(path: &Path, is_repository: bool) -> GitFacts {
             "--porcelain=v1",
             "--untracked-files=normal",
         ],
+        cancelled,
     ) {
         Ok(Some(value)) => Some(!value.is_empty()),
         Ok(None) => Some(false),
         Err(status) => return empty_git_facts(&status),
     };
-    let latest_commit = match git_output(path, &["log", "-1", "--format=%H%x00%s"]) {
+    let latest_commit = match git_output(path, &["log", "-1", "--format=%H%x00%s"], cancelled) {
         Ok(Some(value)) => {
             let (hash, subject) = value.split_once('\0').unwrap_or((&value, ""));
             Some(LatestCommit {
@@ -608,12 +630,12 @@ fn inspect_git(path: &Path, is_repository: bool) -> GitFacts {
         Ok(None) => None,
         Err(status) => return empty_git_facts(&status),
     };
-    let remotes = match git_output(path, &["remote"]) {
+    let remotes = match git_output(path, &["remote"], cancelled) {
         Ok(Some(value)) => value
             .lines()
             .filter(|line| !line.is_empty())
             .map(|name| {
-                let url = git_output(path, &["remote", "get-url", name])
+                let url = git_output(path, &["remote", "get-url", name], cancelled)
                     .ok()
                     .flatten()
                     .map(|url| sanitize_remote(&url));
@@ -634,10 +656,12 @@ fn inspect_git(path: &Path, is_repository: bool) -> GitFacts {
             "--symbolic-full-name",
             "@{upstream}",
         ],
+        cancelled,
     ) {
         Ok(Some(_)) => match git_output(
             path,
             &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            cancelled,
         ) {
             Ok(Some(counts)) => {
                 let mut parts = counts
@@ -699,7 +723,11 @@ fn empty_git_facts(status: &str) -> GitFacts {
     }
 }
 
-fn git_output(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
+fn git_output(
+    path: &Path,
+    args: &[&str],
+    cancelled: &AtomicBool,
+) -> Result<Option<String>, String> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -707,13 +735,15 @@ fn git_output(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
         .args(["-c", "core.fsmonitor=false"])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
-    let output: Output = command.output().map_err(|_| "gitUnavailable".to_owned())?;
+    let output = run_git_command(&mut command, cancelled)?;
     if output.status.success() {
         let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         Ok((!value.is_empty()).then_some(value))
@@ -734,6 +764,63 @@ fn git_output(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
             Err("error".to_owned())
         }
     }
+}
+
+fn run_git_command(command: &mut Command, cancelled: &AtomicBool) -> Result<Output, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("cancelled".to_owned());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| "gitUnavailable".to_owned())?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(u64::MAX).read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(u64::MAX).read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            terminate_child(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("cancelled".to_owned());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < GIT_COMMAND_TIMEOUT => {
+                thread::sleep(GIT_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                terminate_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("timeout".to_owned());
+            }
+            Err(_) => {
+                terminate_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("error".to_owned());
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn sanitize_remote(value: &str) -> String {
@@ -770,6 +857,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
+    fn inspect_git_fixture(path: &Path) -> GitFacts {
+        inspect_git(path, true, &AtomicBool::new(false))
+    }
+
     fn run_git(path: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -800,13 +891,42 @@ mod tests {
     }
 
     #[test]
+    fn git_command_child_waits_for_cancellation() {
+        if std::env::var_os("NAVIS_GIT_CANCEL_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(60));
+            return;
+        }
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "scanner::tests::git_command_child_waits_for_cancellation",
+                "--nocapture",
+            ])
+            .env("NAVIS_GIT_CANCEL_CHILD", "1");
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel_signal = cancelled.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            cancel_signal.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let result = run_git_command(&mut command, &cancelled);
+        cancel_thread.join().unwrap();
+
+        assert!(matches!(result, Err(ref reason) if reason == "cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn reports_unborn_dirty_remotes_and_read_only_commit_facts() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
         }
         let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         run_git(root.path(), &["init", "-q"]);
-        let unborn = inspect_git(root.path(), true);
+        let unborn = inspect_git_fixture(root.path());
         assert_eq!(unborn.status, "unborn");
         assert_eq!(unborn.dirty, Some(false));
 
@@ -833,7 +953,7 @@ mod tests {
             ],
         );
         fs::write(root.path().join("untracked.txt"), "fixture").unwrap();
-        let facts = inspect_git(root.path(), true);
+        let facts = inspect_git_fixture(root.path());
         assert_eq!(facts.status, "available");
         assert_eq!(facts.dirty, Some(true));
         assert_eq!(
@@ -848,7 +968,7 @@ mod tests {
         assert!(!facts.remotes[0].url.as_deref().unwrap().contains("secret"));
 
         run_git(root.path(), &["checkout", "--quiet", "--detach", "HEAD"]);
-        assert_eq!(inspect_git(root.path(), true).status, "detached");
+        assert_eq!(inspect_git_fixture(root.path()).status, "detached");
     }
 
     #[test]
@@ -944,7 +1064,7 @@ mod tests {
             ],
         );
 
-        let facts = inspect_git(&local, true);
+        let facts = inspect_git_fixture(&local);
         assert_eq!(facts.upstream.status, "tracking");
         assert_eq!(facts.upstream.ahead, Some(1));
         assert_eq!(facts.upstream.behind, Some(1));
@@ -958,12 +1078,13 @@ mod tests {
         fs::write(root.path().join("src-tauri/tauri.conf.json"), "{}").unwrap();
         fs::write(root.path().join("src-tauri/Cargo.toml"), "").unwrap();
         fs::write(root.path().join("android/build.gradle"), "").unwrap();
+        fs::write(root.path().join("build.gradle.kts"), "").unwrap();
         fs::write(
             root.path().join("package.json"),
             r#"{"devDependencies":{"react-native":"*"}}"#,
         )
         .unwrap();
-        let names = HashSet::from(["package.json".to_owned()]);
+        let names = HashSet::from(["package.json".to_owned(), "build.gradle.kts".to_owned()]);
         let stacks = detect_stacks(root.path(), &names);
         assert!(stacks.contains(&"Tauri".to_owned()));
         assert!(stacks.contains(&"React Native".to_owned()));
@@ -977,6 +1098,23 @@ mod tests {
                 .iter()
                 .any(|item| item.name == "gradle"
                     && item.required_for.contains(&"Android".to_owned()))
+        );
+        assert!(prerequisites.iter().any(|item| {
+            item.name == "gradle" && item.required_for.contains(&"Kotlin/Gradle".to_owned())
+        }));
+        assert_eq!(
+            prerequisites
+                .iter()
+                .filter(|item| item.name == "gradle")
+                .count(),
+            1
+        );
+        assert_eq!(
+            prerequisites
+                .iter()
+                .filter(|item| item.name == "java")
+                .count(),
+            1
         );
     }
 

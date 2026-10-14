@@ -206,12 +206,12 @@ function App() {
                     {projects.map((project) => <li className="project-row" key={project.id}>
                       <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
                       <div className="project-details"><strong>{project.name}</strong><span>{project.path}</span>
-                        {project.git.status === "available" ? <span className="project-facts">
-                          {project.git.branch ? `Branch ${project.git.branch}` : "Branch unavailable"}
+                        {project.isGitRepository && <span className="project-facts">
+                          {project.git.status === "available" ? (project.git.branch ? `Branch ${project.git.branch}` : "Branch unavailable") : gitStatusLabel(project.git.status)}
                           {project.git.dirty === true ? " · Uncommitted changes" : project.git.dirty === false ? " · Clean" : ""}
                           {project.git.latestCommit ? ` · ${project.git.latestCommit.shortHash} ${project.git.latestCommit.subject}` : ""}
-                          {project.git.upstream.status === "tracking" ? ` · ↑${project.git.upstream.ahead ?? 0} ↓${project.git.upstream.behind ?? 0}` : project.git.upstream.status === "noUpstream" ? " · No upstream" : " · Upstream status unavailable"}
-                        </span> : project.isGitRepository ? <span className="project-facts">{gitStatusLabel(project.git.status)}</span> : null}
+                          {project.git.upstream.status === "tracking" ? ` · ↑${project.git.upstream.ahead ?? 0} ↓${project.git.upstream.behind ?? 0}` : project.git.upstream.status === "noUpstream" ? " · No upstream" : project.git.upstream.status === "unavailable" && project.git.status === "available" ? " · Upstream status unavailable" : ""}
+                        </span>}
                         {project.git.remotes.length > 0 && <span className="project-facts">Remotes: {project.git.remotes.map((remote) => remote.url ? `${remote.name} ${remote.url}` : remote.name).join(" · ")}</span>}
                         {project.workflowPrerequisites.length > 0 && <span className="project-facts">Tools: {project.workflowPrerequisites.map((tool) => `${tool.name} ${tool.available ? "available" : "missing"}`).join(" · ")}</span>}
                       </div>

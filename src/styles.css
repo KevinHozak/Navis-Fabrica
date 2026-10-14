@@ -26,7 +26,7 @@
 * { box-sizing: border-box; }
 html { min-width: 320px; min-height: 100%; background: var(--canvas); }
 body { min-width: 320px; min-height: 100vh; margin: 0; }
-body, button, input, select { font: inherit; }
+body, button, input, select, textarea { font: inherit; }
 button, a, input, select { -webkit-tap-highlight-color: transparent; }
 button { color: inherit; }
 button:disabled { cursor: not-allowed; opacity: .48; }
@@ -119,9 +119,23 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 
 .settings-panel { max-width: 720px; }
 .setting-glyph { display: grid; width: 32px; height: 32px; place-items: center; border: 1px solid #3a526a; border-radius: 9px; background: #1d2d3d; color: #9dcdf8; font-size: 16px; }
-.settings-note { display: flex; align-items: flex-start; gap: 11px; margin: 0 23px 22px; padding: 13px 14px; border: 1px solid #ffffff0e; border-radius: 9px; background: #ffffff04; }
-.settings-note-icon { color: #9dcbf4; font-size: 14px; }
-.settings-note p { margin: 0; color: #a1adbd; font-size: 11px; line-height: 1.6; }
+.settings-form { display: grid; gap: 21px; padding: 0 23px 23px; }
+.settings-field { display: grid; gap: 7px; color: #cbd5e2; font-size: 11px; font-weight: 600; }
+.settings-field input, .settings-field textarea, .settings-field select { width: 100%; border: 1px solid #303b49; border-radius: 8px; background: #10151d; color: #e1e8f1; font-size: 12px; font-weight: 400; }
+.settings-field input, .settings-field select { min-height: 39px; padding: 0 11px; }
+.settings-field textarea { min-height: 92px; padding: 10px 11px; resize: vertical; line-height: 1.55; }
+.settings-field small, .settings-toggle small { color: #8490a0; font-size: 10px; font-weight: 400; line-height: 1.5; }
+.settings-options { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.settings-toggle { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.settings-toggle input { width: 15px; height: 15px; margin: 2px 0 0; accent-color: #75b7f2; }
+.settings-toggle span { display: grid; gap: 4px; }
+.settings-toggle strong { color: #cbd5e2; font-size: 11px; font-weight: 600; }
+.settings-depth { width: 138px; flex: 0 0 138px; }
+.settings-actions { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-top: 4px; border-top: 1px solid var(--line-soft); }
+.settings-feedback { min-height: 16px; margin: 0; color: #8e9bab; font-size: 10px; line-height: 1.5; }
+.settings-feedback.saved { color: var(--green); }
+.settings-feedback.error { color: #ffabb1; }
+.settings-loading { padding: 30px 23px; color: #a1adbd; font-size: 12px; }
 .content-footer { display: flex; align-items: center; gap: 7px; margin-top: 27px; color: #677384; font-size: 10px; }
 .footer-orbit { color: #7fb9eb; font-size: 12px; }
 .footer-version { margin-left: auto; color: #556171; font-variant-numeric: tabular-nums; }
@@ -149,7 +163,13 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
   .page-heading > .button { align-self: stretch; }
   .panel-heading { padding-right: 17px; padding-left: 17px; }
   .panel-rule { margin-right: 17px; margin-left: 17px; }
-  .settings-note { margin-right: 17px; margin-left: 17px; }
+  .settings-form { padding-right: 17px; padding-left: 17px; }
+}
+@media (max-width: 470px) {
+  .settings-options { align-items: flex-start; flex-direction: column; }
+  .settings-depth { width: 100%; flex-basis: auto; }
+  .settings-actions { align-items: flex-start; flex-direction: column; }
+  .settings-actions .button { align-self: stretch; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }

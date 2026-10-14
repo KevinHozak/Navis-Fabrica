@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { SettingsPanel } from "./SettingsPanel";
 
 type Section = "projects" | "runs" | "providers" | "settings";
 type PreviewState = "ready" | "loading" | "empty" | "error";
@@ -95,10 +96,7 @@ function App() {
           </div>
 
           {section === "settings" ? (
-            <section className="panel settings-panel" aria-labelledby="root-setting-title">
-              <div className="panel-heading"><div><h2 id="root-setting-title">Workspace settings</h2><p>Preferences and project location controls are part of the next foundation phase.</p></div><span className="setting-glyph" aria-hidden="true">⌂</span></div>
-              <div className="settings-note" role="note"><span className="settings-note-icon" aria-hidden="true">✦</span><p>Settings storage and project-location validation will be added in Foundation-P2.</p></div>
-            </section>
+            <SettingsPanel />
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">

@@ -1,11 +1,15 @@
+use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
 
@@ -13,9 +17,25 @@ pub mod providers;
 mod scanner;
 
 static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+static PROJECT_FACT_CACHE: OnceLock<Mutex<HashMap<String, scanner::ProjectEntry>>> =
+    OnceLock::new();
+static PROJECT_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
+
+enum WatchCommand {
+    Event(Result<Event, String>),
+    Root {
+        path: PathBuf,
+        exclusions: Vec<String>,
+    },
+}
 
 fn active_scans() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     ACTIVE_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_fact_cache() -> &'static Mutex<HashMap<String, scanner::ProjectEntry>> {
+    PROJECT_FACT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 const SETTINGS_SCHEMA_VERSION: u32 = 2;
@@ -363,6 +383,12 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
     }
 
     write_settings_atomic(&settings_path(&app)?, &settings)?;
+    if let Some(sender) = WATCH_COMMANDS.get() {
+        let _ = sender.send(WatchCommand::Root {
+            path: PathBuf::from(&settings.project_root),
+            exclusions: settings.exclusions.clone(),
+        });
+    }
     Ok(settings)
 }
 
@@ -379,7 +405,7 @@ fn inspect_providers(
 }
 
 #[tauri::command]
-fn start_project_scan(app: AppHandle, scan_id: String) -> Result<(), String> {
+fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> Result<(), String> {
     if scan_id.is_empty()
         || scan_id.len() > 80
         || !scan_id
@@ -389,6 +415,13 @@ fn start_project_scan(app: AppHandle, scan_id: String) -> Result<(), String> {
         return Err("The scan identifier is invalid.".into());
     }
     let settings = load_settings(&settings_path(&app)?)?;
+    if force_refresh {
+        PROJECT_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed);
+        project_fact_cache()
+            .lock()
+            .map_err(|_| "Could not access cached project facts.".to_string())?
+            .clear();
+    }
     let cancellation = Arc::new(AtomicBool::new(false));
     {
         let mut scans = active_scans()
@@ -406,21 +439,182 @@ fn start_project_scan(app: AppHandle, scan_id: String) -> Result<(), String> {
             include_hidden: settings.preferences.include_hidden,
             exclusions: settings.exclusions,
         };
+        let cache_epoch = PROJECT_CACHE_EPOCH.load(Ordering::Relaxed);
+        let cached_projects = project_fact_cache()
+            .lock()
+            .map(|cache| cache.clone())
+            .unwrap_or_default();
         let result = scanner::scan(
             &scan_id,
             Path::new(&settings.project_root),
             &options,
             &cancellation,
+            &cached_projects,
             |progress| {
                 let _ = app.emit("project-scan-progress", progress);
             },
         );
+        if !result.cancelled && result.fatal_error.is_none() {
+            if let Ok(mut cache) = project_fact_cache().lock() {
+                if PROJECT_CACHE_EPOCH.load(Ordering::Relaxed) == cache_epoch {
+                    if result.errors.is_empty() {
+                        cache.clear();
+                    }
+                    for project in &result.projects {
+                        cache.insert(project.id.clone(), project.clone());
+                    }
+                }
+            }
+        }
         if let Ok(mut scans) = active_scans().lock() {
             scans.remove(&scan_id);
         }
         let _ = app.emit("project-scan-finished", result);
     });
     Ok(())
+}
+
+fn invalidate_project_facts(paths: &[PathBuf]) {
+    PROJECT_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed);
+    let Ok(mut cache) = project_fact_cache().lock() else {
+        return;
+    };
+    cache.retain(|_, project| {
+        let project_path = normalize_path(&PathBuf::from(&project.path));
+        !paths.iter().any(|changed| {
+            let changed = normalize_path(changed);
+            paths_overlap(&changed, &project_path)
+        })
+    });
+}
+
+fn normalize_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    let value = value.strip_prefix("//?/").unwrap_or(&value);
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn watcher_path_excluded(path: &Path, root: &Path, exclusions: &[String]) -> bool {
+    let path = normalize_path(path);
+    let root = normalize_path(root).trim_end_matches('/').to_owned();
+    let Some(relative) = path.strip_prefix(&format!("{root}/")) else {
+        return false;
+    };
+    let relative = relative.to_lowercase();
+    exclusions.iter().any(|excluded| {
+        let excluded = excluded.replace('\\', "/").trim_matches('/').to_lowercase();
+        // Git metadata changes must refresh repository facts even though the walker skips .git.
+        if excluded.is_empty() || excluded == ".git" {
+            return false;
+        }
+        relative == excluded
+            || relative
+                .strip_prefix(&excluded)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            || relative.split('/').any(|component| component == excluded)
+    })
+}
+
+fn paths_overlap(first: &str, second: &str) -> bool {
+    let first = first.trim_end_matches('/');
+    let second = second.trim_end_matches('/');
+    first == second
+        || first
+            .strip_prefix(second)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || second
+            .strip_prefix(first)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>) {
+    let (sender, receiver) = mpsc::channel::<WatchCommand>();
+    if WATCH_COMMANDS.set(sender.clone()).is_err() {
+        return;
+    }
+    let event_sender = sender.clone();
+    thread::spawn(move || {
+        let mut watcher = match notify::recommended_watcher(move |event: notify::Result<Event>| {
+            let message = event.map_err(|error| error.to_string());
+            let _ = event_sender.send(WatchCommand::Event(message));
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let _ = app.emit("project-watch-error", error.to_string());
+                return;
+            }
+        };
+        let mut watched_exclusions = exclusions;
+        let mut watched_root = None;
+        let set_root = |watcher: &mut notify::RecommendedWatcher,
+                        watched_root: &mut Option<PathBuf>,
+                        next: PathBuf| {
+            if let Some(previous) = watched_root.take() {
+                let _ = watcher.unwatch(&previous);
+            }
+            match watcher.watch(&next, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    *watched_root = Some(next);
+                    let _ = app.emit("project-watch-error", "");
+                }
+                Err(error) => {
+                    let _ = app.emit("project-watch-error", error.to_string());
+                }
+            }
+        };
+        set_root(&mut watcher, &mut watched_root, root);
+
+        while let Ok(command) = receiver.recv() {
+            match command {
+                WatchCommand::Root { path, exclusions } => {
+                    watched_exclusions = exclusions;
+                    set_root(&mut watcher, &mut watched_root, path);
+                }
+                WatchCommand::Event(Err(error)) => {
+                    let _ = app.emit("project-watch-error", error);
+                }
+                WatchCommand::Event(Ok(event)) => {
+                    let mut changed_paths = event.paths;
+                    let mut deadline = Instant::now() + Duration::from_millis(350);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match receiver.recv_timeout(remaining) {
+                            Ok(WatchCommand::Event(Ok(next))) => {
+                                changed_paths.extend(next.paths);
+                                deadline = Instant::now() + Duration::from_millis(350);
+                            }
+                            Ok(WatchCommand::Event(Err(error))) => {
+                                let _ = app.emit("project-watch-error", error);
+                            }
+                            Ok(WatchCommand::Root { path, exclusions }) => {
+                                watched_exclusions = exclusions;
+                                set_root(&mut watcher, &mut watched_root, path);
+                                changed_paths.clear();
+                                break;
+                            }
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    if let Some(root) = watched_root.as_deref() {
+                        changed_paths
+                            .retain(|path| !watcher_path_excluded(path, root, &watched_exclusions));
+                    }
+                    if !changed_paths.is_empty() {
+                        invalidate_project_facts(&changed_paths);
+                        let _ = app.emit("project-scan-invalidated", ());
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -439,6 +633,19 @@ fn cancel_project_scan(scan_id: String) -> Result<bool, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let settings = settings_path(&handle)
+                .ok()
+                .and_then(|path| load_settings(&path).ok())
+                .unwrap_or_default();
+            start_project_watcher(
+                handle,
+                PathBuf::from(settings.project_root),
+                settings.exclusions,
+            );
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
@@ -453,6 +660,32 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_ignores_excluded_folders_but_keeps_git_metadata_events() {
+        let root = Path::new(r"C:\Projects");
+        let exclusions = vec![".git".into(), "node_modules".into(), "target".into()];
+        assert!(watcher_path_excluded(
+            Path::new(r"C:\Projects\app\node_modules\pkg\index.js"),
+            root,
+            &exclusions
+        ));
+        assert!(watcher_path_excluded(
+            Path::new(r"\\?\C:\Projects\app\target\debug\app.exe"),
+            root,
+            &exclusions
+        ));
+        assert!(!watcher_path_excluded(
+            Path::new(r"C:\Projects\app\.git\index"),
+            root,
+            &exclusions
+        ));
+        assert!(!watcher_path_excluded(
+            Path::new(r"C:\Projects\app\src\main.rs"),
+            root,
+            &exclusions
+        ));
+    }
 
     #[test]
     fn defaults_are_schema_versioned_and_windows_friendly() {

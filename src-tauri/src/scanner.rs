@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -102,6 +102,7 @@ pub fn scan(
     root: &Path,
     options: &ScanOptions,
     cancelled: &AtomicBool,
+    cached_projects: &HashMap<String, ProjectEntry>,
     mut progress: impl FnMut(ScanProgress),
 ) -> ScanFinished {
     let root = match fs::canonicalize(root) {
@@ -212,7 +213,7 @@ pub fn scan(
         }
         let detected_stacks = detect_stacks(&canonical, &names);
         if is_git_repository || !detected_stacks.is_empty() {
-            let key = path_key(&canonical);
+            let key = project_identity(&canonical);
             if project_ids.contains(&key) {
                 // Canonical aliases have already contributed this project.
             } else if projects.len() >= MAX_PROJECTS {
@@ -222,14 +223,17 @@ pub fn scan(
                 );
                 break;
             } else {
-                project_ids.insert(key);
-                let git = inspect_git(&canonical, is_git_repository, cancelled);
+                project_ids.insert(key.clone());
+                let git = cached_projects
+                    .get(&key)
+                    .map(|cached| cached.git.clone())
+                    .unwrap_or_else(|| inspect_git(&canonical, is_git_repository, cancelled));
                 if cancelled.load(Ordering::Relaxed) {
                     was_cancelled = true;
                     break;
                 }
                 projects.push(ProjectEntry {
-                    id: canonical.to_string_lossy().into_owned(),
+                    id: key,
                     name: canonical
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
@@ -294,6 +298,61 @@ fn path_key(path: &Path) -> String {
     } else {
         value
     }
+}
+
+fn project_identity(path: &Path) -> String {
+    if let Ok(metadata) = fs::metadata(path) {
+        #[cfg(windows)]
+        {
+            let _ = metadata;
+            if let Some(identity) = windows_file_identity(path) {
+                return identity;
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return format!("unix:{}:{}", metadata.dev(), metadata.ino());
+        }
+    }
+    format!("path:{}", path_key(path))
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // Metadata handles are opened only to read the stable volume/file ID for reconciliation.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded = unsafe { GetFileInformationByHandle(handle, &mut information) } != 0;
+    unsafe { CloseHandle(handle) };
+    succeeded.then(|| {
+        let index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        format!("windows:{}:{index}", information.dwVolumeSerialNumber)
+    })
 }
 
 fn excluded(relative: &Path, exclusions: &[String]) -> bool {
@@ -1127,11 +1186,20 @@ mod tests {
     }
 
     fn scan_fixture(root: &Path, depth: u8) -> ScanFinished {
+        scan_fixture_with_cache(root, depth, &HashMap::new())
+    }
+
+    fn scan_fixture_with_cache(
+        root: &Path,
+        depth: u8,
+        cached_projects: &HashMap<String, ProjectEntry>,
+    ) -> ScanFinished {
         scan(
             "fixture",
             root,
             &options(depth),
             &AtomicBool::new(false),
+            cached_projects,
             |_| {},
         )
     }
@@ -1163,6 +1231,32 @@ mod tests {
             .projects
             .iter()
             .any(|project| project.name == "linked-worktree" && project.is_worktree));
+    }
+
+    #[test]
+    fn preserves_project_identity_across_rename_and_drops_removed_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("before");
+        fs::create_dir_all(&original).unwrap();
+        fs::write(original.join("package.json"), "{}").unwrap();
+        let first = scan_fixture(root.path(), 1);
+        let original_project = first.projects.first().unwrap().clone();
+        let cache = HashMap::from([(original_project.id.clone(), original_project.clone())]);
+
+        let renamed = root.path().join("after");
+        fs::rename(&original, &renamed).unwrap();
+        let second = scan_fixture_with_cache(root.path(), 1, &cache);
+        assert_eq!(second.projects.len(), 1);
+        assert_eq!(second.projects[0].id, original_project.id);
+        assert_eq!(second.projects[0].name, "after");
+        assert_eq!(
+            second.projects[0].path,
+            fs::canonicalize(&renamed).unwrap().to_string_lossy()
+        );
+
+        fs::remove_dir_all(renamed).unwrap();
+        let removed = scan_fixture_with_cache(root.path(), 1, &cache);
+        assert!(removed.projects.is_empty());
     }
 
     #[test]
@@ -1310,10 +1404,48 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("package.json"), "{}").unwrap();
         let cancelled = AtomicBool::new(false);
-        let result = scan("fixture", root.path(), &options(3), &cancelled, |_| {
-            cancelled.store(true, Ordering::Relaxed);
-        });
+        let result = scan(
+            "fixture",
+            root.path(),
+            &options(3),
+            &cancelled,
+            &HashMap::new(),
+            |_| cancelled.store(true, Ordering::Relaxed),
+        );
         assert!(result.cancelled);
         assert_eq!(result.projects.len(), 1);
+    }
+
+    #[test]
+    fn benchmarks_one_hundred_direct_child_projects_against_documented_targets() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..100 {
+            let project = root.path().join(format!("project-{index:03}"));
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join("package.json"), "{}").unwrap();
+        }
+        let mut first_result = None;
+        let started = Instant::now();
+        let result = scan(
+            "benchmark",
+            root.path(),
+            &options(1),
+            &AtomicBool::new(false),
+            &HashMap::new(),
+            |progress| {
+                if progress.projects_found > 0 && first_result.is_none() {
+                    first_result = Some(started.elapsed());
+                }
+            },
+        );
+        let total = started.elapsed();
+        let first_result = first_result.expect("fixture should discover a project");
+        println!(
+            "100-project fixture: first result {first_result:?} (target <1s), total {total:?} (target <5s), projects {}, folders {}",
+            result.projects.len(), result.directories_scanned
+        );
+        assert_eq!(result.projects.len(), 100);
+        assert!(first_result < Duration::from_secs(1));
+        assert!(total < Duration::from_secs(5));
     }
 }

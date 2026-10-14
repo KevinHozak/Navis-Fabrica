@@ -60,6 +60,10 @@ fn github_cache_key(
     )
 }
 
+fn can_restore_github_cache(authentication: &str, credential_available: bool) -> bool {
+    authentication != "available" || credential_available
+}
+
 #[tauri::command]
 fn get_cached_github_activity(
     app: AppHandle,
@@ -106,7 +110,9 @@ fn get_cached_github_activity(
             })
     });
     Ok(cached
-        .filter(|entry| recent && (entry.authentication != "available" || credential_available))
+        .filter(|entry| {
+            recent && can_restore_github_cache(&entry.authentication, credential_available)
+        })
         .cloned()
         .unwrap_or_else(|| github::GitHubActivity::unchecked(&owner, &repository)))
 }
@@ -143,7 +149,10 @@ async fn refresh_github_activity(
             cache.remove(&key);
             return Ok(activity);
         }
-        if let Some(previous) = cache.get(&key) {
+        if let Some(previous) = cache
+            .get(&key)
+            .filter(|entry| can_restore_github_cache(&entry.authentication, token.is_some()))
+        {
             activity.issue_count = previous.issue_count;
             activity.pull_request_count = previous.pull_request_count;
             activity.recent_commits = previous.recent_commits.clone();
@@ -913,6 +922,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_to_restore_authenticated_activity_without_a_usable_credential() {
+        assert!(!can_restore_github_cache("available", false));
+        assert!(can_restore_github_cache("available", true));
+        assert!(can_restore_github_cache("notConfigured", false));
+    }
 
     #[test]
     fn watcher_ignores_excluded_folders_but_keeps_git_metadata_events() {

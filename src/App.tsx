@@ -398,6 +398,10 @@ function ProjectDetails({ project }: { project: ProjectEntry | null }) {
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityError, setActivityError] = useState("");
   const remote = project?.git.remotes.find((item) => item.github)?.github;
+  const selectedRepository = useRef<string | null>(null);
+  selectedRepository.current = project && remote
+    ? `${project.id}:${remote.owner.toLowerCase()}/${remote.repository.toLowerCase()}`
+    : null;
   useEffect(() => {
     let active = true;
     setActivity(null);
@@ -414,14 +418,18 @@ function ProjectDetails({ project }: { project: ProjectEntry | null }) {
 
   async function refreshActivity() {
     if (!remote) return;
+    const requestRepository = selectedRepository.current;
     setActivityLoading(true);
     setActivityError("");
     try {
-      setActivity(await refreshGitHubActivity(remote.owner, remote.repository));
+      const refreshedActivity = await refreshGitHubActivity(remote.owner, remote.repository);
+      if (selectedRepository.current === requestRepository) setActivity(refreshedActivity);
     } catch (error) {
-      setActivityError(error instanceof Error ? error.message : String(error));
+      if (selectedRepository.current === requestRepository) {
+        setActivityError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setActivityLoading(false);
+      if (selectedRepository.current === requestRepository) setActivityLoading(false);
     }
   }
 

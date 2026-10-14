@@ -164,6 +164,11 @@ pub async fn fetch_activity(owner: &str, repository: &str, token: Option<&str>) 
             result.checked_at = Some(now_iso());
         }
         Err(status) => {
+            if status == "emptyRepository" {
+                result.remote_status = "fresh".into();
+                result.checked_at = Some(now_iso());
+                return result;
+            }
             result.remote_status = status;
             if result.remote_status == "authExpired" {
                 result.authentication = "expired".into();
@@ -287,6 +292,9 @@ fn next_page(headers: &header::HeaderMap) -> Option<String> {
 }
 
 fn status_for(status: StatusCode, rate_remaining: Option<&str>, retry_after: bool) -> String {
+    if status == StatusCode::CONFLICT {
+        return "emptyRepository".into();
+    }
     if status == StatusCode::UNAUTHORIZED {
         return "authExpired".into();
     }
@@ -353,6 +361,10 @@ mod tests {
         assert_eq!(
             status_for(StatusCode::UNAUTHORIZED, None, false),
             "authExpired"
+        );
+        assert_eq!(
+            status_for(StatusCode::CONFLICT, None, false),
+            "emptyRepository"
         );
     }
 

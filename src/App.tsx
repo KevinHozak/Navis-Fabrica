@@ -259,7 +259,7 @@ function App() {
           ) : section === "providers" ? (
             <ProvidersPanel />
           ) : section === "runs" ? selectedProject ? isDesktopApp() ? (
-            <RunsPanel defaultCwd={selectedProject.path} />
+            <RunsPanel defaultCwd={selectedProject.path} project={selectedProject} issue={workIssue} />
           ) : (
             <div className="panel empty-state"><h3>Workflow execution needs the desktop app</h3><p>The browser preview can inspect project context, but it cannot launch local processes.</p></div>
           ) : (

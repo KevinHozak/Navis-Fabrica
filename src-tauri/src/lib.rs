@@ -881,6 +881,7 @@ fn start_codex_workflow_run(
             skill_id: request.skill_id,
             skill_path,
             timeout_seconds: request.timeout_seconds,
+            workflow: request.workflow,
         },
     )
 }

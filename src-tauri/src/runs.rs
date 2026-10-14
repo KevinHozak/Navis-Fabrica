@@ -62,6 +62,55 @@ pub struct RunRecord {
     pub exit_code: Option<i32>,
     pub next_sequence: u64,
     pub events: Vec<RunEvent>,
+    #[serde(default)]
+    pub workflow: Option<WorkflowRunMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowRunMetadata {
+    pub action: String,
+    pub operation_key: String,
+    #[serde(default)]
+    pub intent: String,
+    pub issue_url: Option<String>,
+    pub scope_paths: Vec<String>,
+    pub requested_effects: Vec<String>,
+    #[serde(default)]
+    pub side_effects: Option<WorkflowSideEffects>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowSideEffects {
+    pub commit_sha: Option<String>,
+    pub remote_branch: Option<String>,
+    pub pull_request_url: Option<String>,
+}
+
+fn parse_side_effect_marker(text: &str) -> Option<WorkflowSideEffects> {
+    let json = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("NAVIS_SIDE_EFFECTS:"))?;
+    let value = serde_json::from_str::<WorkflowSideEffects>(json.trim()).ok()?;
+    let commit_sha = value.commit_sha.filter(|sha| {
+        (7..=64).contains(&sha.len()) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    let remote_branch = value.remote_branch.filter(|branch| {
+        !branch.is_empty() && branch.len() <= 255 && !branch.chars().any(char::is_control)
+    });
+    let pull_request_url = value.pull_request_url.filter(|url| {
+        url.starts_with("https://github.com/")
+            && url.contains("/pull/")
+            && !url.chars().any(char::is_control)
+    });
+    (commit_sha.is_some() || remote_branch.is_some() || pull_request_url.is_some()).then_some(
+        WorkflowSideEffects {
+            commit_sha,
+            remote_branch,
+            pull_request_url,
+        },
+    )
 }
 
 #[derive(Default)]
@@ -92,6 +141,7 @@ pub struct CodexStartRequest {
     pub prompt: String,
     pub skill_id: Option<String>,
     pub timeout_seconds: u64,
+    pub workflow: Option<WorkflowRunMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +154,7 @@ pub struct CodexRunConfig {
     pub skill_id: Option<String>,
     pub skill_path: Option<PathBuf>,
     pub timeout_seconds: u64,
+    pub workflow: Option<WorkflowRunMetadata>,
 }
 
 fn store() -> &'static Mutex<RunStore> {
@@ -216,20 +267,200 @@ fn mutation_scope(cwd: &Path) -> String {
 }
 
 pub fn ensure_clean_git_worktree(cwd: &Path) -> Result<(), String> {
+    ensure_git_scope(cwd, &[])
+}
+
+fn ensure_git_scope(cwd: &Path, allowed_dirty_paths: &[String]) -> Result<(), String> {
     let Some(repo_root) = cwd.ancestors().find(|folder| folder.join(".git").exists()) else {
         return Ok(());
     };
     let status = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         .map_err(|_| "Could not verify Git status; Codex was not started.".to_string())?;
     if !status.status.success() {
         return Err("Could not verify Git status; Codex was not started.".into());
     }
-    if !status.stdout.is_empty() {
+    if status.stdout.is_empty() {
+        return Ok(());
+    }
+    if allowed_dirty_paths.is_empty() {
         return Err("Codex requires a clean Git worktree to protect existing changes. Commit or stash your changes, or select a clean worktree.".into());
+    }
+    let selected = allowed_dirty_paths
+        .iter()
+        .map(|path| path.replace('\\', "/").to_lowercase())
+        .collect::<HashSet<_>>();
+    if selected.len() != allowed_dirty_paths.len() {
+        return Err("Select each changed file only once.".into());
+    }
+    let mut actual = HashSet::new();
+    for entry in status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        if entry.len() < 4 {
+            return Err("Git returned an unreadable status; Codex was not started.".into());
+        }
+        if entry[..2].contains(&b'R') || entry[..2].contains(&b'C') {
+            return Err(
+                "Renamed or copied files need a clean worktree before this workflow can start."
+                    .into(),
+            );
+        }
+        let path = std::str::from_utf8(&entry[3..])
+            .map_err(|_| "Git returned a path that cannot be safely scoped.".to_string())?
+            .replace('\\', "/");
+        actual.insert(path.to_lowercase());
+    }
+    if actual != selected {
+        return Err("The selected paths must exactly match every changed file in the repository. Refresh the list and review your selection.".into());
+    }
+    Ok(())
+}
+
+fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), String> {
+    if !matches!(workflow.action.as_str(), "dev-work" | "dev-push")
+        || workflow.operation_key.len() != 64
+        || !workflow
+            .operation_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || workflow.scope_paths.len() > 200
+        || workflow.requested_effects.len() > 3
+    {
+        return Err("The workflow action or operation identity is invalid.".into());
+    }
+    if workflow.action == "dev-work" && workflow.issue_url.as_deref().is_none_or(str::is_empty) {
+        return Err("Work on issue requires a selected issue URL.".into());
+    }
+    if workflow.intent.trim().is_empty()
+        || workflow.intent.len() > 8_000
+        || workflow.intent.contains('\0')
+    {
+        return Err("Describe an intentional workflow scope of at most 8,000 characters.".into());
+    }
+    if workflow
+        .issue_url
+        .as_ref()
+        .is_some_and(|url| url.len() > 2048 || !url.starts_with("https://github.com/"))
+    {
+        return Err("Issue context must use a GitHub.com HTTPS issue URL.".into());
+    }
+    if workflow.action == "dev-push" && workflow.scope_paths.is_empty() {
+        return Err("Push changes requires at least one selected changed file.".into());
+    }
+    let mut paths = HashSet::new();
+    let mut scope_bytes = 0usize;
+    for path in &workflow.scope_paths {
+        let parsed = Path::new(path);
+        scope_bytes = scope_bytes.saturating_add(path.len());
+        if path.trim().is_empty()
+            || path.len() > 500
+            || scope_bytes > 10_000
+            || path.chars().any(char::is_control)
+            || parsed.is_absolute()
+            || parsed.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir
+                        | std::path::Component::CurDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            })
+            || !paths.insert(path.replace('\\', "/").to_lowercase())
+        {
+            return Err("Change scope must use unique repository-relative file paths.".into());
+        }
+    }
+    let mut effects = HashSet::new();
+    for effect in &workflow.requested_effects {
+        if !matches!(effect.as_str(), "commit" | "push" | "createPullRequest")
+            || !effects.insert(effect.as_str())
+        {
+            return Err("The requested workflow effects are invalid.".into());
+        }
+    }
+    if effects.contains("createPullRequest") && !effects.contains("push") {
+        return Err("Creating a pull request requires explicit permission to push.".into());
+    }
+    Ok(())
+}
+
+fn workflow_key_recorded(records: &[RunRecord], operation_key: &str) -> bool {
+    records.iter().any(|record| {
+        record
+            .workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.operation_key == operation_key)
+    })
+}
+
+fn github_repository_from_remote(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))?;
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    (parts.len() == 2
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && !part.chars().any(char::is_control)))
+    .then(|| format!("{}/{}", parts[0], parts[1]).to_ascii_lowercase())
+}
+
+fn verify_workflow_repository(cwd: &Path, workflow: &WorkflowRunMetadata) -> Result<(), String> {
+    let root = cwd
+        .ancestors()
+        .find(|folder| folder.join(".git").exists())
+        .ok_or("Agent-backed repository workflows require a Git checkout.")?;
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["branch", "--show-current"])
+        .output()
+        .map_err(|_| "Could not verify the current Git branch.".to_string())?;
+    if !branch.status.success() || String::from_utf8_lossy(&branch.stdout).trim().is_empty() {
+        return Err(
+            "A named Git branch is required; detached HEAD workflows are unsupported.".into(),
+        );
+    }
+    let remotes = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "-v"])
+        .output()
+        .map_err(|_| "Could not verify configured Git remotes.".to_string())?;
+    if !remotes.status.success() {
+        return Err("Could not verify configured Git remotes.".into());
+    }
+    let repositories = String::from_utf8_lossy(&remotes.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(github_repository_from_remote)
+        .collect::<HashSet<_>>();
+    if repositories.is_empty() {
+        return Err(
+            "Agent-backed issue and push workflows require a configured GitHub remote.".into(),
+        );
+    }
+    if let Some(url) = &workflow.issue_url {
+        let path = url.strip_prefix("https://github.com/").unwrap_or_default();
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts.len() != 4
+            || parts[2] != "issues"
+            || parts[3].parse::<u64>().is_err()
+            || !repositories.contains(&format!("{}/{}", parts[0], parts[1]).to_ascii_lowercase())
+        {
+            return Err(
+                "The selected issue URL does not match a GitHub remote in this repository.".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -467,8 +698,20 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
         kind: kind.to_owned(),
         text,
     };
-    record.next_sequence += 1;
     record.events.push(event.clone());
+    let combined_output = record
+        .events
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "output" | "finalOutput"))
+        .map(|entry| entry.text.as_str())
+        .collect::<String>();
+    if let (Some(effects), Some(workflow)) = (
+        parse_side_effect_marker(&combined_output),
+        record.workflow.as_mut(),
+    ) {
+        workflow.side_effects = Some(effects);
+    }
+    record.next_sequence += 1;
     if truncated
         && record
             .events
@@ -1109,7 +1352,23 @@ pub fn start_codex_workflow_run(
     if !cwd.is_dir() {
         return Err("The selected project must be an existing folder.".into());
     }
-    ensure_clean_git_worktree(&cwd)?;
+    if let Some(workflow) = &config.workflow {
+        validate_workflow_metadata(workflow)?;
+        if workflow.action == "dev-work" && !workflow.scope_paths.is_empty() {
+            return Err("Work on issue uses a clean isolated worktree; do not pass pre-existing changes as scope.".into());
+        }
+        ensure_git_scope(
+            &cwd,
+            if workflow.action == "dev-push" {
+                &workflow.scope_paths
+            } else {
+                &[]
+            },
+        )?;
+        verify_workflow_repository(&cwd, workflow)?;
+    } else {
+        ensure_clean_git_worktree(&cwd)?;
+    }
     let timeout_seconds = config.timeout_seconds;
     let request = StartRequest {
         executable: config.executable.to_string_lossy().into_owned(),
@@ -1173,6 +1432,7 @@ fn start_run(
         exit_code: None,
         next_sequence: 1,
         events: Vec::new(),
+        workflow: codex.as_ref().and_then(|config| config.workflow.clone()),
     };
     {
         let mut state = store()
@@ -1180,6 +1440,11 @@ fn start_run(
             .map_err(|_| "Could not access workflow runs.".to_string())?;
         if state.records.is_empty() {
             state.records = load_records(&path)?;
+        }
+        if let Some(workflow) = &record.workflow {
+            if workflow_key_recorded(&state.records, &workflow.operation_key) {
+                return Err("This exact workflow scope already has a saved run. Review its persisted output and side-effect record before starting another run.".into());
+            }
         }
         if request.mutating && !state.mutating_paths.insert(canonical_key.clone()) {
             return Err(
@@ -1690,12 +1955,38 @@ mod tests {
             exit_code: None,
             next_sequence: 1,
             events: vec![],
+            workflow: Some(WorkflowRunMetadata {
+                action: "dev-push".into(),
+                operation_key: "a".repeat(64),
+                intent: "Review the selected change.".into(),
+                issue_url: None,
+                scope_paths: vec!["src/main.rs".into()],
+                requested_effects: vec!["commit".into()],
+                side_effects: Some(WorkflowSideEffects {
+                    commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    remote_branch: Some("feat/example".into()),
+                    pull_request_url: None,
+                }),
+            }),
         };
         persist_records(&path, &[record.clone()]).unwrap();
         record.state = "interrupted".into();
         let restored = load_records(&path).unwrap();
         assert_eq!(restored[0].state, record.state);
         assert!(restored[0].finished_at_ms.is_some());
+        assert!(workflow_key_recorded(&restored, &"a".repeat(64)));
+        assert_eq!(
+            restored[0]
+                .workflow
+                .as_ref()
+                .unwrap()
+                .side_effects
+                .as_ref()
+                .unwrap()
+                .remote_branch
+                .as_deref(),
+            Some("feat/example")
+        );
     }
 
     #[test]
@@ -1707,7 +1998,7 @@ mod tests {
 
     #[test]
     fn codex_preflight_allows_clean_repositories_and_rejects_dirty_ones() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let init = Command::new("git")
             .arg("init")
             .arg("--quiet")
@@ -1720,6 +2011,59 @@ mod tests {
         fs::write(fixture.path().join("unrelated.txt"), "local work").unwrap();
         let error = ensure_clean_git_worktree(fixture.path()).unwrap_err();
         assert!(error.contains("clean Git worktree"));
+    }
+
+    #[test]
+    fn push_preflight_requires_an_exact_changed_file_scope() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(fixture.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fs::write(fixture.path().join("one.txt"), "one").unwrap();
+        fs::write(fixture.path().join("two.txt"), "two").unwrap();
+        assert!(ensure_git_scope(fixture.path(), &["one.txt".into()]).is_err());
+        assert!(ensure_git_scope(fixture.path(), &["one.txt".into(), "two.txt".into()]).is_ok());
+    }
+
+    #[test]
+    fn workflow_scope_validation_and_side_effect_markers_are_bounded() {
+        let mut workflow = WorkflowRunMetadata {
+            action: "dev-push".into(),
+            operation_key: "a".repeat(64),
+            intent: "Review the selected change.".into(),
+            issue_url: None,
+            scope_paths: vec!["src/main.rs".into()],
+            requested_effects: vec!["commit".into()],
+            side_effects: None,
+        };
+        assert!(validate_workflow_metadata(&workflow).is_ok());
+        workflow.requested_effects = vec!["createPullRequest".into()];
+        assert!(validate_workflow_metadata(&workflow).is_err());
+        workflow.requested_effects = vec!["commit".into()];
+        workflow.scope_paths = vec!["../secret.txt".into()];
+        assert!(validate_workflow_metadata(&workflow).is_err());
+        let marker = parse_side_effect_marker("NAVIS_SIDE_EFFECTS:{\"commitSha\":\"0123456789abcdef0123456789abcdef01234567\",\"remoteBranch\":\"feat/example\",\"pullRequestUrl\":\"https://github.com/owner/repo/pull/12\"}").unwrap();
+        assert_eq!(marker.remote_branch.as_deref(), Some("feat/example"));
+        assert_eq!(
+            marker.pull_request_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/12")
+        );
+        assert!(parse_side_effect_marker(
+            "NAVIS_SIDE_EFFECTS:{\"pullRequestUrl\":\"file:///secret\"}"
+        )
+        .is_none());
+        assert_eq!(
+            github_repository_from_remote("git@github.com:KevinHozak/Navis-Fabrica.git").as_deref(),
+            Some("kevinhozak/navis-fabrica")
+        );
     }
 
     #[test]

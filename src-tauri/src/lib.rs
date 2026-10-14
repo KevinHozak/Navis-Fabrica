@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
 
+mod github;
 pub mod providers;
 mod scanner;
 
@@ -21,6 +22,8 @@ static PROJECT_FACT_CACHE: OnceLock<Mutex<HashMap<String, scanner::ProjectEntry>
     OnceLock::new();
 static PROJECT_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
+static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
+    OnceLock::new();
 
 enum WatchCommand {
     Event(Result<Event, String>),
@@ -36,6 +39,185 @@ fn active_scans() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
 
 fn project_fact_cache() -> &'static Mutex<HashMap<String, scanner::ProjectEntry>> {
     PROJECT_FACT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn github_activity_cache() -> &'static Mutex<HashMap<String, github::GitHubActivity>> {
+    GITHUB_ACTIVITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn github_cache_key(
+    owner: &str,
+    repository: &str,
+    account_id: Option<&str>,
+    credential_ref: Option<&str>,
+) -> String {
+    format!(
+        "{}/{}@{}:{}",
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase(),
+        account_id.unwrap_or("public"),
+        credential_ref.unwrap_or("none")
+    )
+}
+
+fn can_restore_github_cache(authentication: &str, credential_available: bool) -> bool {
+    authentication != "available" || credential_available
+}
+
+#[tauri::command]
+fn get_cached_github_activity(
+    app: AppHandle,
+    owner: String,
+    repository: String,
+) -> Result<github::GitHubActivity, String> {
+    if !github::valid_repository_name(&owner, &repository) {
+        return Err("The GitHub repository identity is invalid.".into());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let account = settings
+        .selected_github_account_id
+        .as_deref()
+        .and_then(|id| {
+            settings
+                .github_accounts
+                .iter()
+                .find(|account| account.id == id)
+        });
+    let account_id = account.map(|item| item.id.as_str());
+    let credential_ref = account.and_then(|item| item.credential_ref.as_deref());
+    let credential_available = credential_ref.and_then(resolve_github_credential).is_some();
+    let cache = github_activity_cache()
+        .lock()
+        .map_err(|_| "Could not access GitHub activity cache.".to_string())?;
+    let cached = cache.get(&github_cache_key(
+        &owner,
+        &repository,
+        account_id,
+        credential_ref,
+    ));
+    let recent = cached.is_some_and(|entry| {
+        entry
+            .checked_at
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|checked_at| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(checked_at)
+                    <= 300
+            })
+    });
+    Ok(cached
+        .filter(|entry| {
+            recent && can_restore_github_cache(&entry.authentication, credential_available)
+        })
+        .cloned()
+        .unwrap_or_else(|| github::GitHubActivity::unchecked(&owner, &repository)))
+}
+
+#[tauri::command]
+async fn refresh_github_activity(
+    app: AppHandle,
+    owner: String,
+    repository: String,
+) -> Result<github::GitHubActivity, String> {
+    if !github::valid_repository_name(&owner, &repository) {
+        return Err("The GitHub repository identity is invalid.".into());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let selected_account = settings
+        .selected_github_account_id
+        .as_deref()
+        .and_then(|id| {
+            settings
+                .github_accounts
+                .iter()
+                .find(|account| account.id == id)
+        });
+    let account_id = selected_account.map(|account| account.id.as_str());
+    let credential_ref = selected_account.and_then(|account| account.credential_ref.as_deref());
+    let token = credential_ref.and_then(resolve_github_credential);
+    let key = github_cache_key(&owner, &repository, account_id, credential_ref);
+    let mut activity = github::fetch_activity(&owner, &repository, token.as_deref()).await;
+    if activity.remote_status != "fresh" {
+        let mut cache = github_activity_cache()
+            .lock()
+            .map_err(|_| "Could not access GitHub activity cache.".to_string())?;
+        if activity.remote_status == "unauthorized" || activity.remote_status == "authExpired" {
+            cache.remove(&key);
+            return Ok(activity);
+        }
+        if let Some(previous) = cache
+            .get(&key)
+            .filter(|entry| can_restore_github_cache(&entry.authentication, token.is_some()))
+        {
+            activity.issue_count = previous.issue_count;
+            activity.pull_request_count = previous.pull_request_count;
+            activity.recent_commits = previous.recent_commits.clone();
+            activity.checked_at = previous.checked_at.clone();
+        }
+        return Ok(activity);
+    }
+    let mut cache = github_activity_cache()
+        .lock()
+        .map_err(|_| "Could not access GitHub activity cache.".to_string())?;
+    if cache.len() >= 256 && !cache.contains_key(&key) {
+        if let Some(first) = cache.keys().next().cloned() {
+            cache.remove(&first);
+        }
+    }
+    cache.insert(key, activity.clone());
+    Ok(activity)
+}
+
+fn resolve_github_credential(reference: &str) -> Option<String> {
+    let key = reference.strip_prefix("credential-store:")?;
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".:/_-".contains(character))
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::slice;
+        use windows_sys::Win32::Security::Credentials::{
+            CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+        };
+        let target: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+        let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+        if read == 0 || credential.is_null() {
+            return None;
+        }
+        let entry = unsafe { &*credential };
+        let token = if entry.CredentialBlob.is_null()
+            || entry.CredentialBlobSize == 0
+            || entry.CredentialBlobSize > 4096
+        {
+            None
+        } else {
+            let bytes = unsafe {
+                slice::from_raw_parts(entry.CredentialBlob, entry.CredentialBlobSize as usize)
+            };
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        unsafe {
+            CredFree(credential.cast());
+        }
+        token
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 const SETTINGS_SCHEMA_VERSION: u32 = 3;
@@ -728,6 +910,8 @@ pub fn run() {
             get_settings,
             save_settings,
             inspect_providers,
+            get_cached_github_activity,
+            refresh_github_activity,
             start_project_scan,
             cancel_project_scan
         ])
@@ -738,6 +922,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_to_restore_authenticated_activity_without_a_usable_credential() {
+        assert!(!can_restore_github_cache("available", false));
+        assert!(can_restore_github_cache("available", true));
+        assert!(can_restore_github_cache("notConfigured", false));
+    }
 
     #[test]
     fn watcher_ignores_excluded_folders_but_keeps_git_metadata_events() {

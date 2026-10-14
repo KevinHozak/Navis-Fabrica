@@ -4,6 +4,8 @@ import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import {
   cancelProjectScan,
+  getCachedGitHubActivity,
+  GitHubActivity,
   isDesktopApp,
   loadSettings,
   onProjectScanFinished,
@@ -13,6 +15,7 @@ import {
   ProjectEntry,
   ProjectScanFinished,
   ProjectScanProgress,
+  refreshGitHubActivity,
   startProjectScan,
 } from "./settings";
 
@@ -42,7 +45,6 @@ function App() {
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
-  const [selectedGitHubLogin, setSelectedGitHubLogin] = useState<string | null>(null);
   const activeScanId = useRef("");
   const cancelRequested = useRef(false);
   const refreshAfterScan = useRef(false);
@@ -52,7 +54,6 @@ function App() {
   useEffect(() => {
     const handleNavigation = () => {
       setSection(sectionFromHash());
-      loadSettings().then((settings) => setSelectedGitHubLogin(settings.githubAccounts.find((account) => account.id === settings.selectedGithubAccountId)?.login ?? null)).catch(() => undefined);
     };
     window.addEventListener("hashchange", handleNavigation);
     return () => window.removeEventListener("hashchange", handleNavigation);
@@ -62,7 +63,6 @@ function App() {
     document.title = `Navis-Fabrica · v${__APP_VERSION__}`;
     loadSettings().then((settings) => {
       setProjectRoot(settings.projectRoot);
-      setSelectedGitHubLogin(settings.githubAccounts.find((account) => account.id === settings.selectedGithubAccountId)?.login ?? null);
     }).catch(() => undefined);
   }, []);
 
@@ -256,7 +256,7 @@ function App() {
                   {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div>}
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
                   {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
-                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} selectedGitHubLogin={selectedGitHubLogin} />
+                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} />
                 </>
               ) : scanning ? (
                 <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
@@ -297,11 +297,10 @@ function gitStatusLabel(status: string): string {
 const PROJECT_ROW_HEIGHT = 68;
 const PROJECT_OVERSCAN = 5;
 
-function ProjectsBrowser({ projects, selectedProjectId, onSelect, selectedGitHubLogin }: {
+function ProjectsBrowser({ projects, selectedProjectId, onSelect }: {
   projects: ProjectEntry[];
   selectedProjectId: string | null;
   onSelect: (id: string) => void;
-  selectedGitHubLogin: string | null;
 }) {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
@@ -389,12 +388,51 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, selectedGitHub
           </div>
         </div> : <div className="project-filter-empty">No projects match these filters.</div>}
       </div>
-      <ProjectDetails project={selected} selectedGitHubLogin={selectedGitHubLogin} />
+      <ProjectDetails project={selected} />
     </div>
   </div>;
 }
 
-function ProjectDetails({ project, selectedGitHubLogin }: { project: ProjectEntry | null; selectedGitHubLogin: string | null }) {
+function ProjectDetails({ project }: { project: ProjectEntry | null }) {
+  const [activity, setActivity] = useState<GitHubActivity | null>(null);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState("");
+  const remote = project?.git.remotes.find((item) => item.github)?.github;
+  const selectedRepository = useRef<string | null>(null);
+  selectedRepository.current = project && remote
+    ? `${project.id}:${remote.owner.toLowerCase()}/${remote.repository.toLowerCase()}`
+    : null;
+  useEffect(() => {
+    let active = true;
+    setActivity(null);
+    setActivityError("");
+    if (remote && isDesktopApp()) {
+      getCachedGitHubActivity(remote.owner, remote.repository).then((value) => {
+        if (active) setActivity(value);
+      }).catch((error: unknown) => {
+        if (active) setActivityError(error instanceof Error ? error.message : String(error));
+      });
+    }
+    return () => { active = false; };
+  }, [project?.id, remote?.owner, remote?.repository]);
+
+  async function refreshActivity() {
+    if (!remote) return;
+    const requestRepository = selectedRepository.current;
+    setActivityLoading(true);
+    setActivityError("");
+    try {
+      const refreshedActivity = await refreshGitHubActivity(remote.owner, remote.repository);
+      if (selectedRepository.current === requestRepository) setActivity(refreshedActivity);
+    } catch (error) {
+      if (selectedRepository.current === requestRepository) {
+        setActivityError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (selectedRepository.current === requestRepository) setActivityLoading(false);
+    }
+  }
+
   if (!project) return <aside className="project-detail empty-detail"><h3>Select a project</h3><p>Choose a project to see its local details.</p></aside>;
   const git = project.git;
   return <aside className="project-detail" aria-labelledby="project-detail-title">
@@ -408,7 +446,23 @@ function ProjectDetails({ project, selectedGitHubLogin }: { project: ProjectEntr
     </div>
     <div className="detail-group"><strong>Detected stacks</strong><div className="project-detail-tags">{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span>None detected</span>}</div></div>
     {git.remotes.length > 0 && <div className="detail-group"><strong>Remotes</strong>{git.remotes.map((remote) => <span className="detail-break" key={remote.name}>{remote.name}{remote.url ? ` · ${remote.url}` : " · URL unavailable"}</span>)}</div>}
-    {git.remotes.some((remote) => remote.github) && <div className="detail-group"><strong>GitHub association</strong>{git.remotes.filter((remote) => remote.github).map((remote) => <span key={remote.name}>{remote.name} · {remote.github!.owner}/{remote.github!.repository}</span>)}<span>Account · {selectedGitHubLogin ?? "none selected"}</span><span>Remote access · not checked; local project details remain available</span></div>}
+    {remote && <div className="detail-group github-activity">
+      <strong>GitHub activity</strong>
+      <a href={remote.canonicalUrl} target="_blank" rel="noreferrer">{remote.owner}/{remote.repository} ↗</a>
+      <span>Remote access · {activity?.authentication === "available" ? "authenticated" : activity?.authentication === "expired" ? "authentication expired" : "public GitHub API"}</span>
+      <div className="github-activity-counts">
+        <a href={activity?.issuesUrl ?? `${remote.canonicalUrl}/issues`} target="_blank" rel="noreferrer">{activity?.issueCount ?? "—"} open issues</a>
+        <a href={activity?.pullsUrl ?? `${remote.canonicalUrl}/pulls`} target="_blank" rel="noreferrer">{activity?.pullRequestCount ?? "—"} open pull requests</a>
+      </div>
+      <span className="github-freshness">Remote · {activity?.remoteStatus === "fresh" ? "updated" : activity?.remoteStatus === "rateLimited" ? "rate limited" : activity?.remoteStatus === "unauthorized" ? "access unavailable" : activity?.remoteStatus === "authExpired" ? "authentication expired" : activity?.remoteStatus === "unavailable" ? "unavailable" : "not refreshed"}{activity?.checkedAt ? ` · ${new Date(Number(activity.checkedAt) * 1000).toLocaleString()}` : ""}</span>
+      {activity?.authentication === "expired" && <span role="status">GitHub rejected authentication. Public repository links and local project details are still available.</span>}
+      {activity?.remoteStatus === "rateLimited" && <span role="status">GitHub rate limit reached. Try again later.</span>}
+      {activity?.remoteStatus === "unauthorized" && <span role="status">GitHub did not provide repository activity. Private data stays hidden.</span>}
+      {activity?.remoteStatus === "unavailable" && <span role="status">Remote activity is unavailable. Local project details are still available.</span>}
+      {activity?.recentCommits.map((commit) => <a className="github-commit" key={commit.hash} href={commit.url} target="_blank" rel="noreferrer"><code>{commit.hash}</code> · {commit.subject}</a>)}
+      {activityError && <span role="status">{activityError}</span>}
+      {isDesktopApp() && <button className="text-button" type="button" onClick={() => { void refreshActivity(); }} disabled={activityLoading}>{activityLoading ? "Refreshing GitHub…" : "Refresh GitHub activity"}</button>}
+    </div>}
     {project.workflowPrerequisites.length > 0 && <div className="detail-group"><strong>Workflow prerequisites</strong>{project.workflowPrerequisites.map((tool) => <span key={tool.name}>{tool.name} · {tool.available ? "available" : "missing"}</span>)}</div>}
   </aside>;
 }

@@ -9,6 +9,8 @@
     "allow-start-project-scan",
     "allow-cancel-project-scan",
     "allow-inspect-providers",
+    "allow-get-cached-github-activity",
+    "allow-refresh-github-activity",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

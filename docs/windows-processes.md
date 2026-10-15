@@ -12,4 +12,4 @@ All app backend child processes are noninteractive and must be created with `cra
 
 These calls previously relied on the platform's default console creation behavior. Source inspection identified these launch paths, but the original report did not identify a single triggering action and no live reproduction was performed for this change. Interactive terminal behavior is outside this backend API; no backend launch is intentionally interactive.
 
-A Windows-only regression contract test in `process.rs` launches the Rust test executable through the shared constructor and checks captured output and successful exit status. Existing scanner and workflow paths retain their current piped streams, cancellation polling, and cleanup logic.
+A Windows-only regression contract test in `process.rs` launches the Rust test executable through the shared constructor, checks that `GetConsoleWindow()` is null in the child, and verifies captured output and successful exit status. Existing scanner and workflow paths retain their current piped streams, cancellation polling, and cleanup logic.

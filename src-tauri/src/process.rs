@@ -24,6 +24,8 @@ mod tests {
     #[test]
     fn hidden_noninteractive_launch_keeps_output_and_exit_status() {
         if std::env::var_os("NAVIS_HIDDEN_PROCESS_CHILD").is_some() {
+            let console = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+            assert!(console.is_null(), "child unexpectedly has a console window");
             println!("hidden-process-child-output");
             return;
         }

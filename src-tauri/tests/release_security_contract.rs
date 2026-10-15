@@ -24,7 +24,7 @@ fn default_capability_is_scoped_to_registered_commands() {
         .filter(|permission| !event_permissions.contains(permission))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(app_permissions.len(), 31);
+    assert_eq!(app_permissions.len(), 33);
     assert_eq!(
         permissions
             .iter()
@@ -128,4 +128,62 @@ fn frontend_does_not_depend_on_the_unrestricted_shell_plugin() {
             }
         }
     }
+}
+
+#[test]
+fn virtualized_project_list_preserves_keyboard_and_screen_reader_contracts() {
+    let app = fs::read_to_string(manifest_path("../src/App.tsx")).unwrap();
+    for contract in [
+        "role=\"listbox\"",
+        "aria-activedescendant",
+        "role=\"option\"",
+        "aria-selected",
+        "aria-posinset",
+        "aria-setsize",
+        "ArrowDown",
+        "ArrowUp",
+        "Home",
+        "End",
+    ] {
+        assert!(app.contains(contract), "project list missing {contract}");
+    }
+    let styles = fs::read_to_string(manifest_path("../src/styles.css")).unwrap();
+    assert!(styles.contains(":focus-visible"));
+    assert!(styles.contains("@media (prefers-reduced-motion: reduce)"));
+}
+
+fn relative_luminance(hex: &str) -> f64 {
+    let color = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap();
+    let channels = [color >> 16, (color >> 8) & 0xff, color & 0xff].map(|channel| {
+        let value = channel as f64 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+}
+
+#[test]
+fn quiet_text_exceeds_wcag_aa_contrast_on_project_surfaces() {
+    let styles = fs::read_to_string(manifest_path("../src/styles.css")).unwrap();
+    assert!(styles.contains("--quiet: #8492a4"));
+    let foreground = relative_luminance("#8492a4");
+    for background in ["#0c0f14", "#141a23", "#151e29"] {
+        let background = relative_luminance(background);
+        let contrast = (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+        assert!(contrast >= 4.5, "contrast {contrast:.2}:1 is below WCAG AA");
+    }
+}
+
+#[test]
+fn output_and_history_bounds_match_the_frontend_limits() {
+    let source = fs::read_to_string(manifest_path("src/runs.rs")).unwrap();
+    assert!(source.contains("const MAX_RUNS: usize = 100;"));
+    assert!(source.contains("const MAX_EVENTS: usize = 2_000;"));
+    assert!(source.contains("const MAX_OUTPUT_BYTES: usize = 512 * 1024;"));
+    let panel = fs::read_to_string(manifest_path("../src/RunsPanel.tsx")).unwrap();
+    assert!(panel.contains("const maxPendingRunEvents = 2_000;"));
+    assert!(panel.contains("requestAnimationFrame"));
 }

@@ -1,11 +1,12 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { FallbackTrigger, GitHubIssue, ProjectEntry, ProviderHandoff, WorkflowRunMetadata } from "./settings";
 import {
-  cancelWorkflowRun, createProviderHandoff, discoverWorkflowSkills, evaluateProviderFallback, listUsageSignals, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
+  cancelWorkflowRun, createProviderHandoff, deleteFinishedWorkflowRuns, discoverWorkflowSkills, evaluateProviderFallback, exportWorkflowDiagnostics, listUsageSignals, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
   loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startOpenRouterWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
 } from "./settings";
 
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
+const maxPendingRunEvents = 2_000;
 
 export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; project: ProjectEntry; issue: GitHubIssue | null }) {
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
@@ -42,6 +43,11 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [workflowIntent, setWorkflowIntent] = useState("");
   const [scopePathsText, setScopePathsText] = useState("");
   const [requestedEffects, setRequestedEffects] = useState<Set<"commit" | "push" | "createPullRequest">>(() => new Set());
+  const [historyMessage, setHistoryMessage] = useState("");
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const historyBusyLock = useRef(false);
+  const pendingEvents = useRef<Array<[string, WorkflowRun["events"][number]]>>([]);
+  const eventFrame = useRef<number | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -52,9 +58,21 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       if (active) setRuns((items) => [next, ...items.filter((item) => item.id !== next.id)].slice(0, 100));
     });
     const event = onWorkflowRunEvent(([runId, next]) => {
-      if (active) setRuns((items) => items.map((item) => item.id === runId
-        ? { ...item, nextSequence: Math.max(item.nextSequence, next.sequence + 1), events: [...item.events, next].slice(-2000) }
-        : item));
+      if (!active) return;
+      pendingEvents.current.push([runId, next]);
+      if (pendingEvents.current.length > maxPendingRunEvents) pendingEvents.current.splice(0, pendingEvents.current.length - maxPendingRunEvents);
+      if (eventFrame.current === null) {
+        eventFrame.current = window.requestAnimationFrame(() => {
+          eventFrame.current = null;
+          const updates = pendingEvents.current.splice(0);
+          const byRun = new Map<string, WorkflowRun["events"]>();
+          updates.forEach(([id, item]) => byRun.set(id, [...(byRun.get(id) ?? []), item]));
+          setRuns((items) => items.map((run) => {
+            const additions = byRun.get(run.id);
+            return additions ? { ...run, nextSequence: Math.max(run.nextSequence, ...additions.map((item) => item.sequence + 1)), events: [...run.events, ...additions].slice(-maxPendingRunEvents) } : run;
+          }));
+        });
+      }
     });
     const recoveryPoll = window.setInterval(() => {
       listWorkflowRuns().then((items) => { if (active) setRuns(items); }).catch(() => undefined);
@@ -62,6 +80,9 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     return () => {
       active = false;
       window.clearInterval(recoveryPoll);
+      if (eventFrame.current !== null) window.cancelAnimationFrame(eventFrame.current);
+      eventFrame.current = null;
+      pendingEvents.current = [];
       void update.then((stop) => stop());
       void event.then((stop) => stop());
     };
@@ -71,6 +92,47 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   useEffect(() => { loadSettings().then((settings) => { const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId); setSelectedProviderKind(provider?.kind ?? null); setSelectedProviderId(provider?.id ?? null); }).catch(() => { setSelectedProviderKind(null); setSelectedProviderId(null); }); }, []);
   useEffect(() => { discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
   const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0] ?? null, [runs, selectedId]);
+
+  async function exportDiagnostics() {
+    if (historyBusyLock.current) return;
+    historyBusyLock.current = true;
+    setHistoryBusy(true);
+    setHistoryMessage("");
+    try {
+      const json = await exportWorkflowDiagnostics();
+      const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `navis-fabrica-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setHistoryMessage("Redacted diagnostics export downloaded. Prompts, output, and local paths are excluded.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      historyBusyLock.current = false;
+      setHistoryBusy(false);
+    }
+  }
+
+  async function deleteFinishedHistory() {
+    if (historyBusyLock.current || !window.confirm("Delete all completed run history? Active runs will be kept.")) return;
+    historyBusyLock.current = true;
+    setHistoryBusy(true);
+    setHistoryMessage("");
+    try {
+      const deleted = await deleteFinishedWorkflowRuns();
+      const remaining = await listWorkflowRuns();
+      setRuns(remaining);
+      if (!remaining.some((run) => run.id === selectedId)) setSelectedId(remaining[0]?.id ?? "");
+      setHistoryMessage(`Deleted ${deleted} completed ${deleted === 1 ? "run" : "runs"}. Active runs were kept.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      historyBusyLock.current = false;
+      setHistoryBusy(false);
+    }
+  }
 
   async function startAgent(event: FormEvent) {
     event.preventDefault();
@@ -349,7 +411,10 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     </section>
     <div className="runs-layout">
       <section className="panel run-list-panel" aria-labelledby="run-history-title">
-        <div className="panel-heading"><div><h2 id="run-history-title">Recent runs</h2><p>Persisted local history · output is bounded and token patterns are redacted.</p></div></div><div className="panel-rule" />
+        <div className="panel-heading"><div><h2 id="run-history-title">Recent runs</h2><p>Local history · at most 100 runs, 2,000 events and 512 KiB output per run.</p></div></div>
+        <div className="run-history-actions"><button className="button button-secondary" type="button" disabled={historyBusy} onClick={() => { void exportDiagnostics(); }}>{historyBusy ? "Working…" : "Export redacted diagnostics"}</button><button className="button button-secondary" type="button" disabled={historyBusy || runs.every((run) => activeStates.has(run.state))} onClick={() => { void deleteFinishedHistory(); }}>Delete completed history</button></div>
+        {historyMessage && <p className="run-history-feedback" role="status" aria-live="polite">{historyMessage}</p>}
+        <div className="panel-rule" />
         {runs.length ? runs.map((run) => <button key={run.id} type="button" className={`run-list-item${selected?.id === run.id ? " selected" : ""}`} onClick={() => setSelectedId(run.id)}>
           <strong>{run.workflow?.action ?? run.executable.split(/[\\/]/).pop()}</strong><span>{run.state}{run.mutating ? " · mutating" : " · read only"}</span><small>{run.cwd}</small>
         </button>) : <p className="registry-context-note">No runs yet.</p>}

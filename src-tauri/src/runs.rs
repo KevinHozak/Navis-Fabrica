@@ -1323,6 +1323,23 @@ fn persist_records(path: &Path, records: &[RunRecord]) -> Result<(), String> {
         "DELETE FROM workflow_runs WHERE id NOT IN (SELECT id FROM workflow_runs ORDER BY started_at_ms DESC LIMIT ?1)",
         [MAX_RUNS as i64],
     ).map_err(|_| "Could not trim run history.".to_string())?;
+    if records.is_empty() {
+        transaction
+            .execute("DELETE FROM workflow_runs", [])
+            .map_err(|_| "Could not delete run history.".to_string())?;
+    } else {
+        let placeholders = (1..=records.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!("DELETE FROM workflow_runs WHERE id NOT IN ({placeholders})");
+        transaction
+            .execute(
+                &query,
+                rusqlite::params_from_iter(records.iter().map(|record| record.id.as_str())),
+            )
+            .map_err(|_| "Could not remove deleted run history.".to_string())?;
+    }
     transaction
         .commit()
         .map_err(|_| "Could not commit run history.".to_string())?;
@@ -1430,6 +1447,17 @@ fn redact(line: &str, secrets: &[String]) -> String {
     value
 }
 
+fn budgeted_output(text: &str, already_used: usize) -> (String, usize, bool) {
+    let accepted = text
+        .len()
+        .min(MAX_OUTPUT_BYTES.saturating_sub(already_used));
+    let mut end = accepted;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), end, end < text.len())
+}
+
 fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
     let mut store = match store().lock() {
         Ok(value) => value,
@@ -1445,19 +1473,11 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
     let secrets = store.redaction_values.get(id).cloned().unwrap_or_default();
     let safe_text = redact(text, &secrets);
     let output_bytes = store.output_bytes.entry(id.to_owned()).or_default();
-    let accepted = if uses_output_budget {
-        safe_text
-            .len()
-            .min(MAX_OUTPUT_BYTES.saturating_sub(*output_bytes))
+    let (text, accepted, truncated) = if uses_output_budget {
+        budgeted_output(&safe_text, *output_bytes)
     } else {
-        safe_text.len()
+        (safe_text.clone(), safe_text.len(), false)
     };
-    let truncated = accepted < safe_text.len();
-    let mut end = accepted;
-    while !safe_text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let text = safe_text[..end].to_owned();
     if uses_output_budget {
         *output_bytes += accepted;
     }
@@ -2200,6 +2220,101 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
         persist_records(&path, &state.records)?;
     }
     Ok(state.records.clone())
+}
+
+#[tauri::command]
+pub fn export_workflow_diagnostics(app: AppHandle) -> Result<String, String> {
+    let records = list_workflow_runs(app)?;
+    diagnostics_json(&records, now_ms())
+}
+
+fn diagnostics_json(records: &[RunRecord], exported_at_ms: u128) -> Result<String, String> {
+    let mut states = std::collections::BTreeMap::<String, usize>::new();
+    let mut providers = std::collections::BTreeMap::<String, usize>::new();
+    let mut actions = std::collections::BTreeMap::<String, usize>::new();
+    let mut event_kinds = std::collections::BTreeMap::<String, usize>::new();
+    let mut event_count = 0usize;
+    for record in records {
+        let state = if matches!(
+            record.state.as_str(),
+            "queued"
+                | "running"
+                | "needsInput"
+                | "cancelling"
+                | "completed"
+                | "failed"
+                | "timedOut"
+                | "cancelled"
+                | "interrupted"
+        ) {
+            record.state.as_str()
+        } else {
+            "other"
+        };
+        *states.entry(state.to_owned()).or_default() += 1;
+        if let Some(provider) = record.provider.as_deref().filter(|provider| {
+            matches!(*provider, "codex" | "antigravity" | "ollama" | "openRouter")
+        }) {
+            *providers.entry(provider.to_owned()).or_default() += 1;
+        }
+        if let Some(action) = record
+            .workflow
+            .as_ref()
+            .map(|workflow| workflow.action.as_str())
+        {
+            if matches!(action, "dev-work" | "dev-push" | "dev-build") {
+                *actions.entry(action.to_owned()).or_default() += 1;
+            }
+        }
+        event_count += record.events.len();
+        for event in &record.events {
+            let kind = if matches!(
+                event.kind.as_str(),
+                "output" | "state" | "providerError" | "approvalRequest" | "userInputRequest"
+            ) {
+                event.kind.as_str()
+            } else {
+                "other"
+            };
+            *event_kinds.entry(kind.to_owned()).or_default() += 1;
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::json!({
+        "schemaVersion": 1,
+        "applicationVersion": env!("CARGO_PKG_VERSION"),
+        "exportedAtMs": exported_at_ms,
+        "entrypointToMainPageLoadMs": crate::startup_measurement_ms(),
+        "retention": { "maximumRuns": MAX_RUNS, "maximumEventsPerRun": MAX_EVENTS, "maximumOutputBytesPerRun": MAX_OUTPUT_BYTES },
+        "history": { "runCount": records.len(), "eventCount": event_count, "states": states, "providers": providers, "actions": actions, "eventKinds": event_kinds }
+    }))
+    .map_err(|_| "Could not encode diagnostics export.".to_string())
+}
+
+#[tauri::command]
+pub fn delete_finished_workflow_runs(app: AppHandle) -> Result<usize, String> {
+    let path = history_path(&app)?;
+    let mut state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.records.is_empty() {
+        state.records = load_records(&path)?;
+    }
+    let deleted = retain_active_runs(&mut state.records);
+    if deleted > 0 {
+        persist_records(&path, &state.records)?;
+    }
+    Ok(deleted)
+}
+
+fn retain_active_runs(records: &mut Vec<RunRecord>) -> usize {
+    let before = records.len();
+    records.retain(|record| {
+        matches!(
+            record.state.as_str(),
+            "queued" | "running" | "needsInput" | "cancelling"
+        )
+    });
+    before - records.len()
 }
 
 #[tauri::command]
@@ -3372,6 +3487,45 @@ mod tests {
         }
     }
 
+    fn fixture_run(id: &str, state: &str) -> RunRecord {
+        RunRecord {
+            id: id.into(),
+            executable: "C:\\Users\\private\\secret-tool.exe".into(),
+            provider: Some("codex".into()),
+            provider_profile_id: Some("private-profile".into()),
+            model_id: Some("private-model".into()),
+            cwd: "C:\\Users\\private\\project".into(),
+            thread_id: Some("private-thread-id".into()),
+            process_id: Some(1234),
+            mutating: true,
+            timeout_seconds: 30,
+            state: state.into(),
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            latency_ms: Some(1),
+            exit_code: Some(0),
+            next_sequence: 2,
+            events: vec![RunEvent {
+                sequence: 1,
+                timestamp_ms: 1,
+                kind: "output".into(),
+                text: "private prompt ghp_sensitive-token-value".into(),
+            }],
+            workflow: Some(WorkflowRunMetadata {
+                action: "dev-work".into(),
+                operation_key: "private-operation-key".into(),
+                intent: "private prompt".into(),
+                build_profile: None,
+                issue_url: Some("https://github.com/private/project/issues/1".into()),
+                scope_paths: vec!["secret.txt".into()],
+                requested_effects: vec!["push".into()],
+                side_effects: None,
+                build_artifact: None,
+            }),
+            handoff: None,
+        }
+    }
+
     fn git_fixture(path: &Path) {
         for args in [
             vec!["init", "-q"],
@@ -3402,6 +3556,85 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn diagnostics_export_contains_only_allowlisted_aggregate_fields() {
+        let record = fixture_run("run-1", "running");
+        let export = diagnostics_json(&[record], 99).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&export).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["exportedAtMs"], 99);
+        assert_eq!(value["history"]["runCount"], 1);
+        assert_eq!(value["history"]["eventCount"], 1);
+        assert_eq!(value["history"]["states"]["running"], 1);
+        assert_eq!(value["history"]["providers"]["codex"], 1);
+        assert_eq!(value["history"]["actions"]["dev-work"], 1);
+        for private_value in [
+            "secret-tool.exe",
+            "C:\\Users\\private",
+            "private-thread-id",
+            "private prompt",
+            "ghp_sensitive-token-value",
+            "private-operation-key",
+            "private-profile",
+            "private-model",
+            "private/project/issues",
+        ] {
+            assert!(
+                !export.contains(private_value),
+                "export leaked {private_value}"
+            );
+        }
+        assert_eq!(value["retention"]["maximumRuns"], MAX_RUNS);
+        assert_eq!(value["retention"]["maximumEventsPerRun"], MAX_EVENTS);
+        assert_eq!(
+            value["retention"]["maximumOutputBytesPerRun"],
+            MAX_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn deleting_completed_history_keeps_active_runs_and_removes_database_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(HISTORY_FILE);
+        let mut records = vec![
+            fixture_run("finished", "completed"),
+            fixture_run("active", "running"),
+        ];
+        persist_records(&path, &records).unwrap();
+        let deleted = retain_active_runs(&mut records);
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["active"]
+        );
+        persist_records(&path, &records).unwrap();
+        let restored = load_records(&path).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "active");
+    }
+
+    #[test]
+    fn output_flood_is_bounded_and_utf8_truncation_keeps_valid_boundaries() {
+        let chunk = "x".repeat(16 * 1024);
+        let mut accepted_total = 0;
+        let mut reached_limit = false;
+        for _ in 0..200 {
+            let (_, accepted, truncated) = budgeted_output(&chunk, accepted_total);
+            accepted_total += accepted;
+            reached_limit |= truncated;
+        }
+        assert_eq!(accepted_total, MAX_OUTPUT_BYTES);
+        assert!(reached_limit);
+
+        let (value, accepted, truncated) = budgeted_output("é", MAX_OUTPUT_BYTES - 1);
+        assert!(value.is_empty());
+        assert_eq!(accepted, 0);
+        assert!(truncated);
     }
 
     #[test]

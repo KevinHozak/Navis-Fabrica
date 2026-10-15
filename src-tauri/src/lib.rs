@@ -27,6 +27,14 @@ static PROJECT_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
 static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
     OnceLock::new();
+static APP_STARTUP_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn startup_measurement_ms() -> Option<u64> {
+    match APP_STARTUP_MS.load(Ordering::Acquire) {
+        0 => None,
+        value => Some(value),
+    }
+}
 
 enum WatchCommand {
     Event(Result<Event, String>),
@@ -1532,7 +1540,24 @@ fn cancel_project_scan(scan_id: String) -> Result<bool, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_started = Instant::now();
     tauri::Builder::default()
+        .on_page_load(move |webview, payload| {
+            if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Finished
+            {
+                let elapsed = startup_started
+                    .elapsed()
+                    .as_millis()
+                    .clamp(1, u64::MAX as u128) as u64;
+                let _ = APP_STARTUP_MS.compare_exchange(
+                    0,
+                    elapsed,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             let settings = settings_path(&handle)
@@ -1567,6 +1592,8 @@ pub fn run() {
             start_project_scan,
             cancel_project_scan,
             runs::list_workflow_runs,
+            runs::export_workflow_diagnostics,
+            runs::delete_finished_workflow_runs,
             runs::start_workflow_run,
             runs::cancel_workflow_run,
             runs::mark_workflow_run_needs_input,

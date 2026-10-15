@@ -24,6 +24,8 @@
     "allow-list-github-issues",
     "allow-get-github-issue",
     "allow-list-workflow-runs",
+    "allow-export-workflow-diagnostics",
+    "allow-delete-finished-workflow-runs",
     "allow-start-workflow-run",
     "allow-cancel-workflow-run",
     "allow-mark-workflow-run-needs-input",

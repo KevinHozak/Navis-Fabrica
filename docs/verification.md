@@ -13,6 +13,33 @@ The initial scaffold delivered only the basic structure. Its original verificati
 
 Do not interpret compile checks as live desktop UX or provider integration verification.
 
+## Release-P2 performance, accessibility, and diagnostics (issue #29)
+
+### Measurement boundaries and baselines
+
+- The desktop records `entrypointToMainPageLoadMs` from the Rust application entrypoint through the first completed load of the `main` Tauri page. It is included in the redacted diagnostics export; it excludes Windows process creation and image loading. Browser-only exports have no native startup measurement.
+- Each completed project scan reports request-to-finish elapsed milliseconds, directories visited, and projects found in the Projects view. It also reports time to the first progress event that contains a discovered project. Times use the webview's monotonic `performance.now()` clock.
+- Scanner fixture targets remain first discovered project under 1 second and full scan under 5 seconds for 100 direct child project folders. The fixture is defined in `src-tauri/src/scanner.rs`; these targets are comparative test gates, not claims of live-root performance. On this Windows 10.0.26300 host (8 logical processors), the 100-project fixture measured first result at 33.32 ms and completion at 211.87 ms (101 folders visited). Prior Windows runs recorded 5.32 s, 6.10 s, and 5.88 s against the 5 s gate; keep those historical outliers as regressions to investigate.
+- Output-flood fixture input is 200 chunks × 16 KiB (3.125 MiB). The per-run persisted/streamed output cap is 512 KiB, with a 2,000-event cap per run. Run history retains at most 100 runs. The diagnostics export reports these limits and aggregate event/run counts without including event text.
+- This verification host reports Microsoft Windows version `10.0.26300` and 8 processors to the process. CPU model and physical memory were unavailable because CIM access is denied in the managed environment. No machine-specific timing result is inferred from these facts.
+
+### Accessibility, responsiveness, and data controls
+
+- Project discovery already uses a virtualized listbox with Arrow Up/Down, Home/End navigation, active-descendant, selected-state, and set-position metadata. Run output now batches event-driven React updates once per animation frame and bounds queued frontend events to 2,000.
+- The global 2 px `:focus-visible` outline and `prefers-reduced-motion` override remain enabled. Contract tests check the listbox keyboard/ARIA markers and these CSS behavior hooks. The quiet text color was raised to `#8492a4`: measured contrast is 6.06:1 against the canvas `#0c0f14`, 5.52:1 against panel `#141a23`, and 5.30:1 against the project-row surface `#151e29`; a Rust contract test enforces at least 4.5:1 for all three.
+- Diagnostics export is an allowlist of version, startup timing, retention limits, and aggregate counts by known state/provider/action/event kind. It excludes per-run IDs, executable names/arguments, local paths, thread IDs, model/profile identifiers, prompts, issue URLs, handoff content, and event text. Tests assert those exclusions, including a GitHub-token-shaped fixture.
+- The run-history screen offers explicit JSON export and a confirmation before deleting completed history. Deletion preserves queued/running/needs-input/cancelling records, removes deleted IDs from SQLite, and reloads the remaining history.
+
+### Verification in this environment
+
+- `npm ci --ignore-scripts --no-audit --no-fund`: passed; 72 locked packages installed.
+- `npm run build`: passed; TypeScript and Vite production build completed (`334.53 kB` JavaScript, `99.21 kB` gzip).
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
+- `git diff --check`: passed.
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml`: passed; 102 library tests and 6 release security/performance contract tests passed. This includes the output-flood cap, privacy allowlist, deletion persistence, scanner benchmark, accessibility/contrast contracts, and capability/CSP checks.
+- The Tauri dev window launched under the temporary `com.navis.fabrica.issue29test` identity with title `Navis-Fabrica · v0.18.3`. The Windows Computer Use approval timed out before accessibility-tree inspection, so keyboard/focus behavior and the exported startup value were not observed live. The fixture results and source-level accessibility checks are not represented as a live interaction test.
+- CIM refused access to the CPU model and physical-memory fields; fixture and live integration results remain separate.
+
 ## Foundation-P1 shell
 
 - The main sections use hash navigation (`#projects`, `#runs`, `#providers`, `#settings`) so browser history and the Tauri webview share the same navigation behavior.

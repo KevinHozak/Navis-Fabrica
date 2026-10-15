@@ -310,6 +310,8 @@ export const getGitHubIssue = (owner: string, repository: string, reference: str
   invoke<GitHubIssue>("get_github_issue", { owner, repository, reference });
 
 export const listWorkflowRuns = () => invoke<WorkflowRun[]>("list_workflow_runs");
+export const exportWorkflowDiagnostics = () => invoke<string>("export_workflow_diagnostics");
+export const deleteFinishedWorkflowRuns = () => invoke<number>("delete_finished_workflow_runs");
 export const startWorkflowRun = (request: WorkflowRunRequest) =>
   invoke<WorkflowRun>("start_workflow_run", { request });
 export const startCodexWorkflowRun = (request: CodexStartRequest) =>

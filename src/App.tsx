@@ -47,12 +47,16 @@ function App() {
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
+  const [scanDurationMs, setScanDurationMs] = useState<number | null>(null);
+  const [firstProjectMs, setFirstProjectMs] = useState<number | null>(null);
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
   const [workContext, setWorkContext] = useState<{ projectId: string; issue: GitHubIssue } | null>(null);
   const [workflowSkills, setWorkflowSkills] = useState<WorkflowSkillStatus[]>([]);
   const activeScanId = useRef("");
+  const scanStartedAt = useRef<number | null>(null);
+  const firstProjectMsRef = useRef<number | null>(null);
   const cancelRequested = useRef(false);
   const refreshAfterScan = useRef(false);
   const beginScanRef = useRef<(forceRefresh: boolean) => void>(() => undefined);
@@ -93,7 +97,13 @@ function App() {
     let unlistenWatchError: (() => void) | undefined;
 
     onProjectScanProgress((next) => {
-      if (active && next.scanId === activeScanId.current) setProgress(next);
+      if (!active || next.scanId !== activeScanId.current) return;
+      setProgress(next);
+      if (next.projectsFound > 0 && firstProjectMsRef.current === null && scanStartedAt.current !== null) {
+        const elapsed = Math.round(performance.now() - scanStartedAt.current);
+        firstProjectMsRef.current = elapsed;
+        setFirstProjectMs(elapsed);
+      }
     }).then((stop) => {
       if (active) unlistenProgress = stop;
       else stop();
@@ -106,6 +116,10 @@ function App() {
     onProjectScanFinished((result) => {
       if (!active || result.scanId !== activeScanId.current) return;
       activeScanId.current = "";
+      if (scanStartedAt.current !== null) {
+        setScanDurationMs(Math.round(performance.now() - scanStartedAt.current));
+        scanStartedAt.current = null;
+      }
       setScanResult(result);
       if (!result.fatalError || result.projects.length > 0) {
         setProjects((previous) => {
@@ -181,10 +195,14 @@ function App() {
     setScanStatus("scanning");
     setScanResult(null);
     setProgress(null);
+    setScanDurationMs(null);
+    setFirstProjectMs(null);
+    firstProjectMsRef.current = null;
     setScanError("");
     try {
       const settings = await loadSettings();
       setProjectRoot(settings.projectRoot);
+      scanStartedAt.current = performance.now();
       await startProjectScan(id, forceRefresh);
       if (cancelRequested.current) await cancelProjectScan(id);
     } catch (error) {
@@ -276,6 +294,8 @@ function App() {
                 <span className="project-count" aria-live="polite">{section === "projects" ? projects.length : ""}</span>
               </div>
               <div className="panel-rule" />
+
+              {section === "projects" && scanResult && scanDurationMs !== null && <p className="scan-measurement" role="status" aria-live="polite">Last scan: {scanDurationMs} ms · {scanResult.directoriesScanned} folders · {scanResult.projects.length} projects{firstProjectMs === null ? "." : ` · first project in ${firstProjectMs} ms.`}</p>}
 
               {watchError && section === "projects" && <div className="scan-notice">Automatic project refresh is unavailable: {watchError} <span>Use Refresh projects to update the list.</span></div>}
 

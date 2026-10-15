@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-export-workflow-diagnostics"
+description = "Enables the export_workflow_diagnostics command without any pre-configured scope."
+commands.allow = ["export_workflow_diagnostics"]
+
+[[permission]]
+identifier = "deny-export-workflow-diagnostics"
+description = "Denies the export_workflow_diagnostics command without any pre-configured scope."
+commands.deny = ["export_workflow_diagnostics"]

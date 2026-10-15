@@ -1617,8 +1617,13 @@ fn start_affected_project_refresh(
         let affected_paths: Vec<PathBuf> = changed_paths
             .iter()
             .map(PathBuf::from)
-            .filter(|path| paths_overlap(&normalize_path(path), &normalize_path(&root)))
+            .filter(|path| path_is_within(&normalize_path(path), &normalize_path(&root)))
             .collect();
+        let options = scanner::ScanOptions {
+            depth: settings.preferences.scan_depth,
+            include_hidden: settings.preferences.include_hidden,
+            exclusions: settings.exclusions.clone(),
+        };
         for changed in changed_paths {
             if cancellation.load(Ordering::Relaxed) {
                 result.cancelled = true;
@@ -1633,20 +1638,24 @@ fn start_affected_project_refresh(
             } else {
                 changed.parent().unwrap_or(&root).to_path_buf()
             };
-            for _ in 0..16 {
+            for _ in 0..64 {
                 let Ok(canonical) = candidate.canonicalize() else {
                     break;
                 };
-                if !canonical.starts_with(&root) || !candidates.insert(normalize_path(&canonical)) {
+                if !path_is_within(&normalize_path(&canonical), &normalize_path(&root))
+                    || !candidates.insert(normalize_path(&canonical))
+                {
                     break;
                 }
-                match scanner::refresh_project_directory(&canonical, &cancellation) {
-                    Ok(Some(project)) => result.projects.push(project),
-                    Ok(None) => {}
-                    Err(error) if result.errors.len() < 500 => result.errors.push(error),
-                    Err(_) => {}
+                if scanner::directory_is_in_discovery_scope(&canonical, &root, &options) {
+                    match scanner::refresh_project_directory(&canonical, &cancellation) {
+                        Ok(Some(project)) => result.projects.push(project),
+                        Ok(None) => {}
+                        Err(error) if result.errors.len() < 500 => result.errors.push(error),
+                        Err(_) => {}
+                    }
+                    result.directories_scanned += 1;
                 }
-                result.directories_scanned += 1;
                 if canonical == root {
                     break;
                 }
@@ -1765,6 +1774,15 @@ fn paths_overlap(first: &str, second: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
         || second
             .strip_prefix(first)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn path_is_within(candidate: &str, root: &str) -> bool {
+    let candidate = candidate.trim_end_matches('/');
+    let root = root.trim_end_matches('/');
+    candidate == root
+        || candidate
+            .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 

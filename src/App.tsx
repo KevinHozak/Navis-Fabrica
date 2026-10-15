@@ -169,8 +169,13 @@ function App() {
     });
 
     onProjectScanInvalidated((paths) => {
-      if (activeScanId.current) refreshAfterScan.current.push(...paths.slice(0, 512));
-      else beginAffectedRefreshRef.current(paths);
+      if (activeScanId.current) {
+        if (partialScanIds.current.has(activeScanId.current)) {
+          refreshAfterScan.current.push(...paths.slice(0, 512));
+        } else {
+          fullRefreshAfterScan.current = true;
+        }
+      } else beginAffectedRefreshRef.current(paths);
     }).then((stop) => {
       if (active) unlistenInvalidated = stop;
       else stop();

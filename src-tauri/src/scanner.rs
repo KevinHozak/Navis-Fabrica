@@ -21,6 +21,28 @@ pub struct ScanOptions {
     pub exclusions: Vec<String>,
 }
 
+pub fn directory_is_in_discovery_scope(path: &Path, root: &Path, options: &ScanOptions) -> bool {
+    let path = path_key(path);
+    let root = path_key(root);
+    let root = root.trim_end_matches('/');
+    if path == root {
+        return true;
+    }
+    let Some(relative) = path
+        .strip_prefix(&format!("{root}/"))
+        .filter(|relative| !relative.is_empty())
+    else {
+        return false;
+    };
+    let components: Vec<_> = relative.split('/').collect();
+    components.len() <= usize::from(options.depth)
+        && (options.include_hidden
+            || components
+                .iter()
+                .all(|component| !component.starts_with('.')))
+        && !excluded(Path::new(relative), &options.exclusions)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectEntry {
@@ -1586,6 +1608,47 @@ mod tests {
         assert!(scan_fixture(root.path(), 2).projects.is_empty());
         let included = scan_fixture(root.path(), 3);
         assert!(included.projects.is_empty());
+    }
+
+    #[test]
+    fn targeted_refresh_scope_matches_depth_hidden_and_exclusion_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let options = options(2);
+        assert!(directory_is_in_discovery_scope(
+            root.path(),
+            root.path(),
+            &options
+        ));
+        assert!(directory_is_in_discovery_scope(
+            &root.path().join("one/two"),
+            root.path(),
+            &options
+        ));
+        assert!(!directory_is_in_discovery_scope(
+            &root.path().join("one/two/three"),
+            root.path(),
+            &options
+        ));
+        assert!(!directory_is_in_discovery_scope(
+            &root.path().join(".hidden/repo"),
+            root.path(),
+            &options
+        ));
+        assert!(!directory_is_in_discovery_scope(
+            &root.path().join("node_modules/repo"),
+            root.path(),
+            &options
+        ));
+
+        let include_hidden = ScanOptions {
+            include_hidden: true,
+            ..options
+        };
+        assert!(directory_is_in_discovery_scope(
+            &root.path().join(".hidden/repo"),
+            root.path(),
+            &include_hidden
+        ));
     }
 
     #[test]

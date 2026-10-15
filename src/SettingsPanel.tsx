@@ -43,6 +43,7 @@ export function SettingsPanel() {
         providerSelection: settings.providerSelection,
         githubAccounts: settings.githubAccounts,
         selectedGithubAccountId: settings.selectedGithubAccountId,
+        typesafeProfile: settings.typesafeProfile,
       });
       setSettings(saved);
       setSaveState("saved");

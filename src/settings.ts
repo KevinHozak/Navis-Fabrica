@@ -15,9 +15,11 @@ export type Settings = {
   providerSelection: ProviderSelection;
   githubAccounts: GitHubAccount[];
   selectedGithubAccountId: string | null;
+  typesafeProfile: TypeSafeProfile | null;
 };
 
 export type GitHubAccount = { id: string; login: string; credentialRef: string | null };
+export type TypeSafeProfile = { id: string; enabled: boolean; credentialRef: string | null };
 
 export type SettingsInput = Omit<Settings, "schemaVersion">;
 
@@ -114,6 +116,7 @@ export type OllamaModel = { id: string; sizeBytes: number; contextTokens: number
 export type OllamaProbe = { state: "ready" | "unavailable"; endpoint: string; models: OllamaModel[]; availableMemoryBytes: number | null; note: string };
 export type OpenRouterModel = { id: string; name: string; contextLength: number | null; promptPrice: string | null; completionPrice: string | null; inputModalities: string[] | null; outputModalities: string[] | null; supportedParameters: string[] | null };
 export type OpenRouterProbe = { state: "ready" | "authenticationRequired" | "rateLimited" | "unavailable"; models: OpenRouterModel[]; note: string };
+export type TypeSafeProbe = { state: "disabled" | "unconfigured" | "healthy" | "authenticationFailed" | "rateLimited" | "unavailable"; model: "jev-1.14.0"; note: string };
 
 export type ProjectEntry = {
   id: string;
@@ -227,7 +230,7 @@ export type ProjectScanFinished = {
 };
 
 export const defaultSettings: Settings = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   projectRoot: "C:\\Projects",
   exclusions: [".git", ".worktrees", "node_modules", "target"],
   preferences: { includeHidden: false, scanDepth: 3 },
@@ -235,6 +238,7 @@ export const defaultSettings: Settings = {
   providerSelection: { providerId: null, modelId: null, reasoningEffort: null, runtimeId: null },
   githubAccounts: [],
   selectedGithubAccountId: null,
+  typesafeProfile: null,
 };
 
 const previewStorageKey = "navis-fabrica.settings.v1";
@@ -281,6 +285,9 @@ export const saveOpenRouterCredential = (providerId: string, apiKey: string) =>
   invoke<Settings>("save_openrouter_credential", { providerId, apiKey });
 export const probeOpenRouter = (providerId: string) =>
   invoke<OpenRouterProbe>("probe_openrouter", { providerId });
+export const saveTypeSafeCredential = (profileId: string, apiKey: string) =>
+  invoke<Settings>("save_typesafe_credential", { profileId, apiKey });
+export const probeTypeSafe = () => invoke<TypeSafeProbe>("probe_typesafe");
 export const listUsageSignals = () => invoke<UsageSignal[]>("list_usage_signals");
 export const recordManualUsageEstimate = (estimate: {
   category: UsageCategory;
@@ -365,7 +372,7 @@ export async function loadSettings(): Promise<Settings> {
     if (!parsed || typeof parsed !== "object") return defaultSettings;
     const candidate = parsed as Partial<Settings>;
     return {
-      schemaVersion: 2,
+      schemaVersion: 4,
       projectRoot: typeof candidate.projectRoot === "string" ? candidate.projectRoot : defaultSettings.projectRoot,
       exclusions: Array.isArray(candidate.exclusions) && candidate.exclusions.every((item) => typeof item === "string")
         ? candidate.exclusions
@@ -382,6 +389,9 @@ export async function loadSettings(): Promise<Settings> {
         : defaultSettings.providerSelection,
       githubAccounts: Array.isArray(candidate.githubAccounts) ? candidate.githubAccounts : defaultSettings.githubAccounts,
       selectedGithubAccountId: typeof candidate.selectedGithubAccountId === "string" ? candidate.selectedGithubAccountId : null,
+      typesafeProfile: candidate.typesafeProfile && typeof candidate.typesafeProfile === "object"
+        ? candidate.typesafeProfile
+        : null,
     };
   } catch {
     return defaultSettings;
@@ -392,13 +402,19 @@ export async function saveSettings(settings: SettingsInput): Promise<Settings> {
   if (isDesktopApp()) return invoke<Settings>("save_settings", { settings });
 
   validatePreviewSecretReferences(settings.providers);
+  if (settings.typesafeProfile) {
+    const { id, credentialRef } = settings.typesafeProfile;
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id) || (credentialRef !== null && credentialRef !== `credential-store:navis-fabrica-typesafe-${id}`)) {
+      throw new Error("The TypeSafe credential reference must be an opaque reference bound to its profile.");
+    }
+  }
   for (const account of settings.githubAccounts) {
     const reference = account.credentialRef;
     if (reference != null && !/^(credential-store|provider-managed):[a-zA-Z0-9.:/_-]+$/.test(reference)) {
       throw new Error("Use an opaque credential-store: or provider-managed: reference; tokens are not accepted.");
     }
   }
-  const saved = { schemaVersion: 3, ...settings };
+  const saved = { schemaVersion: 4, ...settings };
   localStorage.setItem(previewStorageKey, JSON.stringify(saved));
   return saved;
 }

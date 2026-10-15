@@ -14,6 +14,8 @@
     "allow-probe-ollama",
     "allow-save-openrouter-credential",
     "allow-probe-openrouter",
+    "allow-save-typesafe-credential",
+    "allow-probe-typesafe",
     "allow-start-openrouter-workflow-run",
     "allow-create-provider-handoff",
     "allow-start-ollama-workflow-run",

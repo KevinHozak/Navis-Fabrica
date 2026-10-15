@@ -58,6 +58,146 @@ pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub const OPENROUTER_MAX_MODELS: usize = 500;
 pub const OPENROUTER_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+pub const TYPESAFE_API_BASE: &str = "https://api.typesafe.ai/v1";
+pub const TYPESAFE_JEV_MODEL: &str = "jev-1.14.0";
+pub const TYPESAFE_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeSafeProfile {
+    pub id: String,
+    pub enabled: bool,
+    pub credential_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeSafeProbe {
+    pub state: String,
+    pub model: String,
+    pub note: String,
+}
+
+pub fn typesafe_credential_target(profile_id: &str) -> Result<String, String> {
+    if profile_id.is_empty()
+        || profile_id.len() > 80
+        || !profile_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+    {
+        return Err("The TypeSafe profile ID is invalid.".into());
+    }
+    Ok(format!("navis-fabrica-typesafe-{profile_id}"))
+}
+
+pub fn typesafe_credential_reference_matches(profile_id: &str, reference: &str) -> bool {
+    typesafe_credential_target(profile_id)
+        .map(|target| reference == format!("credential-store:{target}"))
+        .unwrap_or(false)
+}
+
+pub fn valid_typesafe_key(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
+}
+
+pub fn typesafe_probe_with<F>(
+    enabled: bool,
+    profile_id: &str,
+    credential_ref: Option<&str>,
+    api_key: Option<&str>,
+    request: F,
+) -> TypeSafeProbe
+where
+    F: FnOnce(&str) -> Result<Value, u16>,
+{
+    let result = |state: &str, note: &str| TypeSafeProbe {
+        state: state.into(),
+        model: TYPESAFE_JEV_MODEL.into(),
+        note: note.into(),
+    };
+    if !enabled {
+        return result(
+            "disabled",
+            "Enable the TypeSafe profile to check its connection.",
+        );
+    }
+    let Some(reference) = credential_ref else {
+        return result(
+            "unconfigured",
+            "Save a TypeSafe API key in Windows Credential Manager first.",
+        );
+    };
+    if !typesafe_credential_reference_matches(profile_id, reference) {
+        return result(
+            "unconfigured",
+            "The TypeSafe credential reference is invalid for this profile. Save the key again.",
+        );
+    }
+    let Some(key) = api_key.filter(|value| valid_typesafe_key(value)) else {
+        return result(
+            "unconfigured",
+            "The TypeSafe credential is unavailable. Save the key again.",
+        );
+    };
+    match request(key) {
+        Ok(value) => {
+            let model_available = value
+                .get("models")
+                .and_then(Value::as_array)
+                .is_some_and(|models| models.iter().any(|item| item.get("name").and_then(Value::as_str) == Some(TYPESAFE_JEV_MODEL)));
+            if model_available {
+                result("healthy", "TypeSafe is reachable and the pinned Jev model is available.")
+            } else {
+                result("unavailable", "TypeSafe did not report the pinned Jev model for this account.")
+            }
+        }
+        Err(401 | 403) => result("authenticationFailed", "TypeSafe rejected the saved API key. Check its validity and access."),
+        Err(429) => result("rateLimited", "TypeSafe rate limited the health check. Try again later."),
+        Err(_) => result("unavailable", "TypeSafe health check failed or timed out. The response was omitted to protect credentials."),
+    }
+}
+
+pub fn typesafe_http_probe(profile: &TypeSafeProfile, api_key: Option<&str>) -> TypeSafeProbe {
+    typesafe_probe_with(
+        profile.enabled,
+        &profile.id,
+        profile.credential_ref.as_deref(),
+        api_key,
+        |key| {
+            let client = reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| 0u16)?;
+            let response = client
+                .get(format!("{TYPESAFE_API_BASE}/models"))
+                .bearer_auth(key)
+                .send()
+                .map_err(|_| 0u16)?;
+            if !response.status().is_success() {
+                return Err(response.status().as_u16());
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > TYPESAFE_MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(0);
+            }
+            let mut bytes = Vec::new();
+            response
+                .take(TYPESAFE_MAX_RESPONSE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| 0u16)?;
+            if bytes.len() > TYPESAFE_MAX_RESPONSE_BYTES {
+                return Err(0);
+            }
+            serde_json::from_slice(&bytes).map_err(|_| 0u16)
+        },
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenRouterModel {
@@ -1665,5 +1805,97 @@ mod tests {
             quality_rating: None,
         });
         assert!(validate_profiles(&[provider], &ProviderSelection::default()).is_err());
+    }
+
+    #[test]
+    fn typesafe_credentials_are_bound_to_profile_and_never_serialized_as_keys() {
+        let reference = "credential-store:navis-fabrica-typesafe-jev-main";
+        assert_eq!(
+            typesafe_credential_target("jev-main").unwrap(),
+            "navis-fabrica-typesafe-jev-main"
+        );
+        assert!(typesafe_credential_reference_matches("jev-main", reference));
+        assert!(!typesafe_credential_reference_matches("other", reference));
+        assert!(!typesafe_credential_reference_matches("../key", reference));
+        assert!(valid_typesafe_key("ts_live_example"));
+        assert!(!valid_typesafe_key("key\nvalue"));
+        let profile = TypeSafeProfile {
+            id: "jev-main".into(),
+            enabled: true,
+            credential_ref: Some(reference.into()),
+        };
+        let serialized = serde_json::to_string(&profile).unwrap();
+        assert!(serialized.contains(reference));
+        assert!(!serialized.contains("ts_live_example"));
+    }
+
+    #[test]
+    fn typesafe_probe_covers_profile_and_service_states_without_leaking() {
+        let profile_id = "jev-main";
+        let reference = "credential-store:navis-fabrica-typesafe-jev-main";
+        let disabled =
+            typesafe_probe_with(false, profile_id, Some(reference), Some("secret"), |_| {
+                panic!("disabled profile must not make a request")
+            });
+        assert_eq!(disabled.state, "disabled");
+        let missing = typesafe_probe_with(true, profile_id, None, None, |_| {
+            panic!("missing credential must not make a request")
+        });
+        assert_eq!(missing.state, "unconfigured");
+        let mismatched = typesafe_probe_with(
+            true,
+            profile_id,
+            Some("credential-store:github-token"),
+            Some("secret"),
+            |_| panic!("mismatched credential must not be looked up or requested"),
+        );
+        assert_eq!(mismatched.state, "unconfigured");
+
+        let healthy = typesafe_probe_with(
+            true,
+            profile_id,
+            Some(reference),
+            Some("ts_live_example"),
+            |key| {
+                assert_eq!(key, "ts_live_example");
+                Ok(json!({"models":[{"name":"jev-1.14.0"}]}))
+            },
+        );
+        assert_eq!(healthy.state, "healthy");
+        assert_eq!(healthy.model, "jev-1.14.0");
+
+        for (status, expected) in [
+            (401, "authenticationFailed"),
+            (403, "authenticationFailed"),
+            (429, "rateLimited"),
+            (0, "unavailable"),
+        ] {
+            let probe = typesafe_probe_with(
+                true,
+                profile_id,
+                Some(reference),
+                Some("ts_live_example"),
+                |_| Err(status),
+            );
+            assert_eq!(probe.state, expected);
+            assert!(!probe.note.contains("ts_live_example"));
+        }
+        let malformed = typesafe_probe_with(
+            true,
+            profile_id,
+            Some(reference),
+            Some("ts_live_example"),
+            |_| Ok(json!({"error":"ts_live_example"})),
+        );
+        assert_eq!(malformed.state, "unavailable");
+        assert!(!malformed.note.contains("ts_live_example"));
+        let unavailable_model = typesafe_probe_with(
+            true,
+            profile_id,
+            Some(reference),
+            Some("ts_live_example"),
+            |_| Ok(json!({"models":[{"name":"jev-latest"}]})),
+        );
+        assert_eq!(unavailable_model.state, "unavailable");
     }
 }

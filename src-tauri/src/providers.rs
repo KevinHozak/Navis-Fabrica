@@ -158,6 +158,12 @@ pub fn openrouter_credential_target(provider_id: &str) -> Result<String, String>
     Ok(format!("navis-fabrica-openrouter-{provider_id}"))
 }
 
+pub fn openrouter_credential_reference_matches(provider_id: &str, reference: &str) -> bool {
+    openrouter_credential_target(provider_id)
+        .map(|target| reference == format!("credential-store:{target}"))
+        .unwrap_or(false)
+}
+
 pub fn aider_openrouter_arguments(
     model_id: &str,
     prompt_file: &str,
@@ -1109,15 +1115,22 @@ pub fn validate_profiles(
         }) {
             return Err("Use an opaque reference such as credential-store:provider-name; secret values are not accepted.".into());
         }
-        if profile.models.len() > 200 {
-            return Err("Configure 200 or fewer manual model profiles per provider.".into());
+        let (model_limit, model_name_limit) = if profile.kind == ProviderKind::OpenRouter {
+            (OPENROUTER_MAX_MODELS, 160)
+        } else {
+            (200, 100)
+        };
+        if profile.models.len() > model_limit {
+            return Err(format!(
+                "Configure {model_limit} or fewer model profiles per provider."
+            ));
         }
         let mut model_ids = Vec::new();
         for model in &profile.models {
             if model.id.trim().is_empty()
                 || model.id.len() > 160
                 || model.name.trim().is_empty()
-                || model.name.len() > 100
+                || model.name.len() > model_name_limit
                 || model.id.chars().any(char::is_control)
                 || model.name.chars().any(char::is_control)
             {
@@ -1540,6 +1553,18 @@ mod tests {
             "navis-fabrica-openrouter-openRouter-a1b2"
         );
         assert!(openrouter_credential_target("../key").is_err());
+        assert!(openrouter_credential_reference_matches(
+            "openRouter-a1b2",
+            "credential-store:navis-fabrica-openrouter-openRouter-a1b2"
+        ));
+        assert!(!openrouter_credential_reference_matches(
+            "openRouter-a1b2",
+            "credential-store:github-session"
+        ));
+        assert!(!openrouter_credential_reference_matches(
+            "openRouter-a1b2",
+            "provider-managed:navis-fabrica-openrouter-openRouter-a1b2"
+        ));
         assert!(valid_openrouter_key("sk-or-v1-value"));
         assert!(!valid_openrouter_key("bad\nkey"));
         let args =
@@ -1549,5 +1574,29 @@ mod tests {
             .any(|pair| pair == ["--model", "openrouter/vendor/model"]));
         assert!(args.windows(2).any(|pair| pair == ["--env-file", "NUL"]));
         assert!(!args.iter().any(|arg| arg.contains("sk-or-")));
+    }
+
+    #[test]
+    fn openrouter_catalog_limit_matches_settings_validation() {
+        let models: Vec<ModelProfile> = (0..OPENROUTER_MAX_MODELS)
+            .map(|index| ModelProfile {
+                id: format!("model-{index}"),
+                name: format!("Model {index}"),
+                reasoning_efforts: Vec::new(),
+            })
+            .collect();
+        let mut provider = profile();
+        provider.id = "openRouter-a1b2".into();
+        provider.kind = ProviderKind::OpenRouter;
+        provider.secret_ref =
+            Some("credential-store:navis-fabrica-openrouter-openRouter-a1b2".into());
+        provider.models = models;
+        assert!(validate_profiles(&[provider.clone()], &ProviderSelection::default()).is_ok());
+        provider.models.push(ModelProfile {
+            id: "model-over-limit".into(),
+            name: "Model over limit".into(),
+            reasoning_efforts: Vec::new(),
+        });
+        assert!(validate_profiles(&[provider], &ProviderSelection::default()).is_err());
     }
 }

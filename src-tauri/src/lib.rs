@@ -259,6 +259,14 @@ fn resolve_github_credential(reference: &str) -> Option<String> {
     }
 }
 
+fn resolve_openrouter_credential(provider_id: &str, reference: Option<&str>) -> Option<String> {
+    let reference = reference?;
+    if !providers::openrouter_credential_reference_matches(provider_id, reference) {
+        return None;
+    }
+    resolve_github_credential(reference)
+}
+
 fn store_openrouter_credential(target: &str, secret: &str) -> Result<(), String> {
     if !providers::valid_openrouter_key(secret) {
         return Err("Enter a valid OpenRouter API key.".into());
@@ -926,10 +934,7 @@ fn probe_openrouter(
     if profile.kind != providers::ProviderKind::OpenRouter {
         return Err("Choose an OpenRouter provider to probe.".into());
     }
-    let key = profile
-        .secret_ref
-        .as_deref()
-        .and_then(resolve_github_credential)
+    let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref())
         .unwrap_or_default();
     Ok(providers::openrouter_http_probe(&key))
 }
@@ -976,7 +981,7 @@ fn start_openrouter_workflow_run(
         return Err(probe.note);
     }
     let model = probe.models.iter().find(|model| model.id == model_id).ok_or("The selected model is no longer available from OpenRouter. Refresh the catalog and choose a model explicitly.")?;
-    let key = profile.secret_ref.as_deref().and_then(resolve_github_credential).ok_or("The OpenRouter credential reference is missing or unavailable. Save the key again in Providers.")?;
+    let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref()).ok_or("The OpenRouter credential reference is missing, mismatched, or unavailable. Save the key again in Providers.")?;
     let path = std::env::var_os("PATH");
     let executable = providers::find_executable(&profile.executable, path.as_deref())
         .ok_or("The configured Aider executable is not available on PATH or at its saved path.")?;
@@ -1598,6 +1603,16 @@ fn record_manual_usage_estimate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openrouter_credential_resolution_rejects_another_profiles_reference() {
+        assert!(resolve_openrouter_credential(
+            "openRouter-a1b2",
+            Some("credential-store:github-session")
+        )
+        .is_none());
+        assert!(resolve_openrouter_credential("openRouter-a1b2", None).is_none());
+    }
 
     #[test]
     fn refuses_to_restore_authenticated_activity_without_a_usable_credential() {

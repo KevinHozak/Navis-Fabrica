@@ -40,6 +40,7 @@ requireValue(bundle.icon?.includes("icons/icon.ico") && bundle.icon?.includes("i
 requireValue(bundle.windows?.nsis?.installMode === "currentUser", "NSIS must default to a per-user installation.");
 requireValue(bundle.windows?.webviewInstallMode?.type === "downloadBootstrapper", "WebView2 setup must use the documented bootstrapper mode.");
 requireValue(bundle.windows?.webviewInstallMode?.silent === true, "WebView2 bootstrapper invocation must be silent.");
+requireValue(tauri.app?.windows?.some((window) => window.title === `Navis-Fabrica · v${tauri.version}`), "The native window title must match the application release version.");
 requireValue(bundle.createUpdaterArtifacts !== true, "Updater artifacts must remain disabled until the update strategy is separately approved.");
 requireValue(bundle.windows?.certificateThumbprint == null && bundle.windows?.signCommand == null, "Release artifacts must not imply configured code signing.");
 requireValue(tauri.identifier === "com.navis.fabrica", "Changing the application identifier would change the per-user data namespace.");

@@ -10,10 +10,15 @@ $executable = Get-ChildItem $releaseDirectory -Filter "*.exe" -File | Where-Obje
     $_.BaseName -eq "navis-fabrica"
 } | Select-Object -First 1
 $installerDirectory = Join-Path $releaseDirectory "bundle\nsis"
-$installer = Get-ChildItem $installerDirectory -Filter "*-setup.exe" -File | Select-Object -First 1
+$installerPattern = "_" + [regex]::Escape($version) + "_.*-setup\.exe$"
+$installers = @(Get-ChildItem $installerDirectory -Filter "*-setup.exe" -File | Where-Object {
+    $_.Name -match $installerPattern
+})
+$installer = $installers | Select-Object -First 1
 
 if (-not $executable) { throw "The release executable was not found under $releaseDirectory." }
-if (-not $installer) { throw "The NSIS setup executable was not found under $installerDirectory." }
+if ($installers.Count -eq 0) { throw "No NSIS setup executable for version $version was found under $installerDirectory." }
+if ($installers.Count -gt 1) { throw "Found multiple NSIS setup executables for version $version under $installerDirectory; expected one artifact." }
 
 foreach ($artifact in @($executable, $installer)) {
     $metadata = $artifact.VersionInfo

@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { GitHubIssue, ProjectEntry, WorkflowRunMetadata } from "./settings";
 import {
-  cancelWorkflowRun, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
-  loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
+  cancelWorkflowRun, createProviderHandoff, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
+  loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
 } from "./settings";
 
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
@@ -26,6 +26,14 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [respondedRequests, setRespondedRequests] = useState<Set<string>>(() => new Set());
   const [codexAnswers, setCodexAnswers] = useState<Record<string, Record<string, string>>>({});
   const [selectedProviderKind, setSelectedProviderKind] = useState<string | null>(null);
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [ollamaTestCommand, setOllamaTestCommand] = useState("");
+  const [handoffSourceRunId, setHandoffSourceRunId] = useState<string | null>(null);
+  const [handoffGoal, setHandoffGoal] = useState("");
+  const [handoffScope, setHandoffScope] = useState("");
+  const [handoffDiff, setHandoffDiff] = useState("");
+  const [handoffChecks, setHandoffChecks] = useState("");
+  const [handoffPending, setHandoffPending] = useState("");
   const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push" | "dev-build">("dev-work");
   const [buildProfile, setBuildProfile] = useState<"release" | "debug">("release");
   const [workflowIntent, setWorkflowIntent] = useState("");
@@ -57,7 +65,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   }, []);
 
   useEffect(() => setCwd(defaultCwd), [defaultCwd]);
-  useEffect(() => { loadSettings().then((settings) => setSelectedProviderKind(settings.providers.find((provider) => provider.id === settings.providerSelection.providerId)?.kind ?? null)).catch(() => setSelectedProviderKind(null)); }, []);
+  useEffect(() => { loadSettings().then((settings) => { const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId); setSelectedProviderKind(provider?.kind ?? null); setSelectedProviderId(provider?.id ?? null); }).catch(() => { setSelectedProviderKind(null); setSelectedProviderId(null); }); }, []);
   useEffect(() => { discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
   const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0] ?? null, [runs, selectedId]);
 
@@ -66,12 +74,36 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     setError("");
     setBusy(true);
     try {
-      const run = selectedProviderKind === "antigravity"
-        ? await startAntigravityWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, timeoutSeconds: codexTimeout })
-        : await startCodexWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, skillId: codexSkill || null, timeoutSeconds: codexTimeout });
+      const settings = await loadSettings();
+      const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId);
+      const sourceId = handoffSourceRunId;
+      const run = provider?.kind === "ollama"
+        ? await startOllamaWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, testCommand: ollamaTestCommand.trim() || null, handoffSourceRunId: sourceId })
+        : provider?.kind === "antigravity"
+          ? await startAntigravityWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, timeoutSeconds: codexTimeout, handoffSourceRunId: sourceId })
+          : await startCodexWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, skillId: codexSkill || null, timeoutSeconds: codexTimeout, handoffSourceRunId: sourceId });
       setRuns((items) => [run, ...items.filter((item) => item.id !== run.id)].slice(0, 100));
       setSelectedId(run.id);
       setCodexPrompt("");
+      setHandoffSourceRunId(null);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusy(false); }
+  }
+
+  async function createHandoff(event: FormEvent) {
+    event.preventDefault();
+    if (!selected) { setError("Choose a completed source run before preparing the handoff."); return; }
+    setBusy(true); setError("");
+    try {
+      const currentSettings = await loadSettings();
+      const targetProviderId = currentSettings.providerSelection.providerId;
+      if (!targetProviderId) throw new Error("Choose a target provider in Providers before preparing the handoff.");
+      setSelectedProviderId(targetProviderId);
+      const packet = await createProviderHandoff({ sourceRunId: selected.id, targetProviderId, goal: handoffGoal, scope: handoffScope, diff: handoffDiff, checks: handoffChecks, pendingWork: handoffPending });
+      setHandoffSourceRunId(packet.sourceRunId);
+      setCodexPrompt("Continue this work from the explicit handoff packet. Verify the saved state, continue only with pending work, and do not repeat recorded remote effects.");
+      setRuns((items) => items.map((run) => run.id === selected.id ? { ...run, handoff: packet } : run));
+      setError("Handoff saved. Review the target provider and press Start to switch manually.");
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
   }
@@ -217,19 +249,20 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
     <section className="panel run-launch-panel" aria-labelledby="codex-run-title">
-      <div className="panel-heading"><div><h2 id="codex-run-title">Start {selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"} in this project</h2><p>Uses the selected provider and model, plus settings supported by that runtime.</p></div></div>
+      <div className="panel-heading"><div><h2 id="codex-run-title">Start {selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : "Codex"} in this project</h2><p>Uses the selected provider and model, plus settings supported by that runtime.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgent(event); }}>
         <label>Project scope<input value={defaultCwd} readOnly aria-readonly="true" /></label>
-        {selectedProviderKind !== "antigravity" && <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
+        {selectedProviderKind === "codex" && <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
           <option value="">No skill</option>{skills.filter((skill) => skill.status === "available" && skill.compatibleAgents.includes("Codex")).map((skill) => <option key={skill.id} value={skill.id}>{skill.id}</option>)}
         </select></label>}
         {selectedProviderKind === "antigravity" && <p className="registry-context-note">Antigravity CLI discovers workspace skills from .agents/skills and global CLI skills. Headless runs cannot pause for approvals or input; terminal tools run with the CLI sandbox. Structured progress and reasoning-effort options are unavailable in the installed CLI version.</p>}
+        {selectedProviderKind === "ollama" && <><label>Test command (optional)<input value={ollamaTestCommand} maxLength={2048} onChange={(event) => setOllamaTestCommand(event.target.value)} placeholder="e.g. npm test or cargo test" /><small>Aider runs this command after edits when configured. It runs inside the selected project and may modify files.</small></label><p className="registry-context-note">Only a discovered local model with reported tool support and at least 8,192 context tokens can start. Timeout is calculated from available system memory and model size. The run is pinned to loopback and cannot commit changes automatically.</p></>}
         <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder={`Describe the work for ${selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"}…`} /></label>
         <div className="run-launch-options">
-          <label>Timeout (seconds)<input type="number" min={1} max={86400} value={codexTimeout} onChange={(event) => setCodexTimeout(Number(event.target.value))} /></label>
-          <p className="registry-context-note">{selectedProviderKind === "antigravity" ? "Git projects must have a clean worktree. The headless CLI cannot pause for approvals; tool permissions follow Antigravity CLI settings and sandbox policy." : "Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision."}</p>
-          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim() || !["codex", "antigravity"].includes(selectedProviderKind ?? "")}>{busy ? "Starting…" : `Start ${selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"}`}</button>
+          {selectedProviderKind !== "ollama" && <label>Timeout (seconds)<input type="number" min={1} max={86400} value={codexTimeout} onChange={(event) => setCodexTimeout(Number(event.target.value))} /></label>}
+          <p className="registry-context-note">{selectedProviderKind === "antigravity" ? "Git projects must have a clean worktree. The headless CLI cannot pause for approvals; tool permissions follow Antigravity CLI settings and sandbox policy." : selectedProviderKind === "ollama" ? "Git projects must have a clean worktree. Select a discovered eligible model in Providers before starting." : "Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision."}</p>
+          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim() || !["codex", "antigravity", "ollama"].includes(selectedProviderKind ?? "")}>{busy ? "Starting…" : `Start ${selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : "Codex"}`}</button>
         </div>
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
@@ -262,7 +295,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           {selected && activeStates.has(selected.state) && <button className="button button-secondary" type="button" onClick={() => { void cancel(selected.id); }}>Cancel run</button>}
         </div><div className="panel-rule" />
         {selected ? <>
-          <p className="registry-context-note">Started {new Date(selected.startedAtMs).toLocaleString()}{selected.finishedAtMs !== null ? ` · finished ${new Date(selected.finishedAtMs).toLocaleString()}` : " · in progress"}{selected.latencyMs !== null ? ` · measured latency ${(selected.latencyMs / 1000).toFixed(1)} s` : ""}{selected.provider ? ` · ${selected.provider}` : ""}{selected.modelId ? ` / ${selected.modelId}` : ""}</p>
+          <p className="registry-context-note">Started {new Date(selected.startedAtMs).toLocaleString()}{selected.finishedAtMs !== null ? ` · finished ${new Date(selected.finishedAtMs).toLocaleString()}` : " · in progress"}{selected.latencyMs !== null ? ` · measured latency ${(selected.latencyMs / 1000).toFixed(1)} s` : ""}{selected.provider ? ` · ${selected.provider}` : ""}{selected.modelId ? ` / ${selected.modelId}` : ""}{selected.provider === "ollama" ? ` · hardware-aware timeout ${selected.timeoutSeconds}s` : ""}</p>
           {selected.workflow && <div className="work-context"><strong>Recorded action scope</strong><p>{selected.workflow.intent}</p>{selected.workflow.issueUrl && <a href={selected.workflow.issueUrl} target="_blank" rel="noreferrer">Issue context ↗</a>}{selected.workflow.scopePaths.length > 0 && <ul>{selected.workflow.scopePaths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>}<small>Requested effects: {selected.workflow.requestedEffects.length ? selected.workflow.requestedEffects.join(", ") : "none"}</small></div>}
           <pre className="run-output" aria-live="polite">{selected.events.map((item) => `[${item.sequence}] ${item.kind}: ${item.text}`).join("\n") || "Waiting for process output…"}</pre>
           {selected.workflow?.buildArtifact && <p className="registry-context-note">{selected.workflow.buildArtifact.verified ? "Artifact verified: " : "Artifact receipt unverified: "}{selected.workflow.buildArtifact.profile.toUpperCase()}{selected.workflow.buildArtifact.profile === "debug" ? " (DEBUG BUILD)" : " (RELEASE)"} · FileVersion {selected.workflow.buildArtifact.fileVersion} · ProductVersion {selected.workflow.buildArtifact.productVersion} · <code>{selected.workflow.buildArtifact.path}</code> · {selected.workflow.buildArtifact.verificationMessage}</p>}
@@ -270,6 +303,15 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           {selected.workflow?.action === "dev-build" && selected.state === "interrupted" && selected.processId !== null && <p className="registry-context-note">The previous build process (PID {selected.processId}) is still running. Retry will appear after it exits.</p>}
           {selected.workflow?.action === "dev-build" && selected.processId === null && ["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state) && <button className="button button-secondary" type="button" disabled={busy || selectedProviderKind !== "codex"} onClick={() => { void retryBuild(); }}>Retry build safely</button>}
           {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
+          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}</div>}
+          {selected.finishedAtMs !== null && !activeStates.has(selected.state) && <details className="work-context"><summary>Prepare a manual provider handoff</summary><p>Creates a saved checkpoint for the currently selected target provider. The next run starts only when you press Start.</p><form className="run-launch-form" onSubmit={(event) => { void createHandoff(event); }}>
+            <label>Goal<input required maxLength={8000} value={handoffGoal} onChange={(event) => setHandoffGoal(event.target.value)} /></label>
+            <label>Scope<textarea required rows={2} maxLength={8000} value={handoffScope} onChange={(event) => setHandoffScope(event.target.value)} /></label>
+            <label>Current diff<textarea required rows={3} maxLength={8000} value={handoffDiff} onChange={(event) => setHandoffDiff(event.target.value)} /></label>
+            <label>Checks and results<textarea required rows={2} maxLength={8000} value={handoffChecks} onChange={(event) => setHandoffChecks(event.target.value)} /></label>
+            <label>Pending work<textarea required rows={2} maxLength={8000} value={handoffPending} onChange={(event) => setHandoffPending(event.target.value)} /></label>
+            <button className="button button-secondary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save handoff checkpoint"}</button>
+          </form></details>}
           {selected.state === "needsInput" && selected.events.filter((item) => item.kind === "approvalRequest" || item.kind === "userInputRequest").map((item) => <CodexRequestCard key={`${item.sequence}-${item.kind}`} runId={selected.id} event={item} onResolved={(requestId) => setRespondedRequests((prior) => new Set(prior).add(requestId))} isResolved={(requestId) => respondedRequests.has(requestId)} />)}
           {selected.state === "needsInput" && selected.provider !== "codex" && selected.provider !== "antigravity" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>
             <label>Send process input (one line)<input value={input} onChange={(event) => setInput(event.target.value)} /></label>

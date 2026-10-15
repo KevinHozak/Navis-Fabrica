@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +28,7 @@ impl ProviderKind {
         match self {
             Self::Codex => "codex",
             Self::Antigravity => "agy",
-            Self::Ollama => "ollama",
+            Self::Ollama => "aider",
             Self::Custom => "",
         }
     }
@@ -48,6 +49,8 @@ pub struct ProviderProfile {
     pub kind: ProviderKind,
     pub name: String,
     pub executable: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
     pub secret_ref: Option<String>,
     pub models: Vec<ModelProfile>,
 }
@@ -114,6 +117,255 @@ pub struct AntigravityProbe {
     pub state: String,
     pub models: Vec<String>,
     pub note: String,
+}
+
+pub const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
+pub const OLLAMA_MIN_CONTEXT_TOKENS: u64 = 8_192;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaModel {
+    pub id: String,
+    pub size_bytes: u64,
+    pub context_tokens: Option<u64>,
+    pub tools_supported: bool,
+    pub eligible: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaProbe {
+    pub state: String,
+    pub endpoint: String,
+    pub models: Vec<OllamaModel>,
+    pub available_memory_bytes: Option<u64>,
+    pub note: String,
+}
+
+pub fn validate_ollama_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(endpoint.trim())
+        .map_err(|_| "Ollama must use a valid local HTTP endpoint.".to_string())?;
+    let loopback = url
+        .host_str()
+        .and_then(|host| {
+            host.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host)
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|address| address.is_loopback());
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || (url.path() != "" && url.path() != "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Ollama profiles are local-only: use HTTP with a numeric loopback address and port, without credentials or a URL path.".into());
+    }
+    Ok(url)
+}
+
+pub fn ollama_models_from_responses(tags: &Value, details: &[(String, Value)]) -> Vec<OllamaModel> {
+    let detail_by_id = details
+        .iter()
+        .map(|(id, value)| (id.as_str(), value))
+        .collect::<std::collections::HashMap<_, _>>();
+    tags.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item
+                .get("name")
+                .or_else(|| item.get("model"))
+                .and_then(Value::as_str)?;
+            if id.trim().is_empty() || id.len() > 160 || id.chars().any(char::is_control) {
+                return None;
+            }
+            let detail = detail_by_id.get(id).copied();
+            let info = detail.and_then(|value| value.get("model_info"));
+            let context_tokens = info.and_then(|value| {
+                value.as_object()?.iter().find_map(|(key, value)| {
+                    key.ends_with(".context_length")
+                        .then(|| value.as_u64())
+                        .flatten()
+                })
+            });
+            let tools_supported = detail
+                .and_then(|value| value.get("capabilities"))
+                .and_then(Value::as_array)
+                .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("tools")));
+            let eligible = tools_supported
+                && context_tokens.is_some_and(|value| value >= OLLAMA_MIN_CONTEXT_TOKENS);
+            let note = if !tools_supported {
+                "Ollama did not report tool-calling support for this model.".into()
+            } else if context_tokens.is_none() {
+                "Model context length is unknown; this model cannot be selected for agent work."
+                    .into()
+            } else if context_tokens.is_some_and(|value| value < OLLAMA_MIN_CONTEXT_TOKENS) {
+                "Model context is below the 8,192-token minimum for agent work.".into()
+            } else {
+                "Tool calling and the minimum agent context were reported by Ollama.".into()
+            };
+            Some(OllamaModel {
+                id: id.into(),
+                size_bytes: item.get("size").and_then(Value::as_u64).unwrap_or(0),
+                context_tokens,
+                tools_supported,
+                eligible,
+                note,
+            })
+        })
+        .take(50)
+        .collect()
+}
+
+pub fn ollama_probe(endpoint: &str) -> OllamaProbe {
+    let normalized = match validate_ollama_endpoint(endpoint) {
+        Ok(url) => url,
+        Err(message) => {
+            return OllamaProbe {
+                state: "unavailable".into(),
+                endpoint: endpoint.into(),
+                models: Vec::new(),
+                available_memory_bytes: available_memory_bytes(),
+                note: message,
+            }
+        }
+    };
+    let endpoint = normalized.as_str().trim_end_matches('/').to_owned();
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return OllamaProbe {
+                state: "unavailable".into(),
+                endpoint,
+                models: Vec::new(),
+                available_memory_bytes: available_memory_bytes(),
+                note: "Could not initialize the local Ollama health check.".into(),
+            }
+        }
+    };
+    let tags: Value = match client.get(format!("{endpoint}/api/tags")).send().and_then(|response| response.error_for_status()).and_then(|response| response.json()) {
+        Ok(value) => value,
+        Err(_) => return OllamaProbe { state: "unavailable".into(), endpoint, models: Vec::new(), available_memory_bytes: available_memory_bytes(), note: "Ollama is not reachable at the configured local endpoint, or its model-list request failed.".into() },
+    };
+    let model_ids = tags
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(50)
+        .filter_map(|item| {
+            item.get("name")
+                .or_else(|| item.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let details = std::thread::scope(|scope| {
+        let workers = model_ids.chunks(8).map(|models| {
+            let models = models.to_vec();
+            let client = client.clone();
+            let endpoint = endpoint.clone();
+            scope.spawn(move || {
+                models
+                    .into_iter()
+                    .filter_map(|id| {
+                        let value = client
+                            .post(format!("{endpoint}/api/show"))
+                            .json(&json!({ "model": id, "verbose": false }))
+                            .send()
+                            .and_then(|response| response.error_for_status())
+                            .and_then(|response| response.json::<Value>());
+                        value.ok().map(|value| (id, value))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        workers
+            .map(|worker| worker.join().unwrap_or_default())
+            .flatten()
+            .collect::<Vec<_>>()
+    });
+    let parsed = ollama_models_from_responses(&tags, &details);
+    let eligible = parsed.iter().filter(|model| model.eligible).count();
+    OllamaProbe {
+        state: "ready".into(), endpoint, models: parsed,
+        available_memory_bytes: available_memory_bytes(),
+        note: format!("Ollama is reachable. Up to 50 local models were inspected; {eligible} report tool support and at least {OLLAMA_MIN_CONTEXT_TOKENS} context tokens. Unknown capabilities remain ineligible."),
+    }
+}
+
+#[cfg(windows)]
+fn available_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.ullAvailPhys)
+}
+
+#[cfg(not(windows))]
+fn available_memory_bytes() -> Option<u64> {
+    None
+}
+
+pub fn ollama_timeout_seconds(
+    model_size_bytes: u64,
+    available_memory_bytes: Option<u64>,
+) -> Option<u64> {
+    let available = available_memory_bytes?;
+    if model_size_bytes == 0 || available == 0 {
+        return None;
+    }
+    let ratio = available as f64 / model_size_bytes as f64;
+    Some((1_200.0 / ratio.sqrt()).round().clamp(300.0, 3_600.0) as u64)
+}
+
+pub fn aider_ollama_arguments(
+    model_id: &str,
+    prompt_file: &str,
+    test_command: Option<&str>,
+    empty_env_file: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "--model".into(),
+        format!("ollama_chat/{model_id}"),
+        "--message-file".into(),
+        prompt_file.into(),
+        "--yes".into(),
+        "--no-auto-commits".into(),
+        "--no-gitignore".into(),
+        "--no-add-gitignore-files".into(),
+        "--no-analytics".into(),
+        "--no-check-update".into(),
+        "--no-restore-chat-history".into(),
+        "--no-suggest-shell-commands".into(),
+        "--no-stream".into(),
+        "--no-pretty".into(),
+        "--env-file".into(),
+        empty_env_file.into(),
+    ];
+    if let Some(test_command) = test_command.filter(|value| !value.trim().is_empty()) {
+        args.extend([
+            "--test-cmd".into(),
+            test_command.into(),
+            "--auto-test".into(),
+        ]);
+    }
+    args
 }
 
 pub fn probe_antigravity(executable: &Path) -> AntigravityProbe {
@@ -562,6 +814,15 @@ pub fn inspect(
             skill_support: true,
             ..AdapterCapabilities::local_preflight()
         },
+        ProviderKind::Ollama => AdapterCapabilities {
+            health: true,
+            model_listing: true,
+            run_start: true,
+            run_cancel: true,
+            event_stream: true,
+            checkpoints: true,
+            ..AdapterCapabilities::local_preflight()
+        },
         _ => AdapterCapabilities::local_preflight(),
     };
     ProviderAvailability {
@@ -582,6 +843,8 @@ pub fn inspect(
             "Codex app-server runs are supported with streamed output, on-request approvals, and user input. Authentication is checked when a run starts; this check never launches the provider.".into()
         } else if profile.kind == ProviderKind::Antigravity {
             "Antigravity uses the installed agy --print CLI with process output and cancellation. This version does not expose structured progress or reasoning-effort flags; model listing requires sign-in. Headless approvals, interactive input, and resumable checkpoints are unavailable.".into()
+        } else if profile.kind == ProviderKind::Ollama {
+            "Ollama discovery is restricted to a numeric loopback endpoint. Aider provides model-driven edits and configured test execution; model tool-call support and context are checked before runs. Portable handoff is explicit and does not resume completed side effects.".into()
         } else {
             "Executable presence is checked without launching it. Authentication validity and provider operations are not implemented by this adapter.".into()
         },
@@ -613,6 +876,22 @@ pub fn validate_profiles(
             return Err("Provider IDs must be unique.".into());
         }
         ids.push(profile.id.clone());
+        if profile.kind == ProviderKind::Ollama {
+            validate_ollama_endpoint(
+                profile
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or(OLLAMA_DEFAULT_ENDPOINT),
+            )?;
+            if profile.secret_ref.is_some() {
+                return Err(
+                    "Local-only Ollama profiles cannot store or use remote provider credentials."
+                        .into(),
+                );
+            }
+        } else if profile.endpoint.is_some() {
+            return Err("Only Ollama profiles may configure an endpoint.".into());
+        }
         if profile.executable.len() > 260 || profile.executable.chars().any(char::is_control) {
             return Err("Executable paths must be 260 characters or fewer and contain no control characters.".into());
         }
@@ -715,6 +994,7 @@ mod tests {
             kind: ProviderKind::Codex,
             name: "Codex Local".into(),
             executable: "codex".into(),
+            endpoint: None,
             secret_ref: Some("credential-store:codex-session".into()),
             models: vec![ModelProfile {
                 id: "model-a".into(),
@@ -811,6 +1091,84 @@ mod tests {
                 && !status.capabilities.interactive_input
                 && !status.capabilities.checkpoints
         );
+    }
+
+    #[test]
+    fn ollama_profiles_accept_only_credential_free_numeric_loopback_endpoints() {
+        assert!(validate_ollama_endpoint("http://127.0.0.1:11434").is_ok());
+        assert!(validate_ollama_endpoint("http://[::1]:11434").is_ok());
+        for endpoint in [
+            "https://127.0.0.1:11434",
+            "http://localhost:11434",
+            "http://192.168.1.5:11434",
+            "http://user:pass@127.0.0.1:11434",
+            "http://127.0.0.1:11434/api",
+        ] {
+            assert!(
+                validate_ollama_endpoint(endpoint).is_err(),
+                "accepted {endpoint}"
+            );
+        }
+        let mut local = profile();
+        local.kind = ProviderKind::Ollama;
+        local.secret_ref = None;
+        local.endpoint = Some("http://127.0.0.1:11434".into());
+        assert!(validate_profiles(&[local.clone()], &ProviderSelection::default()).is_ok());
+        local.secret_ref = Some("credential-store:cloud-key".into());
+        assert!(validate_profiles(&[local], &ProviderSelection::default()).is_err());
+    }
+
+    #[test]
+    fn ollama_model_discovery_requires_reported_tool_support_and_context() {
+        let tags = json!({"models": [
+            {"name": "agent-ready", "size": 8_000_000_000u64},
+            {"name": "no-tools", "size": 2_000_000_000u64},
+            {"name": "unknown-context", "size": 2_000_000_000u64}
+        ]});
+        let details = vec![
+            (
+                "agent-ready".into(),
+                json!({"capabilities": ["completion", "tools"], "model_info": {"model.context_length": 32768}}),
+            ),
+            (
+                "no-tools".into(),
+                json!({"capabilities": ["completion"], "model_info": {"model.context_length": 32768}}),
+            ),
+            (
+                "unknown-context".into(),
+                json!({"capabilities": ["completion", "tools"], "model_info": {}}),
+            ),
+        ];
+        let models = ollama_models_from_responses(&tags, &details);
+        assert_eq!(models.len(), 3);
+        assert!(models[0].eligible);
+        assert!(!models[1].eligible && !models[1].tools_supported);
+        assert!(!models[2].eligible && models[2].context_tokens.is_none());
+    }
+
+    #[test]
+    fn ollama_timeout_scales_with_available_memory_and_model_size() {
+        assert_eq!(
+            ollama_timeout_seconds(8_000_000_000, Some(8_000_000_000)),
+            Some(1200)
+        );
+        assert!(ollama_timeout_seconds(8_000_000_000, Some(2_000_000_000)).unwrap() > 1200);
+        assert_eq!(ollama_timeout_seconds(0, Some(8_000_000_000)), None);
+        assert_eq!(ollama_timeout_seconds(8_000_000_000, None), None);
+    }
+
+    #[test]
+    fn aider_invocation_pins_local_chat_model_and_disables_remote_side_effects() {
+        let args = aider_ollama_arguments("qwen3", "Change the module", Some("cargo test"), "NUL");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "ollama_chat/qwen3"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--test-cmd", "cargo test"]));
+        assert!(args.contains(&"--no-auto-commits".into()));
+        assert!(args.contains(&"--no-analytics".into()));
+        assert!(args.windows(2).any(|pair| pair == ["--env-file", "NUL"]));
     }
 
     #[test]

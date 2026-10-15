@@ -60,6 +60,8 @@ pub struct RunRecord {
     #[serde(default)]
     pub process_id: Option<u32>,
     pub mutating: bool,
+    #[serde(default)]
+    pub timeout_seconds: u64,
     pub state: String,
     pub started_at_ms: u128,
     pub finished_at_ms: Option<u128>,
@@ -70,6 +72,8 @@ pub struct RunRecord {
     pub events: Vec<RunEvent>,
     #[serde(default)]
     pub workflow: Option<WorkflowRunMetadata>,
+    #[serde(default)]
+    pub handoff: Option<ProviderHandoff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,7 +214,7 @@ fn verify_build_artifact_with(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowSideEffects {
     pub commit_sha: Option<String>,
@@ -220,6 +224,42 @@ pub struct WorkflowSideEffects {
     pub verified: bool,
     #[serde(default)]
     pub verification_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderHandoff {
+    pub version: u32,
+    pub source_run_id: String,
+    pub target_provider_id: String,
+    pub goal: String,
+    pub scope: String,
+    pub diff: String,
+    pub checks: String,
+    pub pending_work: String,
+    pub completed_side_effects: Option<WorkflowSideEffects>,
+    pub created_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandoffInput {
+    pub source_run_id: String,
+    pub target_provider_id: String,
+    pub goal: String,
+    pub scope: String,
+    pub diff: String,
+    pub checks: String,
+    pub pending_work: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OllamaStartRequest {
+    pub cwd: String,
+    pub prompt: String,
+    pub test_command: Option<String>,
+    pub handoff_source_run_id: Option<String>,
 }
 
 fn parse_side_effect_marker(text: &str) -> Option<WorkflowSideEffects> {
@@ -278,6 +318,7 @@ pub struct CodexStartRequest {
     pub skill_id: Option<String>,
     pub timeout_seconds: u64,
     pub workflow: Option<WorkflowRunMetadata>,
+    pub handoff_source_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +327,7 @@ pub struct AntigravityStartRequest {
     pub cwd: String,
     pub prompt: String,
     pub timeout_seconds: u64,
+    pub handoff_source_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +341,7 @@ pub struct CodexRunConfig {
     pub skill_path: Option<PathBuf>,
     pub timeout_seconds: u64,
     pub workflow: Option<WorkflowRunMetadata>,
+    pub handoff: Option<ProviderHandoff>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +350,17 @@ pub struct AntigravityRunConfig {
     pub cwd: PathBuf,
     pub model_id: String,
     pub prompt: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OllamaRunConfig {
+    pub executable: PathBuf,
+    pub cwd: PathBuf,
+    pub endpoint: String,
+    pub model_id: String,
+    pub prompt: String,
+    pub test_command: Option<String>,
     pub timeout_seconds: u64,
 }
 
@@ -1963,17 +2017,19 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
 
 #[tauri::command]
 pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRecord, String> {
-    start_run(app, request, None, None, None)
+    start_run(app, request, None, None, None, None, None)
 }
 
 pub fn start_codex_workflow_run(
     app: AppHandle,
     config: CodexRunConfig,
 ) -> Result<RunRecord, String> {
-    if config.prompt.trim().is_empty()
-        || config.prompt.len() > 60_000
-        || config.prompt.contains('\0')
-    {
+    let prompt = config
+        .handoff
+        .as_ref()
+        .map(|packet| format!("{}{}", config.prompt, format_handoff_prompt(packet)))
+        .unwrap_or_else(|| config.prompt.clone());
+    if prompt.trim().is_empty() || prompt.len() > 60_000 || prompt.contains('\0') {
         return Err("Enter a prompt of 1 to 60,000 characters for Codex.".into());
     }
     if config.model_id.trim().is_empty()
@@ -2014,6 +2070,8 @@ pub fn start_codex_workflow_run(
     } else {
         ensure_clean_git_worktree(&cwd)?;
     }
+    let mut config = config;
+    config.prompt = prompt;
     let timeout_seconds = config.timeout_seconds;
     let request = StartRequest {
         executable: config.executable.to_string_lossy().into_owned(),
@@ -2023,17 +2081,28 @@ pub fn start_codex_workflow_run(
         mutating: true,
     };
     let model_id = config.model_id.clone();
-    start_run(app, request, Some(config), Some("codex"), Some(model_id))
+    let handoff = config.handoff.clone();
+    start_run(
+        app,
+        request,
+        Some(config),
+        Some("codex"),
+        Some(model_id),
+        handoff,
+        None,
+    )
 }
 
 pub fn start_antigravity_workflow_run(
     app: AppHandle,
     config: AntigravityRunConfig,
+    handoff: Option<ProviderHandoff>,
 ) -> Result<RunRecord, String> {
-    if config.prompt.trim().is_empty()
-        || config.prompt.len() > 60_000
-        || config.prompt.contains('\0')
-    {
+    let prompt = handoff
+        .as_ref()
+        .map(|packet| format!("{}{}", config.prompt, format_handoff_prompt(packet)))
+        .unwrap_or_else(|| config.prompt.clone());
+    if prompt.trim().is_empty() || prompt.len() > 60_000 || prompt.contains('\0') {
         return Err("Enter a prompt of 1 to 60,000 characters for Antigravity.".into());
     }
     if config.model_id.trim().is_empty()
@@ -2054,7 +2123,7 @@ pub fn start_antigravity_workflow_run(
         executable: config.executable.to_string_lossy().into_owned(),
         arguments: crate::providers::antigravity_arguments(
             &config.model_id,
-            &config.prompt,
+            &prompt,
             config.timeout_seconds,
         ),
         cwd: cwd.to_string_lossy().into_owned(),
@@ -2062,7 +2131,186 @@ pub fn start_antigravity_workflow_run(
         mutating: true,
     };
     let model_id = config.model_id.clone();
-    start_run(app, request, None, Some("antigravity"), Some(model_id))
+    start_run(
+        app,
+        request,
+        None,
+        Some("antigravity"),
+        Some(model_id),
+        handoff,
+        None,
+    )
+}
+
+pub fn create_provider_handoff(
+    app: AppHandle,
+    input: HandoffInput,
+) -> Result<ProviderHandoff, String> {
+    let validate = |name: &str, value: &str| -> Result<String, String> {
+        let value = value.trim();
+        if value.is_empty() || value.len() > 8_000 || value.contains('\0') {
+            return Err(format!(
+                "Handoff {name} must contain 1 to 8,000 characters."
+            ));
+        }
+        Ok(redact(value, &[]))
+    };
+    if input.source_run_id.is_empty()
+        || input.source_run_id.len() > 100
+        || input.target_provider_id.is_empty()
+        || input.target_provider_id.len() > 80
+    {
+        return Err("Choose a valid source run and target provider for the handoff.".into());
+    }
+    let path = history_path(&app)?;
+    let mut state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.records.is_empty() {
+        state.records = load_records(&path)?;
+    }
+    let source = state
+        .records
+        .iter_mut()
+        .find(|record| record.id == input.source_run_id)
+        .ok_or("The source run is no longer in saved workflow history.")?;
+    if !matches!(
+        source.state.as_str(),
+        "completed" | "failed" | "cancelled" | "timedOut" | "interrupted"
+    ) {
+        return Err("Finish or cancel the source run before preparing a manual handoff.".into());
+    }
+    let packet = ProviderHandoff {
+        version: 1,
+        source_run_id: source.id.clone(),
+        target_provider_id: input.target_provider_id,
+        goal: validate("goal", &input.goal)?,
+        scope: validate("scope", &input.scope)?,
+        diff: validate("diff", &input.diff)?,
+        checks: validate("checks", &input.checks)?,
+        pending_work: validate("pending work", &input.pending_work)?,
+        completed_side_effects: source
+            .workflow
+            .as_ref()
+            .and_then(|workflow| workflow.side_effects.clone()),
+        created_at_ms: now_ms(),
+    };
+    source.handoff = Some(packet.clone());
+    persist_records(&path, &state.records)?;
+    Ok(packet)
+}
+
+pub fn saved_provider_handoff(
+    app: &AppHandle,
+    source_run_id: &str,
+    target_provider_id: &str,
+) -> Result<ProviderHandoff, String> {
+    let path = history_path(app)?;
+    let mut state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.records.is_empty() {
+        state.records = load_records(&path)?;
+    }
+    state
+        .records
+        .iter()
+        .find(|record| record.id == source_run_id)
+        .and_then(|record| record.handoff.clone())
+        .filter(|packet| {
+            packet.target_provider_id == target_provider_id && packet.source_run_id == source_run_id
+        })
+        .ok_or_else(|| {
+            "Create a manual handoff for this source run and selected target provider first.".into()
+        })
+}
+
+pub fn format_handoff_prompt(packet: &ProviderHandoff) -> String {
+    let effects = packet
+        .completed_side_effects
+        .as_ref()
+        .map(|value| {
+            format!(
+                "commit={}, branch={}, pull_request={}",
+                value.commit_sha.as_deref().unwrap_or("none"),
+                value.remote_branch.as_deref().unwrap_or("none"),
+                value.pull_request_url.as_deref().unwrap_or("none"),
+            )
+        })
+        .unwrap_or_else(|| "none recorded".into());
+    format!("\n\nMANUAL PROVIDER HANDOFF (source run: {})\nDo not automatically repeat completed commits, pushes, pull requests, or other remote side effects. Completed side effects: {}\nGoal:\n{}\nScope:\n{}\nCurrent diff:\n{}\nChecks already run and results:\n{}\nPending work:\n{}\nContinue only with pending work and report any side effect for user review.\n", packet.source_run_id, effects, packet.goal, packet.scope, packet.diff, packet.checks, packet.pending_work)
+}
+
+pub fn start_ollama_workflow_run(
+    app: AppHandle,
+    config: OllamaRunConfig,
+    handoff: Option<ProviderHandoff>,
+) -> Result<RunRecord, String> {
+    if config.prompt.trim().is_empty()
+        || config.prompt.len() > 60_000
+        || config.prompt.contains('\0')
+    {
+        return Err("Enter a prompt of 1 to 60,000 characters for the local Ollama run.".into());
+    }
+    if config.model_id.trim().is_empty()
+        || config.model_id.len() > 160
+        || config.model_id.chars().any(char::is_control)
+    {
+        return Err("Select a valid tool-capable Ollama model.".into());
+    }
+    if config.timeout_seconds == 0 || config.timeout_seconds > 3_600 {
+        return Err(
+            "The hardware-aware Ollama timeout must be between 1 and 3,600 seconds.".into(),
+        );
+    }
+    if config
+        .test_command
+        .as_ref()
+        .is_some_and(|command| command.len() > 2_048 || command.chars().any(char::is_control))
+    {
+        return Err("The optional test command must be 2,048 characters or fewer without control characters.".into());
+    }
+    let cwd = config
+        .cwd
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() {
+        return Err("The selected project must be an existing folder.".into());
+    }
+    ensure_clean_git_worktree(&cwd)?;
+    if handoff.as_ref().is_some_and(|packet| packet.version != 1) {
+        return Err("This handoff packet version is unsupported.".into());
+    }
+    let prompt = handoff
+        .as_ref()
+        .map(|packet| format!("{}{}", config.prompt, format_handoff_prompt(packet)))
+        .unwrap_or_else(|| config.prompt.clone());
+    if prompt.len() > 60_000 {
+        return Err("The prompt and handoff packet exceed 60,000 characters.".into());
+    }
+    let env_file = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let request = StartRequest {
+        executable: config.executable.to_string_lossy().into_owned(),
+        arguments: crate::providers::aider_ollama_arguments(
+            &config.model_id,
+            &prompt,
+            config.test_command.as_deref(),
+            env_file,
+        ),
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds: config.timeout_seconds,
+        mutating: true,
+    };
+    let model_id = config.model_id.clone();
+    start_run(
+        app,
+        request,
+        None,
+        Some("ollama"),
+        Some(model_id),
+        handoff,
+        Some(config.endpoint),
+    )
 }
 
 fn start_run(
@@ -2071,6 +2319,8 @@ fn start_run(
     codex: Option<CodexRunConfig>,
     provider: Option<&'static str>,
     model_id: Option<String>,
+    handoff: Option<ProviderHandoff>,
+    ollama_endpoint: Option<String>,
 ) -> Result<RunRecord, String> {
     let codex_run = codex.is_some();
     let (executable, cwd, host) = validate_request(&request)?;
@@ -2115,6 +2365,7 @@ fn start_run(
         thread_id: None,
         process_id: None,
         mutating: request.mutating,
+        timeout_seconds: request.timeout_seconds,
         state: "queued".into(),
         started_at_ms: now_ms(),
         finished_at_ms: None,
@@ -2123,6 +2374,7 @@ fn start_run(
         next_sequence: 1,
         events: Vec::new(),
         workflow: codex.as_ref().and_then(|config| config.workflow.clone()),
+        handoff,
     };
     {
         let mut state = store()
@@ -2165,6 +2417,26 @@ fn start_run(
             return Err(error);
         }
     };
+    if let Some(endpoint) = ollama_endpoint {
+        command.env("OLLAMA_API_BASE", endpoint);
+        for key in [
+            "OLLAMA_HOST",
+            "OLLAMA_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_API_BASE",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        command.env("NO_PROXY", "*").env("no_proxy", "*");
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -2665,6 +2937,7 @@ mod tests {
             thread_id: None,
             process_id: Some(std::process::id()),
             mutating: true,
+            timeout_seconds: 1,
             state: "running".into(),
             started_at_ms: 1,
             finished_at_ms: None,
@@ -2689,11 +2962,30 @@ mod tests {
                 }),
                 build_artifact: None,
             }),
+            handoff: Some(ProviderHandoff {
+                version: 1,
+                source_run_id: "fixture".into(),
+                target_provider_id: "ollama-local".into(),
+                goal: "Finish the requested change".into(),
+                scope: "src/main.rs".into(),
+                diff: "One file changed".into(),
+                checks: "cargo test passed".into(),
+                pending_work: "Review the remaining edge case".into(),
+                completed_side_effects: Some(WorkflowSideEffects {
+                    commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    remote_branch: Some("feat/example".into()),
+                    pull_request_url: None,
+                    verified: true,
+                    verification_message: None,
+                }),
+                created_at_ms: 2,
+            }),
         };
         persist_records(&path, &[record.clone()]).unwrap();
         record.state = "interrupted".into();
         let restored = load_records(&path).unwrap();
         assert_eq!(restored[0].state, record.state);
+        assert_eq!(restored[0].handoff, record.handoff);
         assert_eq!(restored[0].process_id, Some(std::process::id()));
         assert!(interrupted_process_owns_scope(
             &restored,
@@ -2701,6 +2993,10 @@ mod tests {
         ));
         assert!(restored[0].finished_at_ms.is_some());
         assert!(workflow_key_recorded(&restored, &"a".repeat(64)));
+        let handoff_prompt = format_handoff_prompt(restored[0].handoff.as_ref().unwrap());
+        assert!(handoff_prompt.contains("Do not automatically repeat completed commits"));
+        assert!(handoff_prompt.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert!(handoff_prompt.contains("Review the remaining edge case"));
         assert_eq!(
             restored[0]
                 .workflow

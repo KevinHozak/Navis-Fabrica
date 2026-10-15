@@ -1346,6 +1346,7 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
     let settings = load_settings(&settings_path(&app)?)?;
     let inventory_path = project_inventory_path(&app)?;
     let prior_inventory = inventory::load(&inventory_path, &settings.project_root);
+    let mut refresh_restored_facts = false;
     if force_refresh {
         PROJECT_CACHE_RESTORED.store(true, Ordering::Release);
         PROJECT_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -1354,6 +1355,9 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
             .map_err(|_| "Could not access cached project facts.".to_string())?
             .clear();
     } else if !PROJECT_CACHE_RESTORED.swap(true, Ordering::AcqRel) {
+        // Keep the persisted projects available for immediate rendering, but do
+        // not let their Git facts short-circuit the first background scan.
+        refresh_restored_facts = true;
         if !prior_inventory.is_empty() {
             let mut cache = project_fact_cache()
                 .lock()
@@ -1388,10 +1392,14 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
         };
         let prior_inventory = prior_inventory;
         let cache_epoch = PROJECT_CACHE_EPOCH.load(Ordering::Relaxed);
-        let cached_projects = project_fact_cache()
-            .lock()
-            .map(|cache| cache.clone())
-            .unwrap_or_default();
+        let cached_projects = if refresh_restored_facts {
+            HashMap::new()
+        } else {
+            project_fact_cache()
+                .lock()
+                .map(|cache| cache.clone())
+                .unwrap_or_default()
+        };
         let mut result = scanner::scan(
             &scan_id,
             Path::new(&settings.project_root),

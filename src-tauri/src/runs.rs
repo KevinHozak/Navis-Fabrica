@@ -268,6 +268,16 @@ pub struct OllamaStartRequest {
     pub handoff_source_run_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenRouterStartRequest {
+    pub cwd: String,
+    pub prompt: String,
+    pub test_command: Option<String>,
+    pub timeout_seconds: u64,
+    pub handoff_source_run_id: Option<String>,
+}
+
 fn parse_side_effect_marker(text: &str) -> Option<WorkflowSideEffects> {
     let json = text
         .lines()
@@ -365,6 +375,17 @@ pub struct OllamaRunConfig {
     pub cwd: PathBuf,
     pub endpoint: String,
     pub model_id: String,
+    pub prompt: String,
+    pub test_command: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenRouterRunConfig {
+    pub executable: PathBuf,
+    pub cwd: PathBuf,
+    pub model_id: String,
+    pub api_key: String,
     pub prompt: String,
     pub test_command: Option<String>,
     pub timeout_seconds: u64,
@@ -2175,7 +2196,7 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
 
 #[tauri::command]
 pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRecord, String> {
-    start_run(app, request, None, None, None, None, None)
+    start_run(app, request, None, None, None, None, None, Vec::new())
 }
 
 pub fn start_codex_workflow_run(
@@ -2250,6 +2271,7 @@ pub fn start_codex_workflow_run(
         Some(model_id),
         handoff,
         None,
+        Vec::new(),
     )
 }
 
@@ -2303,6 +2325,7 @@ pub fn start_antigravity_workflow_run(
         Some(model_id),
         handoff,
         None,
+        Vec::new(),
     )
 }
 
@@ -2502,6 +2525,82 @@ pub fn start_ollama_workflow_run(
         Some(model_id),
         handoff,
         Some(config.endpoint),
+        Vec::new(),
+    )
+}
+
+pub fn start_openrouter_workflow_run(
+    app: AppHandle,
+    config: OpenRouterRunConfig,
+    handoff: Option<ProviderHandoff>,
+) -> Result<RunRecord, String> {
+    let prompt = handoff
+        .as_ref()
+        .map(|packet| format!("{}{}", config.prompt, format_handoff_prompt(packet)))
+        .unwrap_or(config.prompt);
+    if prompt.trim().is_empty() || prompt.len() > 60_000 || prompt.contains('\0') {
+        return Err("Enter a prompt of 1 to 60,000 characters for OpenRouter.".into());
+    }
+    if config.model_id.trim().is_empty()
+        || config.model_id.len() > 160
+        || config.model_id.chars().any(char::is_control)
+    {
+        return Err("Select a valid configured OpenRouter model.".into());
+    }
+    if !crate::providers::valid_openrouter_key(&config.api_key) {
+        return Err("The saved OpenRouter credential is invalid.".into());
+    }
+    if config.timeout_seconds == 0 || config.timeout_seconds > 86_400 {
+        return Err("The OpenRouter run timeout must be between 1 and 86,400 seconds.".into());
+    }
+    if config
+        .test_command
+        .as_ref()
+        .is_some_and(|value| value.len() > 2_048 || value.chars().any(char::is_control))
+    {
+        return Err("The optional test command must be 2,048 characters or fewer without control characters.".into());
+    }
+    let cwd = config
+        .cwd
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() {
+        return Err("The selected project must be an existing folder.".into());
+    }
+    if let Some(packet) = handoff.as_ref() {
+        ensure_handoff_worktree(&cwd, packet)?;
+    } else {
+        ensure_clean_git_worktree(&cwd)?;
+    }
+    if handoff
+        .as_ref()
+        .is_some_and(|packet| ![1, 2].contains(&packet.version))
+    {
+        return Err("This handoff packet version is unsupported.".into());
+    }
+    let env_file = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let request = StartRequest {
+        executable: config.executable.to_string_lossy().into_owned(),
+        arguments: crate::providers::aider_openrouter_arguments(
+            &config.model_id,
+            &prompt,
+            config.test_command.as_deref(),
+            env_file,
+        ),
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds: config.timeout_seconds,
+        mutating: true,
+    };
+    let model_id = config.model_id.clone();
+    start_run(
+        app,
+        request,
+        None,
+        Some("openrouter"),
+        Some(model_id),
+        handoff,
+        None,
+        vec![("OPENROUTER_API_KEY".into(), config.api_key)],
     )
 }
 
@@ -2513,6 +2612,7 @@ fn start_run(
     model_id: Option<String>,
     handoff: Option<ProviderHandoff>,
     ollama_endpoint: Option<String>,
+    provider_environment: Vec<(String, String)>,
 ) -> Result<RunRecord, String> {
     let codex_run = codex.is_some();
     let (executable, cwd, host) = validate_request(&request)?;
@@ -2547,6 +2647,7 @@ fn start_run(
                 })
                 .cloned(),
         )
+        .chain(provider_environment.iter().map(|(_, value)| value.clone()))
         .collect::<Vec<_>>();
     let record = RunRecord {
         id: id.clone(),
@@ -2628,6 +2729,15 @@ fn start_run(
             command.env_remove(key);
         }
         command.env("NO_PROXY", "*").env("no_proxy", "*");
+    }
+    for (name, value) in provider_environment {
+        if name != "OPENROUTER_API_KEY" || !crate::providers::valid_openrouter_key(&value) {
+            set_state(&app, &path, &id, "failed", None);
+            return Err("The provider environment configuration is invalid.".into());
+        }
+        command
+            .env_remove("OPENROUTER_API_KEY")
+            .env("OPENROUTER_API_KEY", value);
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -3296,6 +3406,14 @@ mod tests {
     fn redacts_github_token_shapes_from_output() {
         let value = redact("token=ghp_0123456789abcdefghijklmnop", &[]);
         assert!(!value.contains("ghp_"));
+        assert!(value.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacts_openrouter_credential_from_child_process_output() {
+        let key = "sk-or-v1-fixture-secret".to_string();
+        let value = redact(&format!("request failed with key {key}"), &[key]);
+        assert!(!value.contains("sk-or-v1-fixture-secret"));
         assert!(value.contains("[REDACTED]"));
     }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-openrouter-workflow-run"
+description = "Enables the start_openrouter_workflow_run command without any pre-configured scope."
+commands.allow = ["start_openrouter_workflow_run"]
+
+[[permission]]
+identifier = "deny-start-openrouter-workflow-run"
+description = "Denies the start_openrouter_workflow_run command without any pre-configured scope."
+commands.deny = ["start_openrouter_workflow_run"]

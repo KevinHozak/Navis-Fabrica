@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { GitHubIssue, ProjectEntry, ProviderHandoff, WorkflowRunMetadata } from "./settings";
 import {
   cancelWorkflowRun, createProviderHandoff, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
-  loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
+  loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startOpenRouterWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
 } from "./settings";
 
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
@@ -79,6 +79,8 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       const sourceId = handoffSourceRunId;
       const run = provider?.kind === "ollama"
         ? await startOllamaWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, testCommand: ollamaTestCommand.trim() || null, handoffSourceRunId: sourceId })
+        : provider?.kind === "openRouter"
+          ? await startOpenRouterWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, testCommand: ollamaTestCommand.trim() || null, timeoutSeconds: codexTimeout, handoffSourceRunId: sourceId })
         : provider?.kind === "antigravity"
           ? await startAntigravityWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, timeoutSeconds: codexTimeout, handoffSourceRunId: sourceId })
           : await startCodexWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, skillId: codexSkill || null, timeoutSeconds: codexTimeout, handoffSourceRunId: sourceId });
@@ -259,7 +261,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
     <section className="panel run-launch-panel" aria-labelledby="codex-run-title">
-      <div className="panel-heading"><div><h2 id="codex-run-title">Start {selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : "Codex"} in this project</h2><p>Uses the selected provider and model, plus settings supported by that runtime.</p></div></div>
+      <div className="panel-heading"><div><h2 id="codex-run-title">Start {selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : selectedProviderKind === "openRouter" ? "OpenRouter via Aider" : "Codex"} in this project</h2><p>Uses the selected provider and model, plus settings supported by that runtime.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgent(event); }}>
         <label>Project scope<input value={defaultCwd} readOnly aria-readonly="true" /></label>
@@ -268,11 +270,12 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
         </select></label>}
         {selectedProviderKind === "antigravity" && <p className="registry-context-note">Antigravity CLI discovers workspace skills from .agents/skills and global CLI skills. Headless runs cannot pause for approvals or input; terminal tools run with the CLI sandbox. Structured progress and reasoning-effort options are unavailable in the installed CLI version.</p>}
         {selectedProviderKind === "ollama" && <><label>Test command (optional)<input value={ollamaTestCommand} maxLength={2048} onChange={(event) => setOllamaTestCommand(event.target.value)} placeholder="e.g. npm test or cargo test" /><small>Aider runs this command after edits when configured. It runs inside the selected project and may modify files.</small></label><p className="registry-context-note">Only a discovered local model with reported tool support and at least 8,192 context tokens can start. Timeout is calculated from available system memory and model size. The run is pinned to loopback and cannot commit changes automatically.</p></>}
-        <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder={`Describe the work for ${selectedProviderKind === "antigravity" ? "Antigravity" : "Codex"}…`} /></label>
+        {selectedProviderKind === "openRouter" && <><label>Test command (optional)<input value={ollamaTestCommand} maxLength={2048} onChange={(event) => setOllamaTestCommand(event.target.value)} placeholder="e.g. npm test or cargo test" /><small>Aider runs this command after edits when configured. It runs inside the selected project and may modify files.</small></label><p className="registry-context-note">OpenRouter provides model inference. The configured Aider harness performs edits and optional tests; its process is bounded by the timeout and can be cancelled here. Model metadata stays unknown when OpenRouter omits it.</p></>}
+        <label>Prompt<textarea rows={4} required maxLength={60000} value={codexPrompt} onChange={(event) => setCodexPrompt(event.target.value)} placeholder={`Describe the work for ${selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "openRouter" ? "OpenRouter via Aider" : "Codex"}…`} /></label>
         <div className="run-launch-options">
           {selectedProviderKind !== "ollama" && <label>Timeout (seconds)<input type="number" min={1} max={86400} value={codexTimeout} onChange={(event) => setCodexTimeout(Number(event.target.value))} /></label>}
-          <p className="registry-context-note">{selectedProviderKind === "antigravity" ? "Git projects must have a clean worktree. The headless CLI cannot pause for approvals; tool permissions follow Antigravity CLI settings and sandbox policy." : selectedProviderKind === "ollama" ? "Git projects must have a clean worktree. Select a discovered eligible model in Providers before starting." : "Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision."}</p>
-          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim() || !["codex", "antigravity", "ollama"].includes(selectedProviderKind ?? "")}>{busy ? "Starting…" : `Start ${selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : "Codex"}`}</button>
+          <p className="registry-context-note">{selectedProviderKind === "antigravity" ? "Git projects must have a clean worktree. The headless CLI cannot pause for approvals; tool permissions follow Antigravity CLI settings and sandbox policy." : selectedProviderKind === "ollama" || selectedProviderKind === "openRouter" ? "Git projects must have a clean worktree. Select a discovered model in Providers before starting." : "Git projects must have a clean worktree before Codex starts. Approval requests pause for your decision."}</p>
+          <button className="button button-primary" type="submit" disabled={busy || !codexPrompt.trim() || !["codex", "antigravity", "ollama", "openRouter"].includes(selectedProviderKind ?? "")}>{busy ? "Starting…" : `Start ${selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : selectedProviderKind === "openRouter" ? "OpenRouter" : "Codex"}`}</button>
         </div>
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}

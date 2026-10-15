@@ -259,6 +259,45 @@ fn resolve_github_credential(reference: &str) -> Option<String> {
     }
 }
 
+fn store_openrouter_credential(target: &str, secret: &str) -> Result<(), String> {
+    if !providers::valid_openrouter_key(secret) {
+        return Err("Enter a valid OpenRouter API key.".into());
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Credentials::{
+            CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+        };
+        let target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut bytes = secret.trim().as_bytes().to_vec();
+        let credential = CREDENTIALW {
+            Flags: 0,
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target_wide.as_ptr() as *mut u16,
+            Comment: std::ptr::null_mut(),
+            LastWritten: unsafe { std::mem::zeroed() },
+            CredentialBlobSize: bytes.len() as u32,
+            CredentialBlob: bytes.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: std::ptr::null_mut(),
+            TargetAlias: std::ptr::null_mut(),
+            UserName: std::ptr::null_mut(),
+        };
+        let written = unsafe { CredWriteW(&credential, 0) };
+        bytes.fill(0);
+        if written == 0 {
+            return Err("Windows Credential Manager could not save the OpenRouter key.".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        Err("OpenRouter credential storage is available only in the Windows desktop app.".into())
+    }
+}
+
 const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -852,6 +891,128 @@ fn probe_ollama(app: AppHandle, provider_id: String) -> Result<providers::Ollama
 }
 
 #[tauri::command]
+fn save_openrouter_credential(
+    app: AppHandle,
+    provider_id: String,
+    api_key: String,
+) -> Result<Settings, String> {
+    let mut settings = load_settings(&settings_path(&app)?)?;
+    let profile = settings
+        .providers
+        .iter_mut()
+        .find(|profile| profile.id == provider_id)
+        .ok_or("The OpenRouter provider profile no longer exists.")?;
+    if profile.kind != providers::ProviderKind::OpenRouter {
+        return Err("Choose an OpenRouter provider profile.".into());
+    }
+    let target = providers::openrouter_credential_target(&provider_id)?;
+    store_openrouter_credential(&target, &api_key)?;
+    profile.secret_ref = Some(format!("credential-store:{target}"));
+    write_settings_atomic(&settings_path(&app)?, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn probe_openrouter(
+    app: AppHandle,
+    provider_id: String,
+) -> Result<providers::OpenRouterProbe, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    let profile = settings
+        .providers
+        .iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or("The OpenRouter provider profile no longer exists.")?;
+    if profile.kind != providers::ProviderKind::OpenRouter {
+        return Err("Choose an OpenRouter provider to probe.".into());
+    }
+    let key = profile
+        .secret_ref
+        .as_deref()
+        .and_then(resolve_github_credential)
+        .unwrap_or_default();
+    Ok(providers::openrouter_http_probe(&key))
+}
+
+#[tauri::command]
+fn start_openrouter_workflow_run(
+    app: AppHandle,
+    request: runs::OpenRouterStartRequest,
+) -> Result<runs::RunRecord, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
+    let selection = &settings.provider_selection;
+    let provider_id = selection
+        .provider_id
+        .as_deref()
+        .ok_or("Choose an OpenRouter provider in Providers first.")?;
+    let profile = settings
+        .providers
+        .iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or("The selected provider is no longer configured.")?;
+    if profile.kind != providers::ProviderKind::OpenRouter {
+        return Err("The selected provider is not OpenRouter.".into());
+    }
+    if selection.reasoning_effort.is_some() {
+        return Err(
+            "The Aider OpenRouter adapter does not expose verified reasoning-effort options."
+                .into(),
+        );
+    }
+    if selection
+        .runtime_id
+        .as_deref()
+        .is_some_and(|runtime| !runtime.is_empty() && runtime != "aider-openrouter")
+    {
+        return Err("This phase supports the Aider OpenRouter runtime only.".into());
+    }
+    let model_id = selection
+        .model_id
+        .as_deref()
+        .ok_or("Discover OpenRouter models and select a model first.")?;
+    let probe = probe_openrouter(app.clone(), provider_id.to_owned())?;
+    if probe.state != "ready" {
+        return Err(probe.note);
+    }
+    let model = probe.models.iter().find(|model| model.id == model_id).ok_or("The selected model is no longer available from OpenRouter. Refresh the catalog and choose a model explicitly.")?;
+    let key = profile.secret_ref.as_deref().and_then(resolve_github_credential).ok_or("The OpenRouter credential reference is missing or unavailable. Save the key again in Providers.")?;
+    let path = std::env::var_os("PATH");
+    let executable = providers::find_executable(&profile.executable, path.as_deref())
+        .ok_or("The configured Aider executable is not available on PATH or at its saved path.")?;
+    let handoff = request
+        .handoff_source_run_id
+        .as_deref()
+        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .transpose()?;
+    let root = Path::new(&settings.project_root)
+        .canonicalize()
+        .map_err(|_| "The configured project root could not be resolved.".to_string())?;
+    let cwd = Path::new(&request.cwd)
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() || !cwd.starts_with(&root) {
+        return Err(
+            "OpenRouter can only run in a project folder inside the configured project root."
+                .into(),
+        );
+    }
+    runs::start_openrouter_workflow_run(
+        app,
+        runs::OpenRouterRunConfig {
+            executable,
+            cwd,
+            model_id: model.id.clone(),
+            api_key: key,
+            prompt: request.prompt,
+            test_command: request.test_command,
+            timeout_seconds: request.timeout_seconds,
+        },
+        handoff,
+    )
+}
+
+#[tauri::command]
 fn create_provider_handoff(
     app: AppHandle,
     input: runs::HandoffInput,
@@ -1374,10 +1535,13 @@ pub fn run() {
             inspect_providers,
             probe_antigravity_cli,
             probe_ollama,
+            save_openrouter_credential,
+            probe_openrouter,
             create_provider_handoff,
             start_codex_workflow_run,
             start_antigravity_workflow_run,
             start_ollama_workflow_run,
+            start_openrouter_workflow_run,
             get_cached_github_activity,
             refresh_github_activity,
             list_github_issues,

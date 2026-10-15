@@ -3461,6 +3461,40 @@ mod tests {
         assert!(validate_request(&invalid).is_err());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn rejects_cmd_shell_metacharacters_in_script_paths_and_arguments() {
+        let folder = tempfile::tempdir().unwrap();
+        let safe_script = folder.path().join("safe.cmd");
+        fs::write(&safe_script, "@echo off\n").unwrap();
+        let safe = request(
+            safe_script.to_str().unwrap(),
+            folder.path().to_str().unwrap(),
+            vec!["literal argument"],
+        );
+        assert!(validate_request(&safe).is_ok());
+
+        let injected_argument = request(
+            safe_script.to_str().unwrap(),
+            folder.path().to_str().unwrap(),
+            vec!["safe & whoami"],
+        );
+        assert!(validate_request(&injected_argument)
+            .unwrap_err()
+            .contains("shell metacharacters"));
+
+        let unsafe_script = folder.path().join("unsafe & script.cmd");
+        fs::write(&unsafe_script, "@echo off\n").unwrap();
+        let injected_path = request(
+            unsafe_script.to_str().unwrap(),
+            folder.path().to_str().unwrap(),
+            vec![],
+        );
+        assert!(validate_request(&injected_path)
+            .unwrap_err()
+            .contains("shell metacharacters"));
+    }
+
     #[test]
     fn history_survives_restart_and_orphans_become_interrupted() {
         let directory = tempfile::tempdir().unwrap();
@@ -3591,6 +3625,7 @@ mod tests {
         ));
         assert!(restored[0].finished_at_ms.is_some());
         assert!(workflow_key_recorded(&restored, &"a".repeat(64)));
+        assert!(!workflow_key_recorded(&restored, &"b".repeat(64)));
         let handoff_prompt = format_handoff_prompt(restored[0].handoff.as_ref().unwrap());
         assert!(handoff_prompt.contains("Do not automatically repeat completed commits"));
         assert!(handoff_prompt.contains("0123456789abcdef0123456789abcdef01234567"));

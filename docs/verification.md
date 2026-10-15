@@ -132,3 +132,13 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 - `cargo check --manifest-path src-tauri/Cargo.toml --locked --target-dir src-tauri/target/issue48-alt`: passed for the Windows Tauri target, including credential-manager APIs and command registration.
 - `npm ci --ignore-scripts --no-audit --no-fund`: installed all 72 locked packages; `npm run build`: passed (TypeScript and Vite production build).
 - No live OpenRouter request was performed; a real key is not required by automated tests. Run cancellation uses the already tested process manager; no live Aider/OpenRouter run was attempted.
+
+## Release-P1 cross-feature regression and security checks (issue #28)
+
+### Fixture and contract coverage
+
+- Existing disposable scanner and Git fixtures cover missing/unreadable roots, partial results, cancellation, worktree metadata, remotes, branch divergence, and project identity changes. Run-manager fixtures cover invalid requests, process lifecycle and cancellation, exact handoff snapshots, restart recovery, output redaction, scoped changes, and verified side-effect receipts; a Windows fixture now explicitly rejects shell metacharacters in `.cmd` paths and arguments, and persisted workflow keys are checked for duplicate suppression. Provider fixtures use recorded protocol/catalog responses for malformed data, authentication/rate-limit failures, missing capabilities, secret-safe diagnostics, and local-only behavior. Routing fixtures cover unavailable or unknown usage, exhausted candidates, checkpoint gating, local-only policy, and manual overrides.
+- Added `src-tauri/tests/release_security_contract.rs`. These checks compare the default window's granted IPC commands with the registered Tauri handlers and each generated per-command permission, bound production and development CSP origins, and reject a frontend dependency/reference to the unrestricted shell plugin.
+- The IPC check validates registration and capability configuration; it does not invoke commands through a running webview. Scanner, Git, process, provider, and routing behavior is exercised by their module-level fixtures rather than a live desktop session.
+- `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml`: 99 unit tests and 3 release security contract tests passed on Windows.
+- No live provider workflow, authenticated network request, or desktop IPC session was run for this issue. Fixture success is not represented as live integration evidence. Existing provider-specific live probe observations are recorded with their respective phase entries above.

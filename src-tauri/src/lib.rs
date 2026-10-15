@@ -17,6 +17,7 @@ mod github;
 pub mod providers;
 mod runs;
 mod scanner;
+mod usage;
 
 static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 static PROJECT_FACT_CACHE: OnceLock<Mutex<HashMap<String, scanner::ProjectEntry>>> =
@@ -1242,10 +1243,45 @@ pub fn run() {
             runs::mark_workflow_run_needs_input,
             runs::write_workflow_run_input,
             runs::respond_codex_approval,
-            runs::respond_codex_user_input
+            runs::respond_codex_user_input,
+            list_usage_signals,
+            record_manual_usage_estimate
         ])
         .run(tauri::generate_context!())
         .expect("error while running Navis-Fabrica");
+}
+
+#[tauri::command]
+fn list_usage_signals(app: AppHandle) -> Result<Vec<usage::UsageSignal>, String> {
+    usage::list_signals(&runs::history_path(&app)?, usage::now_ms())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManualUsageEstimateInput {
+    category: usage::UsageCategory,
+    value: f64,
+    unit: String,
+    window_duration_seconds: Option<u64>,
+    reset_at_ms: Option<u128>,
+}
+
+#[tauri::command]
+fn record_manual_usage_estimate(
+    app: AppHandle,
+    estimate: ManualUsageEstimateInput,
+) -> Result<Vec<usage::UsageSignal>, String> {
+    let signal = usage::manual_estimate(
+        estimate.category,
+        estimate.value,
+        estimate.unit,
+        estimate.window_duration_seconds,
+        estimate.reset_at_ms,
+        usage::now_ms(),
+    )?;
+    let path = runs::history_path(&app)?;
+    usage::record_signals(&path, &[signal])?;
+    usage::list_signals(&path, usage::now_ms())
 }
 
 #[cfg(test)]

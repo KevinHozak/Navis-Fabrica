@@ -24,6 +24,8 @@
     "allow-write-workflow-run-input",
     "allow-respond-codex-approval",
     "allow-respond-codex-user-input",
+    "allow-list-usage-signals",
+    "allow-record-manual-usage-estimate",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

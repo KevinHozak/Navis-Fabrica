@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-usage-signals"
+description = "Enables the list_usage_signals command without any pre-configured scope."
+commands.allow = ["list_usage_signals"]
+
+[[permission]]
+identifier = "deny-list-usage-signals"
+description = "Denies the list_usage_signals command without any pre-configured scope."
+commands.deny = ["list_usage_signals"]

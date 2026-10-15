@@ -11,6 +11,8 @@ fn main() {
             "probe_ollama",
             "save_openrouter_credential",
             "probe_openrouter",
+            "save_typesafe_credential",
+            "probe_typesafe",
             "start_openrouter_workflow_run",
             "create_provider_handoff",
             "start_ollama_workflow_run",

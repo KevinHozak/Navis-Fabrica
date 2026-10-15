@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   isDesktopApp,
   loadSettings,
@@ -17,6 +17,9 @@ import {
   probeOllama,
   probeOpenRouter,
   saveOpenRouterCredential,
+  probeTypeSafe,
+  saveTypeSafeCredential,
+  TypeSafeProbe,
   listUsageSignals,
   recordManualUsageEstimate,
   UsageCategory,
@@ -60,6 +63,8 @@ export function ProvidersPanel() {
   const [ollamaProbes, setOllamaProbes] = useState<Record<string, OllamaProbe>>({});
   const [openRouterProbes, setOpenRouterProbes] = useState<Record<string, OpenRouterProbe>>({});
   const [openRouterKeys, setOpenRouterKeys] = useState<Record<string, string>>({});
+  const [typeSafeProbe, setTypeSafeProbe] = useState<TypeSafeProbe | null>(null);
+  const typeSafeKeyRef = useRef<HTMLInputElement>(null);
   const [probingId, setProbingId] = useState<string | null>(null);
   const [kind, setKind] = useState<ProviderKind>("codex");
   const [name, setName] = useState("Codex");
@@ -144,6 +149,7 @@ export function ProvidersPanel() {
         providerSelection: next.providerSelection,
         githubAccounts: next.githubAccounts,
         selectedGithubAccountId: next.selectedGithubAccountId,
+        typesafeProfile: next.typesafeProfile,
       });
       setSettings(saved);
       if (desktop && saved.providers.length) setAvailability(await inspectProviders(saved.providers));
@@ -203,6 +209,32 @@ export function ProvidersPanel() {
       setMessage(error instanceof Error ? error.message : String(error));
       setSaveState("error");
     } finally { setProbingId(null); }
+  }
+
+  async function saveTypeSafeKey() {
+    const profile = settings?.typesafeProfile;
+    const input = typeSafeKeyRef.current;
+    const apiKey = input?.value ?? "";
+    if (!profile || !input) return;
+    input.value = "";
+    setTypeSafeProbe(null);
+    setProbingId(profile.id);
+    try {
+      const saved = await saveTypeSafeCredential(profile.id, apiKey);
+      setSettings(saved);
+      setMessage("TypeSafe key saved to Windows Credential Manager.");
+      setSaveState("saved");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "TypeSafe key could not be saved.");
+      setSaveState("error");
+    } finally { setProbingId(null); }
+  }
+
+  async function checkTypeSafe() {
+    setProbingId("typesafe-jev");
+    try { setTypeSafeProbe(await probeTypeSafe()); }
+    catch { setTypeSafeProbe({ state: "unavailable", model: "jev-1.14.0", note: "TypeSafe health check is unavailable." }); }
+    finally { setProbingId(null); }
   }
 
   async function discoverOpenRouterModels(providerId: string) {
@@ -453,6 +485,19 @@ export function ProvidersPanel() {
             </div>}
           </li>;
         })}</ul> : <div className="provider-empty">No provider profiles yet. Add one below to configure a manual choice.</div>}
+      </section>
+
+      <section className="panel settings-panel" aria-labelledby="typesafe-profile-title">
+        <div className="panel-heading"><div><h2 id="typesafe-profile-title">TypeSafe decision service</h2><p>Optional decision-only connection. Jev is never used for coding runs. Health checks query the available-model list and do not submit a decision.</p></div></div>
+        {!settings.typesafeProfile ? <div className="settings-actions"><span>Unconfigured · Jev is disabled until you add this profile.</span><button className="button button-secondary" type="button" disabled={!desktop} onClick={() => { void persist({ ...settings, typesafeProfile: { id: "typesafe-jev", enabled: false, credentialRef: null } }); }}>Add optional profile</button></div> : <>
+          <label className="settings-field"><span><input type="checkbox" checked={settings.typesafeProfile.enabled} onChange={(event) => { setTypeSafeProbe(null); void persist({ ...settings, typesafeProfile: { ...settings.typesafeProfile!, enabled: event.target.checked } }); }} /> Enable TypeSafe health checks</span></label>
+          <label className="settings-field"><span>TypeSafe API key</span><input ref={typeSafeKeyRef} type="password" autoComplete="new-password" maxLength={4096} placeholder={settings.typesafeProfile.credentialRef ? "Enter a replacement key" : "Paste key; saved directly to Windows Credential Manager"} /></label>
+          <div className="settings-actions">
+            <button className="button button-secondary" type="button" disabled={!desktop || probingId === settings.typesafeProfile.id} onClick={() => { void saveTypeSafeKey(); }}>Save key securely</button>
+            <button className="button button-secondary" type="button" disabled={!desktop || probingId === settings.typesafeProfile.id} onClick={() => { void checkTypeSafe(); }}>{probingId === settings.typesafeProfile.id ? "Checking TypeSafe…" : `Check connection (${typeSafeProbe?.state ?? (settings.typesafeProfile.enabled ? settings.typesafeProfile.credentialRef ? "not checked" : "unconfigured" : "disabled")})`}</button>
+          </div>
+          {typeSafeProbe && <div className="provider-feedback" role="status"><strong>{typeSafeProbe.state}</strong> · {typeSafeProbe.model} · {typeSafeProbe.note}</div>}
+        </>}
       </section>
 
       <section className="panel settings-panel" aria-labelledby="add-provider-title">

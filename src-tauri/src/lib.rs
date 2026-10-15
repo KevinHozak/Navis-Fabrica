@@ -318,7 +318,54 @@ fn store_openrouter_credential(target: &str, secret: &str) -> Result<(), String>
     }
 }
 
-const SETTINGS_SCHEMA_VERSION: u32 = 3;
+fn resolve_typesafe_credential(profile_id: &str, reference: Option<&str>) -> Option<String> {
+    let reference = reference?;
+    if !providers::typesafe_credential_reference_matches(profile_id, reference) {
+        return None;
+    }
+    resolve_github_credential(reference)
+}
+
+fn store_typesafe_credential(target: &str, secret: &str) -> Result<(), String> {
+    if !providers::valid_typesafe_key(secret) {
+        return Err("Enter a valid TypeSafe API key.".into());
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Credentials::{
+            CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+        };
+        let target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut bytes = secret.trim().as_bytes().to_vec();
+        let credential = CREDENTIALW {
+            Flags: 0,
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target_wide.as_ptr() as *mut u16,
+            Comment: std::ptr::null_mut(),
+            LastWritten: unsafe { std::mem::zeroed() },
+            CredentialBlobSize: bytes.len() as u32,
+            CredentialBlob: bytes.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: std::ptr::null_mut(),
+            TargetAlias: std::ptr::null_mut(),
+            UserName: std::ptr::null_mut(),
+        };
+        let written = unsafe { CredWriteW(&credential, 0) };
+        bytes.fill(0);
+        if written == 0 {
+            return Err("Windows Credential Manager could not save the TypeSafe key.".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        Err("TypeSafe credential storage is available only in the Windows desktop app.".into())
+    }
+}
+
+const SETTINGS_SCHEMA_VERSION: u32 = 4;
 const SETTINGS_FILE: &str = "settings.json";
 const PROJECT_INVENTORY_FILE: &str = "project-inventory.json";
 
@@ -349,6 +396,7 @@ pub struct Settings {
     pub provider_selection: providers::ProviderSelection,
     pub github_accounts: Vec<GitHubAccount>,
     pub selected_github_account_id: Option<String>,
+    pub typesafe_profile: Option<providers::TypeSafeProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +423,7 @@ impl Default for Settings {
             provider_selection: providers::ProviderSelection::default(),
             github_accounts: Vec::new(),
             selected_github_account_id: None,
+            typesafe_profile: None,
         }
     }
 }
@@ -393,6 +442,8 @@ struct SettingsInput {
     github_accounts: Vec<GitHubAccount>,
     #[serde(default)]
     selected_github_account_id: Option<String>,
+    #[serde(default)]
+    typesafe_profile: Option<providers::TypeSafeProfile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,6 +599,16 @@ fn recover_settings(value: Value) -> Settings {
         .and_then(Value::as_str)
         .filter(|id| github_accounts.iter().any(|account| &account.id == *id))
         .map(str::to_owned);
+    let typesafe_profile = object
+        .get("typesafeProfile")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<providers::TypeSafeProfile>(value).ok())
+        .filter(|profile| {
+            providers::typesafe_credential_target(&profile.id).is_ok()
+                && profile.credential_ref.as_ref().is_none_or(|reference| {
+                    providers::typesafe_credential_reference_matches(&profile.id, reference)
+                })
+        });
 
     Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
@@ -561,6 +622,7 @@ fn recover_settings(value: Value) -> Settings {
         provider_selection,
         github_accounts,
         selected_github_account_id,
+        typesafe_profile,
     }
 }
 
@@ -806,6 +868,7 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         &settings.github_accounts,
         settings.selected_github_account_id.as_deref(),
     )?;
+    validate_typesafe_profile(settings.typesafe_profile.as_ref())?;
     let settings = Settings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         project_root: validate_project_root(&settings.project_root)?,
@@ -818,6 +881,7 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         provider_selection: settings.provider_selection,
         github_accounts: settings.github_accounts,
         selected_github_account_id: settings.selected_github_account_id,
+        typesafe_profile: settings.typesafe_profile,
     };
     if !(1..=8).contains(&settings.preferences.scan_depth) {
         return Err("Scan depth must be between 1 and 8.".into());
@@ -831,6 +895,18 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         });
     }
     Ok(settings)
+}
+
+fn validate_typesafe_profile(profile: Option<&providers::TypeSafeProfile>) -> Result<(), String> {
+    if let Some(profile) = profile {
+        providers::typesafe_credential_target(&profile.id)?;
+        if profile.credential_ref.as_ref().is_some_and(|reference| {
+            !providers::typesafe_credential_reference_matches(&profile.id, reference)
+        }) {
+            return Err("The TypeSafe credential reference does not match this profile.".into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_github_accounts(
@@ -967,6 +1043,46 @@ fn probe_openrouter(
     let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref())
         .unwrap_or_default();
     Ok(providers::openrouter_http_probe(&key))
+}
+
+#[tauri::command]
+fn save_typesafe_credential(
+    app: AppHandle,
+    profile_id: String,
+    api_key: String,
+) -> Result<Settings, String> {
+    let mut settings = load_settings(&settings_path(&app)?)?;
+    let profile = settings
+        .typesafe_profile
+        .as_mut()
+        .filter(|profile| profile.id == profile_id)
+        .ok_or("The TypeSafe profile no longer exists.")?;
+    let target = providers::typesafe_credential_target(&profile_id)?;
+    store_typesafe_credential(&target, &api_key)?;
+    profile.credential_ref = Some(format!("credential-store:{target}"));
+    write_settings_atomic(&settings_path(&app)?, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn probe_typesafe(app: AppHandle) -> Result<providers::TypeSafeProbe, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    let Some(profile) = settings.typesafe_profile.as_ref() else {
+        return Ok(providers::TypeSafeProbe {
+            state: "unconfigured".into(),
+            model: providers::TYPESAFE_JEV_MODEL.into(),
+            note: "Add the optional TypeSafe profile to configure connection health.".into(),
+        });
+    };
+    validate_typesafe_profile(Some(profile))?;
+    let credential = profile
+        .enabled
+        .then(|| resolve_typesafe_credential(&profile.id, profile.credential_ref.as_deref()))
+        .flatten();
+    Ok(providers::typesafe_http_probe(
+        profile,
+        credential.as_deref(),
+    ))
 }
 
 #[tauri::command]
@@ -1646,6 +1762,8 @@ pub fn run() {
             probe_ollama,
             save_openrouter_credential,
             probe_openrouter,
+            save_typesafe_credential,
+            probe_typesafe,
             create_provider_handoff,
             start_codex_workflow_run,
             start_antigravity_workflow_run,
@@ -1928,7 +2046,7 @@ mod tests {
     #[test]
     fn defaults_are_schema_versioned_and_windows_friendly() {
         let settings = Settings::default();
-        assert_eq!(settings.schema_version, 3);
+        assert_eq!(settings.schema_version, 4);
         assert_eq!(settings.project_root, r"C:\Projects");
         assert_eq!(settings.preferences.scan_depth, 3);
     }
@@ -1984,6 +2102,36 @@ mod tests {
     }
 
     #[test]
+    fn typesafe_profile_settings_keep_only_matching_opaque_references() {
+        let valid = recover_settings(serde_json::json!({
+            "schemaVersion": 3,
+            "typesafeProfile": {
+                "id": "jev-main",
+                "enabled": true,
+                "credentialRef": "credential-store:navis-fabrica-typesafe-jev-main"
+            }
+        }));
+        assert_eq!(valid.typesafe_profile.as_ref().unwrap().id, "jev-main");
+        assert_eq!(valid.schema_version, 4);
+
+        let invalid = recover_settings(serde_json::json!({
+            "schemaVersion": 4,
+            "typesafeProfile": {
+                "id": "jev-main",
+                "enabled": true,
+                "credentialRef": "credential-store:github-token"
+            }
+        }));
+        assert!(invalid.typesafe_profile.is_none());
+        assert!(validate_typesafe_profile(Some(&providers::TypeSafeProfile {
+            id: "jev-main".into(),
+            enabled: true,
+            credential_ref: Some("raw-api-key-value".into()),
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn invalid_exclusions_cannot_escape_the_root() {
         assert!(validate_exclusions(vec![String::from(r"..\outside")]).is_err());
         assert_eq!(
@@ -2007,11 +2155,11 @@ mod tests {
     fn leaves_settings_from_a_newer_schema_untouched() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = folder.path().join(SETTINGS_FILE);
-        fs::write(&path, r#"{"schemaVersion":4,"projectRoot":"C:\\Projects"}"#).unwrap();
+        fs::write(&path, r#"{"schemaVersion":5,"projectRoot":"C:\\Projects"}"#).unwrap();
         assert!(load_settings(&path).unwrap_err().contains("newer version"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            r#"{"schemaVersion":4,"projectRoot":"C:\\Projects"}"#
+            r#"{"schemaVersion":5,"projectRoot":"C:\\Projects"}"#
         );
     }
 

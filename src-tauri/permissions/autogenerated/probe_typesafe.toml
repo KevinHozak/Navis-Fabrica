@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-probe-typesafe"
+description = "Enables the probe_typesafe command without any pre-configured scope."
+commands.allow = ["probe_typesafe"]
+
+[[permission]]
+identifier = "deny-probe-typesafe"
+description = "Denies the probe_typesafe command without any pre-configured scope."
+commands.deny = ["probe_typesafe"]

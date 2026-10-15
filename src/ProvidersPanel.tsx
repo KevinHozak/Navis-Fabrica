@@ -29,8 +29,10 @@ import {
   WorkflowRun,
   RoutingCandidate,
   RoutingDecision,
+  JevRoutingEvaluation,
   RoutingCalibrationSummary,
   calibrateRouting,
+  evaluateJevRouting,
   RoutingComplexity,
   RoutingPace,
 } from "./settings";
@@ -93,6 +95,8 @@ export function ProvidersPanel() {
   const [desiredMinutes, setDesiredMinutes] = useState("");
   const [manualRoute, setManualRoute] = useState("");
   const [routingDecision, setRoutingDecision] = useState<RoutingDecision | null>(null);
+  const [jevEvaluation, setJevEvaluation] = useState<JevRoutingEvaluation | null>(null);
+  const [taskSummary, setTaskSummary] = useState("");
   const [routingCalibration, setRoutingCalibration] = useState<RoutingCalibrationSummary[]>([]);
   const [routingBusy, setRoutingBusy] = useState(false);
   const [routingError, setRoutingError] = useState("");
@@ -307,7 +311,7 @@ export function ProvidersPanel() {
 
   function updateSelection(next: ProviderSelection) {
     if (!settings) return;
-    void persist({ ...settings, providerSelection: { ...next, runtimeId: runtimeId.trim() || null } });
+    void persist({ ...settings, providerSelection: { ...next, runtimeId: runtimeId.trim() || null, routeSource: "manual", routeConfidencePercent: null, routeExplanation: "Selected manually in Providers." } });
   }
 
   function updateSelectedModelRouting(patch: Partial<Pick<ModelProfile, "contextWindowTokens" | "supportsTools" | "qualityRating">>) {
@@ -319,7 +323,7 @@ export function ProvidersPanel() {
     void persist({ ...settings, providers });
   }
 
-  async function recommendModel() {
+  async function recommendModel(useJev = false) {
     if (!settings) return;
     setRoutingBusy(true);
     setRoutingError("");
@@ -331,7 +335,7 @@ export function ProvidersPanel() {
       }
       setWorkflowRuns(latestRuns);
       setUsageSignals(latestUsageSignals);
-      const candidates: RoutingCandidate[] = settings.providers.flatMap((provider) => provider.models.map((model) => {
+      const candidates: RoutingCandidate[] = settings.providers.filter((provider) => provider.kind !== "custom").flatMap((provider) => provider.models.map((model) => {
         const ollamaModel = provider.kind === "ollama" ? ollamaProbes[provider.id]?.models.find((item) => item.id === model.id) : undefined;
         const openRouterModel = provider.kind === "openRouter" ? openRouterProbes[provider.id]?.models.find((item) => item.id === model.id) : undefined;
         const telemetryId = telemetryProviderId(provider.kind);
@@ -352,11 +356,14 @@ export function ProvidersPanel() {
         };
       }));
       const [manualProviderId, manualModelId] = manualRoute ? JSON.parse(manualRoute) as [string, string] : [null, null];
-      const decision = await evaluateRouting({
+      const request = {
         complexity: routingComplexity, pace: routingPace, requireTools: routingRequireTools, localOnly: routingLocalOnly,
         desiredCompletionMinutes: desiredMinutes.trim() ? Number(desiredMinutes) : null,
         manualProviderId, manualModelId, candidates, usageSignals: latestUsageSignals, nowMs: Date.now(),
-      });
+      };
+      const evaluation = useJev ? await evaluateJevRouting(request, taskSummary.trim()) : null;
+      const decision = evaluation?.routing ?? await evaluateRouting(request);
+      setJevEvaluation(evaluation);
       setRoutingDecision(decision);
       const terminalRuns = latestRuns.filter((run) => ["completed", "failed", "timedOut", "cancelled", "interrupted"].includes(run.state) && run.provider && run.modelId && run.finishedAtMs !== null);
       const calibrationSamples = terminalRuns.map((run) => {
@@ -374,6 +381,23 @@ export function ProvidersPanel() {
     } catch (error) {
       setRoutingError(error instanceof Error ? error.message : String(error));
     } finally { setRoutingBusy(false); }
+  }
+
+  async function applyRoutingSelection() {
+    if (!settings || !routingDecision?.selectedProviderId || !routingDecision.selectedModelId) return;
+    const provider = settings.providers.find((item) => item.id === routingDecision.selectedProviderId);
+    if (!provider?.models.some((model) => model.id === routingDecision.selectedModelId)) {
+      setRoutingError("The selected route is no longer configured. Refresh provider settings and evaluate again.");
+      return;
+    }
+    const source = jevEvaluation?.source ?? "deterministic";
+    const confidence = jevEvaluation?.confidence;
+    await persist({ ...settings, providerSelection: {
+      providerId: provider.id, modelId: routingDecision.selectedModelId, reasoningEffort: null,
+      runtimeId: provider.kind === "ollama" ? "aider-ollama" : provider.kind === "openRouter" ? "aider-openrouter" : provider.kind === "antigravity" ? "agy-cli" : provider.kind === "codex" ? "codex-app-server" : runtimeId.trim() || null,
+      routeSource: source, routeConfidencePercent: confidence == null ? null : Math.round(confidence * 100),
+      routeExplanation: jevEvaluation?.explanation ?? "Selected by the deterministic router.",
+    } });
   }
 
   if (!settings) return <section className="panel settings-panel"><div className="settings-loading" role={saveState === "error" ? "alert" : "status"}>{saveState === "error" ? message : "Loading provider settings…"}</div></section>;
@@ -428,14 +452,21 @@ export function ProvidersPanel() {
           <label className="routing-checkbox"><input type="checkbox" checked={routingRequireTools} onChange={(event) => setRoutingRequireTools(event.target.checked)} /> Require known tool support</label>
           <label className="routing-checkbox"><input type="checkbox" checked={routingLocalOnly} onChange={(event) => setRoutingLocalOnly(event.target.checked)} /> Local-only privacy</label>
         </div>
-        <div className="settings-actions"><button className="button button-primary" type="button" disabled={!desktop || routingBusy || !settings.providers.some((provider) => provider.models.length)} onClick={() => { void recommendModel(); }}>{routingBusy ? "Evaluating…" : "Recommend a model"}</button><p className="settings-feedback" role="status">{routingError}</p></div>
+        <label className="settings-field"><span>Short task summary for Jev</span><textarea rows={2} maxLength={1024} value={taskSummary} onChange={(event) => setTaskSummary(event.target.value)} placeholder="Describe the task in a sentence. Do not include repository files, diffs, credentials, or full issue text." /><small>Only this summary and capability requirements are sent to TypeSafe when Jev is enabled.</small></label>
+        <div className="settings-actions routing-actions">
+          <button className="button button-secondary" type="button" disabled={!desktop || routingBusy || !settings.providers.some((provider) => provider.models.length)} onClick={() => { void recommendModel(false); }}>{routingBusy ? "Evaluating…" : "Recommend a model"}</button>
+          <button className="button button-primary" type="button" disabled={!desktop || routingBusy || !taskSummary.trim() || !settings.providers.some((provider) => provider.models.length)} onClick={() => { void recommendModel(true); }}>{routingBusy ? "Evaluating…" : "Recommend with Jev"}</button>
+          <p className="settings-feedback" role="status">{routingError}</p>
+        </div>
         {routingDecision && <div className="routing-results" aria-live="polite">
           <h3>{routingDecision.selectedProviderId ? `Selected: ${routingDecision.candidates.find((item) => item.selected)?.providerName} · ${routingDecision.candidates.find((item) => item.selected)?.modelName}` : "No eligible model"}</h3>
           <p>{routingDecision.requiredContextTokens.toLocaleString()} tokens required for this complexity. {routingDecision.desiredCompletionNote}</p>
+          {jevEvaluation && <p><strong>{jevEvaluation.source === "jev" ? `Jev · ${Math.round((jevEvaluation.confidence ?? 0) * 100)}% confidence` : jevEvaluation.source === "manual" ? "Manual route override" : "Deterministic fallback"}</strong> · {jevEvaluation.explanation}</p>}
           <ul className="provider-list">{routingDecision.candidates.map((candidate) => <li className={`provider-card routing-candidate${candidate.selected ? " selected" : ""}`} key={`${candidate.providerId}/${candidate.modelId}`}>
             <strong>{candidate.providerName} · {candidate.modelName}</strong><span>{candidate.selected ? "Selected" : candidate.eligible ? "Eligible alternative" : "Rejected"}</span>
             <ul>{candidate.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
           </li>)}</ul>
+          {routingDecision.selectedProviderId && <button className="button button-primary" type="button" disabled={saveState === "saving"} onClick={() => { void applyRoutingSelection(); }}>Apply selected route</button>}
         </div>}
         {routingDecision && <div className="routing-results">
           <h3>Observed calibration</h3>

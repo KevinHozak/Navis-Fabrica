@@ -39,6 +39,9 @@ export type ProviderSelection = {
   modelId: string | null;
   reasoningEffort: string | null;
   runtimeId: string | null;
+  routeSource?: "manual" | "deterministic" | "jev" | null;
+  routeConfidencePercent?: number | null;
+  routeExplanation?: string | null;
 };
 export type UsageCategory = "subscriptionWindow" | "apiSpend" | "contextLimit" | "localResource";
 export type UsageSignal = {
@@ -69,6 +72,12 @@ export type RoutingDecision = {
   selectedProviderId: string | null; selectedModelId: string | null; requiredContextTokens: number;
   desiredCompletionNote: string;
   candidates: { providerId: string; providerName: string; modelId: string; modelName: string; eligible: boolean; selected: boolean; reasons: string[] }[];
+};
+export type JevRoutingEvaluation = {
+  routing: RoutingDecision;
+  source: "manual" | "deterministic" | "jev";
+  confidence: number | null;
+  explanation: string;
 };
 export type FallbackTrigger = "providerFailure" | "quotaBoundary" | "quotaUnknown";
 export type FallbackPolicy = { enabled: boolean; onProviderFailure: boolean; onQuotaBoundary: boolean; localOnly: boolean; maxHandoffs: number };
@@ -301,6 +310,11 @@ export const evaluateRouting = (request: {
   desiredCompletionMinutes: number | null; manualProviderId: string | null; manualModelId: string | null;
   candidates: RoutingCandidate[]; usageSignals: UsageSignal[]; nowMs: number;
 }) => invoke<RoutingDecision>("evaluate_routing", { request });
+export const evaluateJevRouting = (request: {
+  complexity: RoutingComplexity; pace: RoutingPace; requireTools: boolean; localOnly: boolean;
+  desiredCompletionMinutes: number | null; manualProviderId: string | null; manualModelId: string | null;
+  candidates: RoutingCandidate[]; usageSignals: UsageSignal[]; nowMs: number;
+}, taskSummary: string) => invoke<JevRoutingEvaluation>("evaluate_jev_routing", { request, taskSummary });
 export const evaluateProviderFallback = (request: FallbackEvaluationRequest) =>
   invoke<FallbackDecision>("evaluate_provider_fallback", { request });
 export const calibrateRouting = (samples: RoutingCalibrationSample[]) =>

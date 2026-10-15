@@ -33,6 +33,8 @@
     "allow-list-usage-signals",
     "allow-record-manual-usage-estimate",
     "allow-evaluate-routing",
+    "allow-evaluate-provider-fallback",
+    "allow-calibrate-routing",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

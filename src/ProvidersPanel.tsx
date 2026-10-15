@@ -26,6 +26,8 @@ import {
   WorkflowRun,
   RoutingCandidate,
   RoutingDecision,
+  RoutingCalibrationSummary,
+  calibrateRouting,
   RoutingComplexity,
   RoutingPace,
 } from "./settings";
@@ -86,6 +88,7 @@ export function ProvidersPanel() {
   const [desiredMinutes, setDesiredMinutes] = useState("");
   const [manualRoute, setManualRoute] = useState("");
   const [routingDecision, setRoutingDecision] = useState<RoutingDecision | null>(null);
+  const [routingCalibration, setRoutingCalibration] = useState<RoutingCalibrationSummary[]>([]);
   const [routingBusy, setRoutingBusy] = useState(false);
   const [routingError, setRoutingError] = useState("");
   const desktop = isDesktopApp();
@@ -323,6 +326,19 @@ export function ProvidersPanel() {
         manualProviderId, manualModelId, candidates, usageSignals: latestUsageSignals, nowMs: Date.now(),
       });
       setRoutingDecision(decision);
+      const terminalRuns = latestRuns.filter((run) => ["completed", "failed", "timedOut", "cancelled", "interrupted"].includes(run.state) && run.provider && run.modelId && run.finishedAtMs !== null);
+      const calibrationSamples = terminalRuns.map((run) => {
+        const usage = latestUsageSignals
+          .filter((signal) => signal.providerId === run.provider && signal.modelId === run.modelId
+            && signal.status === "available" && signal.confidence === "measured" && signal.value !== null
+            && signal.collectedAtMs >= run.startedAtMs && signal.collectedAtMs <= (run.finishedAtMs ?? 0))
+          .sort((a, b) => b.collectedAtMs - a.collectedAtMs)[0];
+        return {
+          providerId: run.provider!, modelId: run.modelId!, succeeded: run.state === "completed", latencyMs: run.latencyMs,
+          measuredUsage: usage?.value ?? null, usageUnit: usage?.unit ?? null,
+        };
+      });
+      setRoutingCalibration(await calibrateRouting(calibrationSamples));
     } catch (error) {
       setRoutingError(error instanceof Error ? error.message : String(error));
     } finally { setRoutingBusy(false); }
@@ -388,6 +404,15 @@ export function ProvidersPanel() {
             <strong>{candidate.providerName} · {candidate.modelName}</strong><span>{candidate.selected ? "Selected" : candidate.eligible ? "Eligible alternative" : "Rejected"}</span>
             <ul>{candidate.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
           </li>)}</ul>
+        </div>}
+        {routingDecision && <div className="routing-results">
+          <h3>Observed calibration</h3>
+          <p>Summarizes saved terminal runs. Usage appears only when a fresh measured signal was recorded during that run; missing or estimated usage stays unknown. These observations inform your policy settings and do not change them automatically.</p>
+          {routingCalibration.length ? <ul className="provider-list">{routingCalibration.map((summary) => <li className="provider-card" key={`${summary.providerId}/${summary.modelId}`}>
+            <strong>{settings.providers.find((provider) => telemetryProviderId(provider.kind) === summary.providerId)?.name ?? summary.providerId} · {settings.providers.flatMap((provider) => provider.models).find((model) => model.id === summary.modelId)?.name ?? summary.modelId}</strong>
+            <span>{summary.sampleCount} terminal runs · {Math.round(summary.successRate * 100)}% completed · median latency {summary.medianLatencyMs === null ? "unknown" : `${summary.medianLatencyMs.toLocaleString()} ms`}</span>
+            <small>{summary.unknownUsageCount} run(s) with unknown usage{summary.measuredUsageByUnit.map((usage) => ` · median ${usage.medianValue.toLocaleString()} ${usage.unit} across ${usage.sampleCount} run(s)`).join("")}</small>
+          </li>)}</ul> : <p className="registry-context-note">No saved terminal run samples are available yet.</p>}
         </div>}
       </section>
 

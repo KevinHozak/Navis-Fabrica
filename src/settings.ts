@@ -68,6 +68,28 @@ export type RoutingDecision = {
   desiredCompletionNote: string;
   candidates: { providerId: string; providerName: string; modelId: string; modelName: string; eligible: boolean; selected: boolean; reasons: string[] }[];
 };
+export type FallbackTrigger = "providerFailure" | "quotaBoundary" | "quotaUnknown";
+export type FallbackPolicy = { enabled: boolean; onProviderFailure: boolean; onQuotaBoundary: boolean; localOnly: boolean; maxHandoffs: number };
+export type FallbackDecision = {
+  policyVersion: number; accepted: boolean; localOnly: boolean; sourceRunId: string; trigger: FallbackTrigger; sourceProviderId: string;
+  targetProviderId: string | null; targetModelId: string | null; checkpointRef: string | null; handoffCount: number;
+  reason: string; routing: RoutingDecision | null;
+};
+export type FallbackEvaluationRequest = {
+  sourceRunId: string; policy: FallbackPolicy; trigger: FallbackTrigger; currentProviderId: string;
+  visitedProviderIds: string[]; handoffCount: number; sourceRunTerminal: boolean; safeCheckpointRef: string | null;
+  effectsReconciled: boolean;
+  routing: {
+    complexity: RoutingComplexity; pace: RoutingPace; requireTools: boolean; localOnly: boolean;
+    desiredCompletionMinutes: number | null; manualProviderId: string | null; manualModelId: string | null;
+    candidates: RoutingCandidate[]; usageSignals: UsageSignal[]; nowMs: number;
+  };
+};
+export type RoutingCalibrationSample = { providerId: string; modelId: string; succeeded: boolean; latencyMs: number | null; measuredUsage: number | null; usageUnit: string | null };
+export type RoutingCalibrationSummary = {
+  providerId: string; modelId: string; sampleCount: number; successRate: number; medianLatencyMs: number | null;
+  measuredUsageByUnit: { unit: string; sampleCount: number; medianValue: number }[]; unknownUsageCount: number;
+};
 export type ProviderAvailability = {
   providerId: string;
   executableFound: boolean;
@@ -134,13 +156,13 @@ export type GitHubIssue = GitHubIssueSummary & {
 
 export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
 export type WorkflowRun = {
-  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; timeoutSeconds: number; state: string;
+  id: string; executable: string; provider: string | null; providerProfileId?: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; timeoutSeconds: number; state: string;
   modelId: string | null; startedAtMs: number; finishedAtMs: number | null; latencyMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
   workflow: WorkflowRunMetadata | null;
   handoff: ProviderHandoff | null;
 };
-export type ProviderHandoff = { version: number; sourceRunId: string; targetProviderId: string; workingTreeRoot: string; workingTreePaths: string[]; workingTreeFingerprint: string | null; goal: string; scope: string; diff: string; checks: string; pendingWork: string; completedSideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null; createdAtMs: number };
+export type ProviderHandoff = { version: number; sourceRunId: string; targetProviderId: string; workingTreeRoot: string; workingTreePaths: string[]; workingTreeFingerprint: string | null; goal: string; scope: string; diff: string; checks: string; pendingWork: string; completedSideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null; fallbackDecisions: FallbackDecision[]; createdAtMs: number };
 export type HandoffInput = { sourceRunId: string; targetProviderId: string; goal: string; scope: string; diff: string; checks: string; pendingWork: string };
 export type WorkflowRunMetadata = {
   action: "dev-work" | "dev-push" | "dev-build";
@@ -270,6 +292,10 @@ export const evaluateRouting = (request: {
   desiredCompletionMinutes: number | null; manualProviderId: string | null; manualModelId: string | null;
   candidates: RoutingCandidate[]; usageSignals: UsageSignal[]; nowMs: number;
 }) => invoke<RoutingDecision>("evaluate_routing", { request });
+export const evaluateProviderFallback = (request: FallbackEvaluationRequest) =>
+  invoke<FallbackDecision>("evaluate_provider_fallback", { request });
+export const calibrateRouting = (samples: RoutingCalibrationSample[]) =>
+  invoke<RoutingCalibrationSummary[]>("calibrate_routing", { samples });
 
 export const getCachedGitHubActivity = (owner: string, repository: string) =>
   invoke<GitHubActivity>("get_cached_github_activity", { owner, repository });

@@ -53,6 +53,8 @@ pub struct RunRecord {
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
+    pub provider_profile_id: Option<String>,
+    #[serde(default)]
     pub model_id: Option<String>,
     pub cwd: String,
     #[serde(default)]
@@ -226,7 +228,7 @@ pub struct WorkflowSideEffects {
     pub verification_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderHandoff {
     pub version: u32,
@@ -244,6 +246,8 @@ pub struct ProviderHandoff {
     pub checks: String,
     pub pending_work: String,
     pub completed_side_effects: Option<WorkflowSideEffects>,
+    #[serde(default)]
+    pub fallback_decisions: Vec<crate::routing::FallbackDecision>,
     pub created_at_ms: u128,
 }
 
@@ -351,6 +355,7 @@ pub struct CodexRunConfig {
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub model_id: String,
+    pub provider_profile_id: String,
     pub reasoning_effort: Option<String>,
     pub prompt: String,
     pub skill_id: Option<String>,
@@ -365,6 +370,7 @@ pub struct AntigravityRunConfig {
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub model_id: String,
+    pub provider_profile_id: String,
     pub prompt: String,
     pub timeout_seconds: u64,
 }
@@ -375,6 +381,7 @@ pub struct OllamaRunConfig {
     pub cwd: PathBuf,
     pub endpoint: String,
     pub model_id: String,
+    pub provider_profile_id: String,
     pub prompt: String,
     pub test_command: Option<String>,
     pub timeout_seconds: u64,
@@ -385,6 +392,7 @@ pub struct OpenRouterRunConfig {
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub model_id: String,
+    pub provider_profile_id: String,
     pub api_key: String,
     pub prompt: String,
     pub test_command: Option<String>,
@@ -2196,7 +2204,7 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
 
 #[tauri::command]
 pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRecord, String> {
-    start_run(app, request, None, None, None, None, None, Vec::new())
+    start_run(app, request, None, None, None, None, None, None, Vec::new())
 }
 
 pub fn start_codex_workflow_run(
@@ -2262,6 +2270,7 @@ pub fn start_codex_workflow_run(
         mutating: true,
     };
     let model_id = config.model_id.clone();
+    let provider_profile_id = config.provider_profile_id.clone();
     let handoff = config.handoff.clone();
     start_run(
         app,
@@ -2269,6 +2278,7 @@ pub fn start_codex_workflow_run(
         Some(config),
         Some("codex"),
         Some(model_id),
+        Some(provider_profile_id),
         handoff,
         None,
         Vec::new(),
@@ -2323,6 +2333,7 @@ pub fn start_antigravity_workflow_run(
         None,
         Some("antigravity"),
         Some(model_id),
+        Some(config.provider_profile_id),
         handoff,
         None,
         Vec::new(),
@@ -2401,6 +2412,11 @@ pub fn create_provider_handoff(
             .workflow
             .as_ref()
             .and_then(|workflow| workflow.side_effects.clone()),
+        fallback_decisions: source
+            .handoff
+            .as_ref()
+            .map(|handoff| handoff.fallback_decisions.clone())
+            .unwrap_or_default(),
         created_at_ms: now_ms(),
     };
     source.handoff = Some(packet.clone());
@@ -2408,10 +2424,127 @@ pub fn create_provider_handoff(
     Ok(packet)
 }
 
+fn source_provider_profile_matches(
+    saved_profile_id: Option<&str>,
+    candidate_profile_id: &str,
+) -> bool {
+    saved_profile_id == Some(candidate_profile_id)
+}
+
+fn workflow_effects_reconciled(workflow: Option<&WorkflowRunMetadata>) -> bool {
+    workflow.is_none_or(|workflow| {
+        if workflow.requested_effects.is_empty() && workflow.side_effects.is_none() {
+            return true;
+        }
+        workflow
+            .side_effects
+            .as_ref()
+            .is_some_and(|effects| effects.verified)
+    })
+}
+
+pub fn evaluate_provider_fallback(
+    app: &AppHandle,
+    mut request: crate::routing::FallbackRequest,
+) -> Result<crate::routing::FallbackDecision, String> {
+    let path = history_path(app)?;
+    let mut state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.records.is_empty() {
+        state.records = load_records(&path)?;
+    }
+    let source_index = state
+        .records
+        .iter()
+        .position(|record| record.id == request.source_run_id)
+        .ok_or("The source run is no longer in saved workflow history.")?;
+    let source = state.records[source_index].clone();
+    let Some(mut handoff) = source.handoff.clone() else {
+        return Err(
+            "Prepare a worktree-verified handoff checkpoint before evaluating fallback.".into(),
+        );
+    };
+    if !matches!(source.state.as_str(), "failed" | "timedOut" | "interrupted") {
+        return Err("Fallback can be evaluated only after a failed, timed-out, or interrupted run reaches a terminal state.".into());
+    }
+    let current_candidate = request
+        .routing
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == request.current_provider_id)
+        .ok_or("The source provider must be included in the routing candidates.")?;
+    if !source_provider_profile_matches(
+        source.provider_profile_id.as_deref(),
+        &current_candidate.provider_id,
+    ) || source.provider.as_deref() != Some(current_candidate.telemetry_provider_id.as_str())
+        || source.model_id.as_deref() != Some(current_candidate.model_id.as_str())
+    {
+        return Err("The exact source provider profile and model must match the saved run; older runs without profile identity cannot be used for fallback.".into());
+    }
+    if matches!(
+        request.trigger,
+        crate::routing::FallbackTrigger::QuotaBoundary
+    ) && !crate::routing::has_confirmed_quota_boundary(
+        &request.routing,
+        &current_candidate.telemetry_provider_id,
+    ) {
+        request.trigger = crate::routing::FallbackTrigger::QuotaUnknown;
+    }
+
+    request.source_run_terminal = true;
+    request.safe_checkpoint_ref = None;
+    if let (Some(expected), Ok(Some(snapshot))) = (
+        handoff.working_tree_fingerprint.as_deref(),
+        git_worktree_snapshot(Path::new(&source.cwd)),
+    ) {
+        if snapshot.fingerprint == expected {
+            request.safe_checkpoint_ref = Some(expected.to_owned());
+        }
+    }
+    request.effects_reconciled = workflow_effects_reconciled(source.workflow.as_ref())
+        && handoff
+            .completed_side_effects
+            .as_ref()
+            .is_none_or(|effects| effects.verified);
+    let visited = handoff
+        .fallback_decisions
+        .iter()
+        .filter(|decision| decision.accepted)
+        .flat_map(|decision| {
+            decision
+                .target_provider_id
+                .iter()
+                .chain(std::iter::once(&decision.source_provider_id))
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    request.visited_provider_ids = visited.into_iter().collect();
+    request.handoff_count = handoff
+        .fallback_decisions
+        .iter()
+        .filter(|decision| decision.accepted)
+        .count()
+        .min(u8::MAX as usize) as u8;
+    let decision = crate::routing::evaluate_fallback(request);
+    handoff.fallback_decisions.push(decision.clone());
+    if handoff.fallback_decisions.len() > 16 {
+        handoff.fallback_decisions.remove(0);
+    }
+    state.records[source_index].handoff = Some(handoff);
+    persist_records(&path, &state.records)?;
+    let snapshot = state.records[source_index].clone();
+    drop(state);
+    let _ = app.emit("workflow-run-updated", snapshot);
+    Ok(decision)
+}
+
 pub fn saved_provider_handoff(
     app: &AppHandle,
     source_run_id: &str,
     target_provider_id: &str,
+    target_model_id: &str,
+    target_is_local: bool,
 ) -> Result<ProviderHandoff, String> {
     let path = history_path(app)?;
     let mut state = store()
@@ -2428,8 +2561,30 @@ pub fn saved_provider_handoff(
         .filter(|packet| {
             packet.target_provider_id == target_provider_id && packet.source_run_id == source_run_id
         })
+        .filter(|packet| {
+            approved_fallback_matches(packet, target_provider_id, target_model_id, target_is_local)
+        })
         .ok_or_else(|| {
-            "Create a manual handoff for this source run and selected target provider first.".into()
+            "Create a manual handoff for this source run and selected target provider first, and keep any approved fallback on its recorded provider and model.".into()
+        })
+}
+
+fn approved_fallback_matches(
+    packet: &ProviderHandoff,
+    target_provider_id: &str,
+    target_model_id: &str,
+    target_is_local: bool,
+) -> bool {
+    packet
+        .fallback_decisions
+        .iter()
+        .rev()
+        .next()
+        .is_none_or(|decision| {
+            (!decision.local_only || target_is_local)
+                && (!decision.accepted
+                    || (decision.target_provider_id.as_deref() == Some(target_provider_id)
+                        && decision.target_model_id.as_deref() == Some(target_model_id)))
         })
 }
 
@@ -2523,6 +2678,7 @@ pub fn start_ollama_workflow_run(
         None,
         Some("ollama"),
         Some(model_id),
+        Some(config.provider_profile_id),
         handoff,
         Some(config.endpoint),
         Vec::new(),
@@ -2598,6 +2754,7 @@ pub fn start_openrouter_workflow_run(
         None,
         Some("openrouter"),
         Some(model_id),
+        Some(config.provider_profile_id),
         handoff,
         None,
         vec![("OPENROUTER_API_KEY".into(), config.api_key)],
@@ -2610,6 +2767,7 @@ fn start_run(
     codex: Option<CodexRunConfig>,
     provider: Option<&'static str>,
     model_id: Option<String>,
+    provider_profile_id: Option<String>,
     handoff: Option<ProviderHandoff>,
     ollama_endpoint: Option<String>,
     provider_environment: Vec<(String, String)>,
@@ -2653,6 +2811,7 @@ fn start_run(
         id: id.clone(),
         executable: executable.to_string_lossy().into_owned(),
         provider: provider.map(str::to_owned),
+        provider_profile_id,
         model_id: model_id.map(|value| crate::usage::safe_identity(&value)),
         cwd: cwd.to_string_lossy().into_owned(),
         thread_id: None,
@@ -3266,6 +3425,7 @@ mod tests {
             checks: "none".into(),
             pending_work: "finish".into(),
             completed_side_effects: None,
+            fallback_decisions: vec![],
             created_at_ms: 1,
         };
         assert!(ensure_handoff_worktree(directory.path(), &handoff).is_ok());
@@ -3309,6 +3469,7 @@ mod tests {
             id: "fixture".into(),
             executable: "test".into(),
             provider: None,
+            provider_profile_id: None,
             model_id: None,
             cwd: directory.path().display().to_string(),
             thread_id: None,
@@ -3363,6 +3524,20 @@ mod tests {
                     verified: true,
                     verification_message: None,
                 }),
+                fallback_decisions: vec![crate::routing::FallbackDecision {
+                    policy_version: crate::routing::FALLBACK_POLICY_VERSION,
+                    accepted: true,
+                    local_only: false,
+                    source_run_id: "fixture".into(),
+                    trigger: crate::routing::FallbackTrigger::ProviderFailure,
+                    source_provider_id: "codex-profile".into(),
+                    target_provider_id: Some("ollama-local".into()),
+                    target_model_id: Some("model".into()),
+                    checkpoint_ref: Some("fixture-checkpoint".into()),
+                    handoff_count: 1,
+                    reason: "fixture decision".into(),
+                    routing: None,
+                }],
                 created_at_ms: 2,
             }),
         };
@@ -3371,6 +3546,44 @@ mod tests {
         let restored = load_records(&path).unwrap();
         assert_eq!(restored[0].state, record.state);
         assert_eq!(restored[0].handoff, record.handoff);
+        assert_eq!(
+            restored[0].handoff.as_ref().unwrap().fallback_decisions[0].policy_version,
+            crate::routing::FALLBACK_POLICY_VERSION
+        );
+        let mut legacy_json = serde_json::to_value(&record).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("providerProfileId");
+        let legacy_record: RunRecord = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy_record.provider_profile_id, None);
+        let checkpoint = restored[0].handoff.as_ref().unwrap();
+        assert!(approved_fallback_matches(
+            checkpoint,
+            "ollama-local",
+            "model",
+            true
+        ));
+        assert!(!approved_fallback_matches(
+            checkpoint,
+            "ollama-local",
+            "different-model",
+            true
+        ));
+        let mut privacy_checkpoint = checkpoint.clone();
+        privacy_checkpoint.fallback_decisions[0].local_only = true;
+        assert!(!approved_fallback_matches(
+            &privacy_checkpoint,
+            "openrouter-profile",
+            "model",
+            false
+        ));
+        assert!(approved_fallback_matches(
+            &privacy_checkpoint,
+            "ollama-local",
+            "model",
+            true
+        ));
         assert_eq!(restored[0].process_id, Some(std::process::id()));
         assert!(interrupted_process_owns_scope(
             &restored,
@@ -3487,6 +3700,52 @@ mod tests {
             github_repository_from_remote("git@github.com:KevinHozak/Navis-Fabrica.git").as_deref(),
             Some("kevinhozak/navis-fabrica")
         );
+    }
+
+    #[test]
+    fn fallback_requires_a_verified_receipt_for_requested_side_effects() {
+        let mut workflow = WorkflowRunMetadata {
+            action: "dev-push".into(),
+            operation_key: "b".repeat(64),
+            intent: "Complete the selected delivery.".into(),
+            build_profile: None,
+            issue_url: None,
+            scope_paths: vec!["src/main.rs".into()],
+            requested_effects: vec!["push".into()],
+            side_effects: None,
+            build_artifact: None,
+        };
+        assert!(!workflow_effects_reconciled(Some(&workflow)));
+
+        workflow.side_effects = Some(WorkflowSideEffects {
+            commit_sha: None,
+            remote_branch: Some("feat/example".into()),
+            pull_request_url: None,
+            verified: false,
+            verification_message: None,
+        });
+        assert!(!workflow_effects_reconciled(Some(&workflow)));
+
+        workflow.side_effects.as_mut().unwrap().verified = true;
+        assert!(workflow_effects_reconciled(Some(&workflow)));
+
+        workflow.requested_effects.clear();
+        workflow.side_effects = None;
+        assert!(workflow_effects_reconciled(Some(&workflow)));
+        assert!(workflow_effects_reconciled(None));
+    }
+
+    #[test]
+    fn fallback_source_identity_requires_the_exact_provider_profile() {
+        assert!(source_provider_profile_matches(
+            Some("codex-profile-a"),
+            "codex-profile-a"
+        ));
+        assert!(!source_provider_profile_matches(
+            Some("codex-profile-a"),
+            "codex-profile-b"
+        ));
+        assert!(!source_provider_profile_matches(None, "codex-profile-a"));
     }
 
     #[test]

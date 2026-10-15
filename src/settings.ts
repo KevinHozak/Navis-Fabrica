@@ -78,6 +78,16 @@ export type JevRoutingEvaluation = {
   source: "manual" | "deterministic" | "jev";
   confidence: number | null;
   explanation: string;
+  deterministicProviderId: string | null;
+  deterministicModelId: string | null;
+  usage: { inputTokens: number | null; outputTokens: number | null } | null;
+  estimatedCostUsd: number | null;
+  jevCalled: boolean;
+};
+export type JevRoutingHistoryEntry = {
+  evaluatedAtMs: number; source: string; selectedProviderId: string | null; selectedModelId: string | null;
+  deterministicProviderId: string | null; deterministicModelId: string | null; confidence: number | null;
+  inputTokens: number | null; outputTokens: number | null; estimatedCostUsd: number | null;
 };
 export type FallbackTrigger = "providerFailure" | "quotaBoundary" | "quotaUnknown";
 export type FallbackPolicy = { enabled: boolean; onProviderFailure: boolean; onQuotaBoundary: boolean; localOnly: boolean; maxHandoffs: number };
@@ -298,6 +308,7 @@ export const saveTypeSafeCredential = (profileId: string, apiKey: string) =>
   invoke<Settings>("save_typesafe_credential", { profileId, apiKey });
 export const probeTypeSafe = () => invoke<TypeSafeProbe>("probe_typesafe");
 export const listUsageSignals = () => invoke<UsageSignal[]>("list_usage_signals");
+export const listJevRoutingHistory = () => invoke<JevRoutingHistoryEntry[]>("list_jev_routing_history");
 export const recordManualUsageEstimate = (estimate: {
   category: UsageCategory;
   value: number;

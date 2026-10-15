@@ -14,6 +14,7 @@ fn main() {
             "save_typesafe_credential",
             "probe_typesafe",
             "evaluate_jev_routing",
+            "list_jev_routing_history",
             "start_openrouter_workflow_run",
             "create_provider_handoff",
             "start_ollama_workflow_run",

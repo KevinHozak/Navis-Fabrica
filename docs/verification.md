@@ -10,6 +10,16 @@ The initial scaffold delivered only the basic structure. Its original verificati
 - `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` and `git diff --check`: passed. No real API key or live TypeSafe request was used.
 - TypeSafe API reference: [TypeSafe API Swagger](https://api.typesafe.ai/docs).
 
+## Jev-P4 cost visibility and routing evaluation (issue #62)
+
+- Request cost is estimated as reported input tokens × $0.042 / 1,000,000; TypeSafe output tokens are treated as free. The UI labels this as an estimate, not an account bill. The estimate is unknown when input token usage is absent; partial usage remains partial.
+- Local routing history stores only the evaluation timestamp, source, selected and deterministic provider/model IDs, confidence, reported token counts, and estimated cost. It does not store task summaries, provider keys, repository content, or diffs. History is capped at the latest 100 evaluations.
+- The deterministic fixture summary covers a high-confidence Jev selection, a below-floor response, and a transport fallback. The 0.75 confidence floor remains fixed; any future change must be gated on the planned calibration process. Automated coverage uses fixtures and requires no API key.
+- Live TypeSafe verification is separate and opt-in. No real-key request was made for automated verification.
+- Pricing reference: [TypeSafe API Swagger](https://api.typesafe.ai/docs); the configured estimate follows the issue's published input price of $0.042 per million tokens with free output.
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml`: 127 unit tests and 6 release-security contract tests passed, including Jev usage/cost, unknown usage, fixture outcome summary, and persisted history privacy. Focused `routing::`, `usage::`, and `jev::` runs passed as well. `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` and `git diff --check` passed.
+- Frontend `npm run build` could not run because this worktree has no installed npm dependencies. `npm ci --ignore-scripts --offline` confirmed a required package is not cached; a normal registry install did not return and was stopped. No frontend build result is claimed.
+
 - `npm install --ignore-scripts`: locked dependencies installed; audit reported zero vulnerabilities.
 - `npm run build`: TypeScript and Vite production build passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml --locked -j 2` with `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_DEV_INCREMENTAL=false`: passed on Windows after removing this scaffold's generated cache and adding the required Windows icon. An earlier attempt hit low disk space.

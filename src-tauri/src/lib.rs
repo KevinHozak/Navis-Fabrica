@@ -1786,6 +1786,7 @@ pub fn run() {
             runs::respond_codex_approval,
             runs::respond_codex_user_input,
             list_usage_signals,
+            list_jev_routing_history,
             record_manual_usage_estimate,
             evaluate_routing,
             evaluate_jev_routing,
@@ -1799,6 +1800,11 @@ pub fn run() {
 #[tauri::command]
 fn list_usage_signals(app: AppHandle) -> Result<Vec<usage::UsageSignal>, String> {
     usage::list_signals(&runs::history_path(&app)?, usage::now_ms())
+}
+
+#[tauri::command]
+fn list_jev_routing_history(app: AppHandle) -> Result<Vec<usage::JevRoutingHistoryEntry>, String> {
+    usage::list_jev_routing_history(&runs::history_path(&app)?)
 }
 
 #[tauri::command]
@@ -2070,6 +2076,19 @@ fn evaluate_jev_routing(
             "Local-only privacy is enabled; Jev was not called and deterministic routing was used."
                 .into();
     }
+    let entry = usage::JevRoutingHistoryEntry {
+        evaluated_at_ms: request.now_ms,
+        source: evaluation.source.clone(),
+        selected_provider_id: evaluation.routing.selected_provider_id.clone(),
+        selected_model_id: evaluation.routing.selected_model_id.clone(),
+        deterministic_provider_id: evaluation.deterministic_provider_id.clone(),
+        deterministic_model_id: evaluation.deterministic_model_id.clone(),
+        confidence: evaluation.confidence,
+        input_tokens: evaluation.usage.and_then(|usage| usage.input_tokens),
+        output_tokens: evaluation.usage.and_then(|usage| usage.output_tokens),
+        estimated_cost_usd: evaluation.estimated_cost_usd,
+    };
+    usage::record_jev_routing(&runs::history_path(&app)?, &entry)?;
     Ok(evaluation)
 }
 

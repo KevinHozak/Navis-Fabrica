@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-jev-routing-history"
+description = "Enables the list_jev_routing_history command without any pre-configured scope."
+commands.allow = ["list_jev_routing_history"]
+
+[[permission]]
+identifier = "deny-list-jev-routing-history"
+description = "Denies the list_jev_routing_history command without any pre-configured scope."
+commands.deny = ["list_jev_routing_history"]

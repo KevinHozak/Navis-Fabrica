@@ -13,6 +13,7 @@ fn main() {
             "probe_openrouter",
             "save_typesafe_credential",
             "probe_typesafe",
+            "evaluate_jev_routing",
             "start_openrouter_workflow_run",
             "create_provider_handoff",
             "start_ollama_workflow_run",

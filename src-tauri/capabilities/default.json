@@ -37,6 +37,7 @@
     "allow-list-usage-signals",
     "allow-record-manual-usage-estimate",
     "allow-evaluate-routing",
+    "allow-evaluate-jev-routing",
     "allow-evaluate-provider-fallback",
     "allow-calibrate-routing",
     "allow-get-project-inventory",

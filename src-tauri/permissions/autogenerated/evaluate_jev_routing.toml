@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-evaluate-jev-routing"
+description = "Enables the evaluate_jev_routing command without any pre-configured scope."
+commands.allow = ["evaluate_jev_routing"]
+
+[[permission]]
+identifier = "deny-evaluate-jev-routing"
+description = "Denies the evaluate_jev_routing command without any pre-configured scope."
+commands.deny = ["evaluate_jev_routing"]

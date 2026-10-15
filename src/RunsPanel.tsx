@@ -28,6 +28,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [codexAnswers, setCodexAnswers] = useState<Record<string, Record<string, string>>>({});
   const [selectedProviderKind, setSelectedProviderKind] = useState<string | null>(null);
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [routeConfirmation, setRouteConfirmation] = useState("");
   const [ollamaTestCommand, setOllamaTestCommand] = useState("");
   const [handoffSourceRunId, setHandoffSourceRunId] = useState<string | null>(null);
   const [handoffGoal, setHandoffGoal] = useState("");
@@ -94,7 +95,15 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   }, []);
 
   useEffect(() => setCwd(defaultCwd), [defaultCwd]);
-  useEffect(() => { loadSettings().then((settings) => { const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId); setSelectedProviderKind(provider?.kind ?? null); setSelectedProviderId(provider?.id ?? null); }).catch(() => { setSelectedProviderKind(null); setSelectedProviderId(null); }); }, []);
+  useEffect(() => { loadSettings().then((settings) => {
+    const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId);
+    const model = provider?.models.find((item) => item.id === settings.providerSelection.modelId);
+    setSelectedProviderKind(provider?.kind ?? null);
+    setSelectedProviderId(provider?.id ?? null);
+    setRouteConfirmation(provider && model
+      ? `${provider.name} · ${model.name} · ${settings.providerSelection.routeSource ?? "manual"} selection${settings.providerSelection.routeConfidencePercent == null ? "" : ` · ${settings.providerSelection.routeConfidencePercent}% Jev confidence`}${settings.providerSelection.routeExplanation ? ` · ${settings.providerSelection.routeExplanation}` : ""}`
+      : "No configured provider/model route is selected.");
+  }).catch(() => { setSelectedProviderKind(null); setSelectedProviderId(null); setRouteConfirmation("The saved provider route could not be loaded."); }); }, []);
   useEffect(() => { discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
   const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0] ?? null, [runs, selectedId]);
 
@@ -383,6 +392,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgent(event); }}>
         <label>Project scope<input value={defaultCwd} readOnly aria-readonly="true" /></label>
+        <p className="registry-context-note" role="status">Route confirmation: {routeConfirmation} This selection is saved in Providers; execution starts only after you press Start.</p>
         {selectedProviderKind === "codex" && <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
           <option value="">No skill</option>{skills.filter((skill) => skill.status === "available" && skill.compatibleAgents.includes("Codex")).map((skill) => <option key={skill.id} value={skill.id}>{skill.id}</option>)}
         </select></label>}

@@ -1788,6 +1788,7 @@ pub fn run() {
             list_usage_signals,
             record_manual_usage_estimate,
             evaluate_routing,
+            evaluate_jev_routing,
             evaluate_provider_fallback,
             calibrate_routing
         ])
@@ -1844,6 +1845,232 @@ fn evaluate_routing(mut request: routing::Request) -> Result<routing::Decision, 
     }
     request.now_ms = usage::now_ms();
     Ok(routing::decide(request))
+}
+
+#[tauri::command]
+fn evaluate_jev_routing(
+    app: AppHandle,
+    mut request: routing::Request,
+    task_summary: String,
+) -> Result<jev::RoutingEvaluation, String> {
+    if request.candidates.len() > 3_200 || request.usage_signals.len() > 500 {
+        return Err("Routing input exceeds the supported candidate or signal limit.".into());
+    }
+    request.now_ms = usage::now_ms();
+    // Share the same request validation used by deterministic routing.
+    let _ = evaluate_routing(request.clone())?;
+    let summary = task_summary.trim().to_owned();
+    if summary.is_empty()
+        || summary.len() > jev::MAX_SUMMARY_BYTES
+        || summary.chars().any(char::is_control)
+    {
+        return Err(
+            "Enter a short task summary of 1,024 bytes or fewer without control characters.".into(),
+        );
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
+    for candidate in &request.candidates {
+        let profile = settings
+            .providers
+            .iter()
+            .find(|profile| profile.id == candidate.provider_id)
+            .ok_or("Routing candidates must come from configured provider profiles.")?;
+        if !profile.kind.supports_workflow_run()
+            || profile.kind.telemetry_id() != candidate.telemetry_provider_id
+            || !profile
+                .models
+                .iter()
+                .any(|model| model.id == candidate.model_id)
+        {
+            return Err("Routing candidates must identify an available model on a configured workflow provider.".into());
+        }
+    }
+
+    // Run privacy, tool, and context eligibility first. Only inspect the
+    // providers that remain candidates, so local-only/no-route cases stay offline.
+    let preliminary = routing::decide(request.clone());
+    let eligible_provider_ids = preliminary
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .map(|candidate| candidate.provider_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut healthy_routes = std::collections::HashSet::new();
+    let path = std::env::var_os("PATH");
+    for profile in &settings.providers {
+        if !eligible_provider_ids.contains(profile.id.as_str()) {
+            continue;
+        }
+        let availability = providers::inspect(profile, path.as_deref());
+        let ready = availability.executable_found && availability.capabilities.run_start;
+        if !ready {
+            continue;
+        }
+        let candidate_models = request
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.provider_id == profile.id)
+            .map(|candidate| candidate.model_id.as_str())
+            .collect::<Vec<_>>();
+        match profile.kind {
+            providers::ProviderKind::Antigravity => {
+                if let Some(executable) = availability
+                    .executable_path
+                    .as_deref()
+                    .map(std::path::Path::new)
+                {
+                    let probe = providers::probe_antigravity(executable);
+                    if probe.state == "ready" {
+                        for candidate in request.candidates.iter().filter(|candidate| {
+                            candidate.provider_id == profile.id
+                                && probe.models.contains(&candidate.model_id)
+                        }) {
+                            healthy_routes.insert((
+                                candidate.provider_id.clone(),
+                                candidate.model_id.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            providers::ProviderKind::Ollama => {
+                let probe = providers::ollama_probe(
+                    profile
+                        .endpoint
+                        .as_deref()
+                        .unwrap_or(providers::OLLAMA_DEFAULT_ENDPOINT),
+                );
+                if probe.state == "ready" {
+                    for candidate in request.candidates.iter().filter(|candidate| {
+                        candidate.provider_id == profile.id
+                            && probe
+                                .models
+                                .iter()
+                                .any(|model| model.id == candidate.model_id && model.eligible)
+                    }) {
+                        healthy_routes
+                            .insert((candidate.provider_id.clone(), candidate.model_id.clone()));
+                    }
+                }
+            }
+            providers::ProviderKind::OpenRouter => {
+                let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref());
+                if let Some(key) = key {
+                    let probe = providers::openrouter_http_probe(&key);
+                    if probe.state == "ready" {
+                        for model_id in candidate_models
+                            .into_iter()
+                            .filter(|id| probe.models.iter().any(|model| model.id == *id))
+                        {
+                            healthy_routes.insert((profile.id.clone(), model_id.to_owned()));
+                        }
+                    }
+                }
+            }
+            _ => {
+                for candidate in request
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.provider_id == profile.id)
+                {
+                    healthy_routes
+                        .insert((candidate.provider_id.clone(), candidate.model_id.clone()));
+                }
+            }
+        }
+    }
+    let original = request.candidates.clone();
+    request.candidates.retain(|candidate| {
+        healthy_routes.contains(&(candidate.provider_id.clone(), candidate.model_id.clone()))
+    });
+    let mut fallback = routing::decide(request.clone());
+    for candidate in original.iter().filter(|candidate| {
+        !healthy_routes.contains(&(candidate.provider_id.clone(), candidate.model_id.clone()))
+    }) {
+        fallback.candidates.push(routing::CandidateDecision {
+            provider_id: candidate.provider_id.clone(),
+            provider_name: candidate.provider_name.clone(),
+            model_id: candidate.model_id.clone(),
+            model_name: candidate.model_name.clone(),
+            eligible: false,
+            selected: false,
+            reasons: vec!["Rejected: provider health or run availability check failed.".into()],
+        });
+    }
+    let eligible = fallback
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .filter_map(|candidate| {
+            let route = original.iter().find(|route| {
+                route.provider_id == candidate.provider_id && route.model_id == candidate.model_id
+            })?;
+            Some(jev::EligibleRoute {
+                id: format!("{}:{}", candidate.provider_id, candidate.model_id),
+                provider: candidate.provider_name.clone(),
+                model: candidate.model_name.clone(),
+                context_tokens: route
+                    .context_tokens
+                    .and_then(|value| u32::try_from(value).ok()),
+                supports_tools: route.supports_tools,
+                is_local: route.is_local,
+            })
+        })
+        .collect::<Vec<_>>();
+    let preferred_route_id = fallback
+        .selected_provider_id
+        .as_ref()
+        .zip(fallback.selected_model_id.as_ref())
+        .map(|(provider_id, model_id)| format!("{provider_id}:{model_id}"));
+    let eligible = jev::limit_eligible_routes(eligible, preferred_route_id.as_deref());
+    let route_ids = eligible
+        .iter()
+        .map(|route| route.id.clone())
+        .collect::<Vec<_>>();
+    let manual_override = request.manual_provider_id.as_deref()
+        == fallback.selected_provider_id.as_deref()
+        && request.manual_model_id.as_deref() == fallback.selected_model_id.as_deref()
+        && request.manual_provider_id.is_some();
+    let profile = settings.typesafe_profile.as_ref();
+    let enabled = !request.local_only && profile.is_some_and(|profile| profile.enabled);
+    let required_capabilities = [
+        request
+            .require_tools
+            .then_some(jev::RequiredCapability::Tools),
+        (request.complexity == routing::Complexity::Complex)
+            .then_some(jev::RequiredCapability::Reasoning),
+        (fallback.required_context_tokens >= 32_768)
+            .then_some(jev::RequiredCapability::LongContext),
+        request
+            .local_only
+            .then_some(jev::RequiredCapability::LocalExecution),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let mut evaluation =
+        jev::select_with_jev(fallback, enabled, manual_override, &route_ids, || {
+            let profile = profile
+                .filter(|profile| profile.enabled)
+                .ok_or(jev::TriageError::Unavailable)?;
+            let key = resolve_typesafe_credential(&profile.id, profile.credential_ref.as_deref())
+                .ok_or(jev::TriageError::Unauthorized)?;
+            jev::http_triage(
+                &jev::TaskTriageInput {
+                    task_summary: summary,
+                    required_capabilities,
+                    eligible_routes: eligible,
+                },
+                &key,
+            )
+        });
+    if request.local_only && evaluation.source == "deterministic" {
+        evaluation.explanation =
+            "Local-only privacy is enabled; Jev was not called and deterministic routing was used."
+                .into();
+    }
+    Ok(evaluation)
 }
 
 #[tauri::command]

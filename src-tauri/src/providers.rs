@@ -421,6 +421,12 @@ pub struct ProviderSelection {
     pub model_id: Option<String>,
     pub reasoning_effort: Option<String>,
     pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub route_source: Option<String>,
+    #[serde(default)]
+    pub route_confidence_percent: Option<u8>,
+    #[serde(default)]
+    pub route_explanation: Option<String>,
 }
 
 impl Default for ProviderSelection {
@@ -430,6 +436,9 @@ impl Default for ProviderSelection {
             model_id: None,
             reasoning_effort: None,
             runtime_id: None,
+            route_source: None,
+            route_confidence_percent: None,
+            route_explanation: None,
         }
     }
 }
@@ -1225,6 +1234,20 @@ pub fn validate_profiles(
     profiles: &[ProviderProfile],
     selection: &ProviderSelection,
 ) -> Result<(), String> {
+    if selection
+        .route_source
+        .as_deref()
+        .is_some_and(|source| !matches!(source, "manual" | "deterministic" | "jev"))
+        || selection
+            .route_confidence_percent
+            .is_some_and(|value| value > 100)
+        || selection
+            .route_explanation
+            .as_deref()
+            .is_some_and(|value| value.len() > 512 || value.chars().any(char::is_control))
+    {
+        return Err("The saved route decision metadata is invalid.".into());
+    }
     if profiles.len() > 16 {
         return Err("Configure 16 or fewer providers.".into());
     }
@@ -1454,6 +1477,22 @@ mod tests {
             ..ProviderSelection::default()
         };
         assert!(validate_profiles(&[profile], &invalid).is_err());
+    }
+
+    #[test]
+    fn route_decision_provenance_is_validated_and_persistable() {
+        let mut selection = ProviderSelection {
+            route_source: Some("jev".into()),
+            route_confidence_percent: Some(92),
+            route_explanation: Some("High-confidence route.".into()),
+            ..ProviderSelection::default()
+        };
+        assert!(validate_profiles(&[], &selection).is_ok());
+        let round_trip: ProviderSelection =
+            serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();
+        assert_eq!(round_trip, selection);
+        selection.route_confidence_percent = Some(101);
+        assert!(validate_profiles(&[], &selection).is_err());
     }
 
     #[test]

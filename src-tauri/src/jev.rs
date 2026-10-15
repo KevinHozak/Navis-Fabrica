@@ -12,6 +12,7 @@ pub const MAX_ROUTES: usize = 32;
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MIN_CONFIDENCE: f64 = 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +34,19 @@ pub struct EligibleRoute {
     pub is_local: bool,
 }
 
+/// Keeps Jev's request within its route limit while retaining the deterministic
+/// winner so that every fallback and override remains available to the selector.
+pub fn limit_eligible_routes(
+    mut routes: Vec<EligibleRoute>,
+    preferred_route_id: Option<&str>,
+) -> Vec<EligibleRoute> {
+    if let Some(preferred) = preferred_route_id {
+        routes.sort_by_key(|route| route.id != preferred);
+    }
+    routes.truncate(MAX_ROUTES);
+    routes
+}
+
 /// Deliberately excludes repository paths, files, diffs, credentials, and issue bodies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -49,6 +63,118 @@ pub struct JevChoice {
     /// Probability for each submitted route. `confidence` is the selected route's probability.
     pub probabilities: BTreeMap<String, f64>,
     pub confidence: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingEvaluation {
+    pub routing: crate::routing::Decision,
+    pub source: String,
+    pub confidence: Option<f64>,
+    pub explanation: String,
+}
+
+/// Applies a Jev suggestion only after the caller has produced a deterministic
+/// decision from the eligible, healthy routes. The closure is never called when
+/// Jev is disabled, a manual route is selected, or no route can run.
+pub fn select_with_jev<F>(
+    mut fallback: crate::routing::Decision,
+    jev_enabled: bool,
+    manual_override: bool,
+    route_ids: &[String],
+    call_jev: F,
+) -> RoutingEvaluation
+where
+    F: FnOnce() -> Result<JevChoice, TriageError>,
+{
+    if fallback.selected_provider_id.is_none() || fallback.selected_model_id.is_none() {
+        return RoutingEvaluation {
+            routing: fallback,
+            source: "deterministic".into(),
+            confidence: None,
+            explanation: "No eligible route is available; Jev was not called.".into(),
+        };
+    }
+    if manual_override {
+        return RoutingEvaluation {
+            routing: fallback,
+            source: "manual".into(),
+            confidence: None,
+            explanation: "The eligible manual route override takes precedence.".into(),
+        };
+    }
+    if !jev_enabled {
+        return RoutingEvaluation {
+            routing: fallback,
+            source: "deterministic".into(),
+            confidence: None,
+            explanation: "Jev is disabled; the deterministic router selected this route.".into(),
+        };
+    }
+    if route_ids.len() < 2 {
+        return RoutingEvaluation {
+            routing: fallback,
+            source: "deterministic".into(),
+            confidence: None,
+            explanation: "Fewer than two healthy eligible routes are available for Jev.".into(),
+        };
+    }
+    let choice = match call_jev() {
+        Ok(choice) if choice.confidence >= MIN_CONFIDENCE => choice,
+        Ok(choice) => {
+            return RoutingEvaluation {
+                routing: fallback,
+                source: "deterministic".into(),
+                confidence: Some(choice.confidence),
+                explanation: format!("Jev confidence {:.0}% is below the 75% threshold; the deterministic route was kept.", choice.confidence * 100.0),
+            };
+        }
+        Err(error) => {
+            return RoutingEvaluation {
+                routing: fallback,
+                source: "deterministic".into(),
+                confidence: None,
+                explanation: error.sanitized_message().into(),
+            };
+        }
+    };
+    let selected = fallback.candidates.iter_mut().find(|candidate| {
+        candidate.eligible
+            && format!("{}:{}", candidate.provider_id, candidate.model_id) == choice.route_id
+    });
+    let Some(selected) = selected else {
+        return RoutingEvaluation {
+            routing: fallback,
+            source: "deterministic".into(),
+            confidence: Some(choice.confidence),
+            explanation: "Jev selected a route outside the healthy eligible set; the deterministic route was kept.".into(),
+        };
+    };
+    let provider_id = selected.provider_id.clone();
+    let model_id = selected.model_id.clone();
+    for candidate in &mut fallback.candidates {
+        candidate.selected = candidate.provider_id == provider_id && candidate.model_id == model_id;
+        candidate.reasons.retain(|reason| {
+            !reason.starts_with("Highest eligible ")
+                && !reason.starts_with("Eligible alternative ranked after ")
+        });
+        if candidate.eligible {
+            candidate.reasons.push(if candidate.selected {
+                "Selected by Jev with at least 75% confidence.".into()
+            } else {
+                "Eligible route not selected by Jev.".into()
+            });
+        }
+    }
+    fallback.selected_provider_id = Some(provider_id);
+    fallback.selected_model_id = Some(model_id);
+    RoutingEvaluation {
+        routing: fallback,
+        source: "jev".into(),
+        confidence: Some(choice.confidence),
+        explanation:
+            "Jev selected the route with at least 75% confidence after eligibility checks.".into(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +457,183 @@ pub fn http_triage(input: &TaskTriageInput, api_key: &str) -> Result<JevChoice, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn routing_decision(selected: Option<(&str, &str)>) -> crate::routing::Decision {
+        let candidates = vec![
+            crate::routing::CandidateDecision {
+                provider_id: "codex".into(),
+                provider_name: "Codex".into(),
+                model_id: "model-a".into(),
+                model_name: "Model A".into(),
+                eligible: true,
+                selected: selected == Some(("codex", "model-a")),
+                reasons: Vec::new(),
+            },
+            crate::routing::CandidateDecision {
+                provider_id: "ollama".into(),
+                provider_name: "Ollama".into(),
+                model_id: "model-b".into(),
+                model_name: "Model B".into(),
+                eligible: true,
+                selected: selected == Some(("ollama", "model-b")),
+                reasons: Vec::new(),
+            },
+        ];
+        crate::routing::Decision {
+            selected_provider_id: selected.map(|route| route.0.to_owned()),
+            selected_model_id: selected.map(|route| route.1.to_owned()),
+            required_context_tokens: 16_384,
+            desired_completion_note: "No completion-time preference.".into(),
+            candidates,
+        }
+    }
+
+    fn choice(route_id: &str, confidence: f64) -> JevChoice {
+        JevChoice {
+            route_id: route_id.into(),
+            probabilities: BTreeMap::new(),
+            confidence,
+        }
+    }
+
+    #[test]
+    fn limits_jev_routes_and_keeps_the_deterministic_winner() {
+        let routes = (0..40)
+            .map(|index| EligibleRoute {
+                id: format!("route-{index}"),
+                provider: "Provider".into(),
+                model: format!("Model {index}"),
+                context_tokens: None,
+                supports_tools: None,
+                is_local: false,
+            })
+            .collect();
+        let routes = limit_eligible_routes(routes, Some("route-39"));
+        assert_eq!(routes.len(), MAX_ROUTES);
+        assert_eq!(routes[0].id, "route-39");
+    }
+
+    #[test]
+    fn applies_only_high_confidence_eligible_jev_choices() {
+        let result = select_with_jev(
+            routing_decision(Some(("codex", "model-a"))),
+            true,
+            false,
+            &["codex:model-a".into(), "ollama:model-b".into()],
+            || Ok(choice("ollama:model-b", 0.75)),
+        );
+        assert_eq!(result.source, "jev");
+        assert_eq!(result.confidence, Some(0.75));
+        assert_eq!(
+            result.routing.selected_provider_id.as_deref(),
+            Some("ollama")
+        );
+        assert!(result.routing.candidates[1]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Selected by Jev")));
+        assert!(!result.routing.candidates[1]
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("Eligible alternative ranked after")));
+        assert!(result.routing.candidates[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not selected by Jev")));
+    }
+
+    #[test]
+    fn keeps_deterministic_route_for_low_confidence_and_every_triage_failure() {
+        for result in [
+            Ok(choice("ollama:model-b", 0.749)),
+            Err(TriageError::Unavailable),
+            Err(TriageError::RateLimited),
+            Err(TriageError::Unauthorized),
+            Err(TriageError::InvalidResponse),
+            Err(TriageError::UnknownRoute),
+            Err(TriageError::InvalidProbabilities),
+        ] {
+            let evaluation = select_with_jev(
+                routing_decision(Some(("codex", "model-a"))),
+                true,
+                false,
+                &["codex:model-a".into(), "ollama:model-b".into()],
+                || result,
+            );
+            assert_eq!(evaluation.source, "deterministic");
+            assert_eq!(
+                evaluation.routing.selected_provider_id.as_deref(),
+                Some("codex")
+            );
+            assert!(!evaluation.explanation.is_empty());
+        }
+    }
+
+    #[test]
+    fn skips_jev_for_manual_disabled_or_missing_routes() {
+        for (decision, enabled, manual, ids) in [
+            (
+                routing_decision(Some(("codex", "model-a"))),
+                true,
+                true,
+                vec!["codex:model-a".into(), "ollama:model-b".into()],
+            ),
+            (
+                routing_decision(Some(("codex", "model-a"))),
+                false,
+                false,
+                vec!["codex:model-a".into(), "ollama:model-b".into()],
+            ),
+            (
+                routing_decision(None),
+                true,
+                false,
+                vec!["codex:model-a".into(), "ollama:model-b".into()],
+            ),
+            (
+                routing_decision(Some(("codex", "model-a"))),
+                true,
+                false,
+                vec!["codex:model-a".into()],
+            ),
+        ] {
+            let evaluation = select_with_jev(decision, enabled, manual, &ids, || {
+                panic!("Jev must not be called")
+            });
+            assert_ne!(evaluation.source, "jev");
+        }
+    }
+
+    #[test]
+    fn ignores_any_choice_outside_healthy_eligible_routes() {
+        let evaluation = select_with_jev(
+            routing_decision(Some(("codex", "model-a"))),
+            true,
+            false,
+            &["codex:model-a".into(), "ollama:model-b".into()],
+            || Ok(choice("unknown:model", 0.99)),
+        );
+        assert_eq!(evaluation.source, "deterministic");
+        assert!(evaluation.explanation.contains("outside"));
+    }
+
+    #[test]
+    fn only_eligible_routes_can_replace_the_deterministic_choice() {
+        let mut decision = routing_decision(Some(("codex", "model-a")));
+        decision.candidates[1].eligible = false;
+        let evaluation = select_with_jev(
+            decision,
+            true,
+            false,
+            &["codex:model-a".into(), "ollama:model-b".into()],
+            || Ok(choice("ollama:model-b", 0.99)),
+        );
+        assert_eq!(evaluation.source, "deterministic");
+        assert_eq!(
+            evaluation.routing.selected_provider_id.as_deref(),
+            Some("codex")
+        );
+    }
 
     fn input() -> TaskTriageInput {
         TaskTriageInput {

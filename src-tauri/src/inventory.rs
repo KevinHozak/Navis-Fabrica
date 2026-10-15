@@ -54,7 +54,17 @@ pub fn load(path: &Path, expected_root: &str) -> Vec<ProjectEntry> {
     {
         return Vec::new();
     }
-    let projects = deduplicate(saved.projects);
+    let projects = deduplicate(saved.projects)
+        .into_iter()
+        .filter(|project| {
+            project.is_git_repository
+                && project
+                    .git
+                    .remotes
+                    .iter()
+                    .any(|remote| remote.github.is_some())
+        })
+        .collect::<Vec<_>>();
     if projects.iter().any(|project| !is_valid_project(project)) {
         return Vec::new();
     }
@@ -252,6 +262,20 @@ mod tests {
         }
     }
 
+    fn github_project(id: &str, name: &str, path: &str) -> ProjectEntry {
+        let mut project = project(id, name, path);
+        project.git.remotes.push(crate::scanner::GitRemote {
+            name: "origin".into(),
+            url: Some(format!("https://github.com/owner/{id}.git")),
+            github: Some(crate::scanner::GitHubRepository {
+                owner: "owner".into(),
+                repository: id.into(),
+                canonical_url: format!("https://github.com/owner/{id}"),
+            }),
+        });
+        project
+    }
+
     #[test]
     fn restores_inventory_and_atomically_replaces_prior_snapshot() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -260,14 +284,22 @@ mod tests {
         original.git.remotes.push(crate::scanner::GitRemote {
             name: "origin".into(),
             url: Some("https://user:secret@github.com/owner/repo?access_token=secret".into()),
-            github: None,
+            github: Some(crate::scanner::GitHubRepository {
+                owner: "owner".into(),
+                repository: "repo".into(),
+                canonical_url: "https://github.com/owner/repo".into(),
+            }),
         });
         save(&path, r"C:\Projects", &[original]).unwrap();
         let mut updated = project("one", "After", r"C:\Projects\after");
         updated.git.remotes.push(crate::scanner::GitRemote {
             name: "origin".into(),
             url: Some("https://user:secret@github.com/owner/repo?access_token=secret".into()),
-            github: None,
+            github: Some(crate::scanner::GitHubRepository {
+                owner: "owner".into(),
+                repository: "repo".into(),
+                canonical_url: "https://github.com/owner/repo".into(),
+            }),
         });
         save(&path, r"C:\Projects", &[updated]).unwrap();
 
@@ -284,6 +316,40 @@ mod tests {
     }
 
     #[test]
+    fn restored_inventory_excludes_projects_without_a_github_remote() {
+        let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = folder.path().join("project-inventory.json");
+        let mut github = project("github", "GitHub", r"C:\Projects\github");
+        github.git.remotes.push(crate::scanner::GitRemote {
+            name: "origin".into(),
+            url: Some("git@github.com:owner/repo.git".into()),
+            github: Some(crate::scanner::GitHubRepository {
+                owner: "owner".into(),
+                repository: "repo".into(),
+                canonical_url: "https://github.com/owner/repo".into(),
+            }),
+        });
+        save(
+            &path,
+            r"C:\Projects",
+            &[github, project("local", "Local", r"C:\Projects\local"), {
+                let mut non_github = project("other", "Other host", r"C:\Projects\other");
+                non_github.git.remotes.push(crate::scanner::GitRemote {
+                    name: "origin".into(),
+                    url: Some("https://gitlab.com/owner/repo.git".into()),
+                    github: None,
+                });
+                non_github
+            }],
+        )
+        .unwrap();
+
+        let restored = load(&path, r"C:\Projects");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "github");
+    }
+
+    #[test]
     fn complete_refresh_reconciles_removed_moved_and_added_projects() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = folder.path().join("project-inventory.json");
@@ -291,14 +357,14 @@ mod tests {
             &path,
             r"C:\Projects",
             &[
-                project("stable-id", "Old name", r"C:\Projects\old-path"),
-                project("removed", "Removed", r"C:\Projects\removed"),
+                github_project("stable-id", "Old name", r"C:\Projects\old-path"),
+                github_project("removed", "Removed", r"C:\Projects\removed"),
             ],
         )
         .unwrap();
         let refreshed = vec![
-            project("stable-id", "Renamed", r"C:\Projects\new-path"),
-            project("added", "Added", r"C:\Projects\added"),
+            github_project("stable-id", "Renamed", r"C:\Projects\new-path"),
+            github_project("added", "Added", r"C:\Projects\added"),
         ];
         save(&path, r"C:\Projects", &refreshed).unwrap();
 

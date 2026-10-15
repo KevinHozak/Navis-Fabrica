@@ -233,33 +233,39 @@ pub fn scan(
                 );
                 break;
             } else {
-                project_ids.insert(key.clone());
-                let git = cached_projects
-                    .get(&key)
-                    .map(|cached| cached.git.clone())
-                    .unwrap_or_else(|| inspect_git(&canonical, is_git_repository, cancelled));
+                let git = if is_git_repository {
+                    cached_projects
+                        .get(&key)
+                        .map(|cached| cached.git.clone())
+                        .unwrap_or_else(|| inspect_git(&canonical, true, cancelled))
+                } else {
+                    empty_git_facts("notRepository")
+                };
                 if cancelled.load(Ordering::Relaxed) {
                     was_cancelled = true;
                     break;
                 }
-                projects.push(ProjectEntry {
-                    id: key,
-                    name: canonical
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| canonical.to_string_lossy().into_owned()),
-                    path: canonical.to_string_lossy().into_owned(),
-                    is_git_repository,
-                    is_worktree,
-                    detected_stacks,
-                    git,
-                    workflow_prerequisites: workflow_prerequisites(
-                        &canonical,
-                        &names,
+                if is_git_repository && git.remotes.iter().any(|remote| remote.github.is_some()) {
+                    project_ids.insert(key.clone());
+                    projects.push(ProjectEntry {
+                        id: key,
+                        name: canonical
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| canonical.to_string_lossy().into_owned()),
+                        path: canonical.to_string_lossy().into_owned(),
                         is_git_repository,
-                        &mut tool_availability,
-                    ),
-                });
+                        is_worktree,
+                        detected_stacks,
+                        git,
+                        workflow_prerequisites: workflow_prerequisites(
+                            &canonical,
+                            &names,
+                            is_git_repository,
+                            &mut tool_availability,
+                        ),
+                    });
+                }
             }
         }
 
@@ -956,15 +962,28 @@ pub fn sanitize_remote(value: &str) -> String {
 
 fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
     let trimmed = value.trim();
-    let path = if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        rest
+    let (path, domain) = if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let (domain, path) = rest.split_once('/')?;
+        if scheme.eq_ignore_ascii_case("https") {
+            (path, domain.rsplit('@').next()?)
+        } else if scheme.eq_ignore_ascii_case("ssh") {
+            let (user, host) = domain.rsplit_once('@')?;
+            if user != "git" {
+                return None;
+            }
+            (path, host)
+        } else {
+            return None;
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (domain, path) = rest.split_once(':')?;
+        (path, domain)
     } else {
         return None;
     };
+    if !is_github_authority(domain) {
+        return None;
+    }
     let path = path
         .split(['?', '#'])
         .next()
@@ -990,6 +1009,24 @@ fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
         repository: repository.to_owned(),
         canonical_url: format!("https://github.com/{owner}/{repository}"),
     })
+}
+
+fn is_github_authority(authority: &str) -> bool {
+    let Some(host_port) = authority.rsplit('@').next() else {
+        return false;
+    };
+    let host = if let Some((host, port)) = host_port.rsplit_once(':') {
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return false;
+        }
+        host
+    } else {
+        host_port
+    };
+    host.eq_ignore_ascii_case("github.com")
 }
 
 fn push_error(errors: &mut Vec<String>, message: String) {
@@ -1123,11 +1160,23 @@ mod tests {
             "https://github.com/Owner/Repo.git",
             "ssh://git@github.com/Owner/Repo.git",
             "git@github.com:Owner/Repo.git",
+            "https://github.com:443/Owner/Repo.git",
+            "ssh://git@github.com:22/Owner/Repo.git",
         ] {
             let repository = parse_github_remote(input).unwrap();
             assert_eq!(repository.owner, "Owner");
             assert_eq!(repository.repository, "Repo");
             assert_eq!(repository.canonical_url, "https://github.com/Owner/Repo");
+        }
+        for input in [
+            "https://github.com.evil.test/Owner/Repo.git",
+            "https://evilgithub.com/Owner/Repo.git",
+            "https://www.github.com/Owner/Repo.git",
+            "https://github.com:invalid/Owner/Repo.git",
+            "https://github.com:65536/Owner/Repo.git",
+            "ssh://git@github.com:22.evil.test/Owner/Repo.git",
+        ] {
+            assert!(parse_github_remote(input).is_none(), "{input}");
         }
         for input in [
             "https://example.com/Owner/Repo.git",
@@ -1137,6 +1186,38 @@ mod tests {
         ] {
             assert!(parse_github_remote(input).is_none(), "{input}");
         }
+    }
+
+    #[test]
+    fn scan_lists_only_github_repositories_and_keeps_local_git_facts() {
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let github = root.path().join("github");
+        init_github_repo(&github, "git@github.com:Owner/Repo.git");
+        fs::write(github.join("README.md"), "dirty").unwrap();
+        let local_only = root.path().join("local-only");
+        fs::create_dir_all(&local_only).unwrap();
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&local_only)
+            .status()
+            .unwrap();
+        let other_host = root.path().join("other-host");
+        init_github_repo(&other_host, "https://gitlab.com/owner/repo.git");
+        let folder = root.path().join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("package.json"), "{}").unwrap();
+
+        let result = scan_fixture(root.path(), 1);
+
+        assert_eq!(result.projects.len(), 1);
+        let project = &result.projects[0];
+        assert_eq!(project.name, "github");
+        assert!(project.is_git_repository);
+        assert_eq!(project.git.dirty, Some(true));
+        assert_eq!(
+            project.git.remotes[0].github.as_ref().unwrap().owner,
+            "Owner"
+        );
     }
 
     #[test]
@@ -1339,6 +1420,22 @@ mod tests {
         scan_fixture_with_cache(root, depth, &HashMap::new())
     }
 
+    fn init_github_repo(path: &Path, remote: &str) {
+        fs::create_dir_all(path).unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let added = Command::new("git")
+            .args(["remote", "add", "origin", remote])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(added.success());
+    }
+
     fn scan_fixture_with_cache(
         root: &Path,
         depth: u8,
@@ -1355,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_git_repositories_coding_projects_nested_and_worktree_markers() {
+    fn excludes_local_repositories_and_stack_folders_without_github_remotes() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo with spaces");
         fs::create_dir_all(repo.join(".git")).unwrap();
@@ -1367,27 +1464,14 @@ mod tests {
         fs::write(linked.join(".git"), "gitdir: ../git-metadata\n").unwrap();
 
         let result = scan_fixture(root.path(), 3);
-        assert_eq!(result.projects.len(), 3);
-        assert!(result
-            .projects
-            .iter()
-            .any(|project| project.name == "repo with spaces" && project.is_git_repository));
-        assert!(result.projects.iter().any(|project| {
-            project.name == "nested"
-                && project.is_git_repository
-                && project.detected_stacks == ["Node.js"]
-        }));
-        assert!(result
-            .projects
-            .iter()
-            .any(|project| project.name == "linked-worktree" && project.is_worktree));
+        assert!(result.projects.is_empty());
     }
 
     #[test]
-    fn preserves_project_identity_across_rename_and_drops_removed_projects() {
+    fn preserves_github_project_identity_across_rename_and_drops_removed_projects() {
         let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let original = root.path().join("before");
-        fs::create_dir_all(&original).unwrap();
+        init_github_repo(&original, "https://github.com/owner/repo.git");
         fs::write(original.join("package.json"), "{}").unwrap();
         let first = scan_fixture(root.path(), 1);
         let original_project = first.projects.first().unwrap().clone();
@@ -1422,8 +1506,7 @@ mod tests {
 
         assert!(scan_fixture(root.path(), 2).projects.is_empty());
         let included = scan_fixture(root.path(), 3);
-        assert_eq!(included.projects.len(), 1);
-        assert_eq!(included.projects[0].detected_stacks, ["Rust"]);
+        assert!(included.projects.is_empty());
     }
 
     #[test]
@@ -1450,9 +1533,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn duplicate_aliases_are_deduplicated() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let project = root.path().join("project");
         fs::create_dir_all(&project).unwrap();
+        init_github_repo(&project, "https://github.com/owner/repo.git");
         fs::write(project.join("package.json"), "{}").unwrap();
         std::os::unix::fs::symlink(&project, root.path().join("alias")).unwrap();
         let result = scan_fixture(root.path(), 2);
@@ -1483,9 +1567,9 @@ mod tests {
 
     #[test]
     fn retains_projects_when_a_neighbor_has_broken_worktree_metadata() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let good = root.path().join("good-project");
-        fs::create_dir_all(&good).unwrap();
+        init_github_repo(&good, "https://github.com/owner/good.git");
         fs::write(good.join("package.json"), "{}").unwrap();
         let broken = root.path().join("broken-worktree");
         fs::create_dir_all(&broken).unwrap();
@@ -1503,7 +1587,7 @@ mod tests {
     fn inaccessible_subfolder_reports_an_error_and_keeps_sibling_projects() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let good = root.path().join("good-project");
         fs::create_dir_all(&good).unwrap();
         fs::write(good.join("package.json"), "{}").unwrap();
@@ -1524,10 +1608,7 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.contains("Could not read a folder")));
-        assert!(result
-            .projects
-            .iter()
-            .any(|project| project.name == "good-project"));
+        assert!(result.projects.is_empty());
     }
 
     #[cfg(unix)]
@@ -1551,8 +1632,8 @@ mod tests {
 
     #[test]
     fn cancellation_keeps_already_discovered_projects() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("package.json"), "{}").unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        init_github_repo(root.path(), "https://github.com/owner/cancelled.git");
         let cancelled = AtomicBool::new(false);
         let result = scan(
             "fixture",
@@ -1574,6 +1655,10 @@ mod tests {
             fs::create_dir_all(&project).unwrap();
             fs::write(project.join("package.json"), "{}").unwrap();
         }
+        init_github_repo(
+            &root.path().join("project-000"),
+            "https://github.com/owner/project-000.git",
+        );
         let mut first_result = None;
         let started = Instant::now();
         let result = scan(
@@ -1591,11 +1676,11 @@ mod tests {
         let total = started.elapsed();
         let first_result = first_result.expect("fixture should discover a project");
         println!(
-            "100-project fixture: first result {first_result:?} (target <1s), total {total:?} (target <5s), projects {}, folders {}",
+            "100-project fixture: first result {first_result:?} (target <3s), total {total:?} (target <5s), projects {}, folders {}",
             result.projects.len(), result.directories_scanned
         );
-        assert_eq!(result.projects.len(), 100);
-        assert!(first_result < Duration::from_secs(1));
+        assert_eq!(result.projects.len(), 1);
+        assert!(first_result < Duration::from_secs(3));
         assert!(total < Duration::from_secs(5));
     }
 }

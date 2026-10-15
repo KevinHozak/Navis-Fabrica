@@ -34,6 +34,19 @@ pub struct EligibleRoute {
     pub is_local: bool,
 }
 
+/// Keeps Jev's request within its route limit while retaining the deterministic
+/// winner so that every fallback and override remains available to the selector.
+pub fn limit_eligible_routes(
+    mut routes: Vec<EligibleRoute>,
+    preferred_route_id: Option<&str>,
+) -> Vec<EligibleRoute> {
+    if let Some(preferred) = preferred_route_id {
+        routes.sort_by_key(|route| route.id != preferred);
+    }
+    routes.truncate(MAX_ROUTES);
+    routes
+}
+
 /// Deliberately excludes repository paths, files, diffs, credentials, and issue bodies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -141,6 +154,17 @@ where
     let model_id = selected.model_id.clone();
     for candidate in &mut fallback.candidates {
         candidate.selected = candidate.provider_id == provider_id && candidate.model_id == model_id;
+        candidate.reasons.retain(|reason| {
+            !reason.starts_with("Highest eligible ")
+                && !reason.starts_with("Eligible alternative ranked after ")
+        });
+        if candidate.eligible {
+            candidate.reasons.push(if candidate.selected {
+                "Selected by Jev with at least 75% confidence.".into()
+            } else {
+                "Eligible route not selected by Jev.".into()
+            });
+        }
     }
     fallback.selected_provider_id = Some(provider_id);
     fallback.selected_model_id = Some(model_id);
@@ -473,6 +497,23 @@ mod tests {
     }
 
     #[test]
+    fn limits_jev_routes_and_keeps_the_deterministic_winner() {
+        let routes = (0..40)
+            .map(|index| EligibleRoute {
+                id: format!("route-{index}"),
+                provider: "Provider".into(),
+                model: format!("Model {index}"),
+                context_tokens: None,
+                supports_tools: None,
+                is_local: false,
+            })
+            .collect();
+        let routes = limit_eligible_routes(routes, Some("route-39"));
+        assert_eq!(routes.len(), MAX_ROUTES);
+        assert_eq!(routes[0].id, "route-39");
+    }
+
+    #[test]
     fn applies_only_high_confidence_eligible_jev_choices() {
         let result = select_with_jev(
             routing_decision(Some(("codex", "model-a"))),
@@ -487,6 +528,18 @@ mod tests {
             result.routing.selected_provider_id.as_deref(),
             Some("ollama")
         );
+        assert!(result.routing.candidates[1]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Selected by Jev")));
+        assert!(!result.routing.candidates[1]
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("Eligible alternative ranked after")));
+        assert!(result.routing.candidates[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not selected by Jev")));
     }
 
     #[test]

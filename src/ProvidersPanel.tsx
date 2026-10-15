@@ -100,6 +100,7 @@ export function ProvidersPanel() {
   const [routingCalibration, setRoutingCalibration] = useState<RoutingCalibrationSummary[]>([]);
   const [routingBusy, setRoutingBusy] = useState(false);
   const [routingError, setRoutingError] = useState("");
+  const routingInputRevision = useRef(0);
   const desktop = isDesktopApp();
 
   const selectedProvider = settings?.providers.find((provider) => provider.id === settings.providerSelection.providerId);
@@ -140,7 +141,15 @@ export function ProvidersPanel() {
     return () => { active = false; };
   }, [desktop]);
 
+  function invalidateRoutingDecision() {
+    routingInputRevision.current += 1;
+    setRoutingDecision(null);
+    setJevEvaluation(null);
+    setRoutingError("");
+  }
+
   async function persist(next: Settings) {
+    invalidateRoutingDecision();
     setSettings(next);
     setSaveState("saving");
     setMessage("");
@@ -325,6 +334,7 @@ export function ProvidersPanel() {
 
   async function recommendModel(useJev = false) {
     if (!settings) return;
+    const inputRevision = routingInputRevision.current;
     setRoutingBusy(true);
     setRoutingError("");
     try {
@@ -363,6 +373,7 @@ export function ProvidersPanel() {
       };
       const evaluation = useJev ? await evaluateJevRouting(request, taskSummary.trim()) : null;
       const decision = evaluation?.routing ?? await evaluateRouting(request);
+      if (inputRevision !== routingInputRevision.current) return;
       setJevEvaluation(evaluation);
       setRoutingDecision(decision);
       const terminalRuns = latestRuns.filter((run) => ["completed", "failed", "timedOut", "cancelled", "interrupted"].includes(run.state) && run.provider && run.modelId && run.finishedAtMs !== null);
@@ -379,7 +390,9 @@ export function ProvidersPanel() {
       });
       setRoutingCalibration(await calibrateRouting(calibrationSamples));
     } catch (error) {
-      setRoutingError(error instanceof Error ? error.message : String(error));
+      if (inputRevision === routingInputRevision.current) {
+        setRoutingError(error instanceof Error ? error.message : String(error));
+      }
     } finally { setRoutingBusy(false); }
   }
 
@@ -445,14 +458,14 @@ export function ProvidersPanel() {
       <section className="panel settings-panel routing-panel" aria-labelledby="routing-policy-title">
         <div className="panel-heading"><div><h2 id="routing-policy-title">Explainable model recommendation</h2><p>Eligibility is checked before pace ranking. Manual selection applies only to an eligible model.</p></div><span className="setting-glyph" aria-hidden="true">⌁</span></div>
         <div className="provider-inline-fields">
-          <label className="settings-field"><span>Task complexity</span><select value={routingComplexity} onChange={(event) => setRoutingComplexity(event.target.value as RoutingComplexity)}><option value="simple">Simple · 8k context floor</option><option value="standard">Standard · 16k context floor</option><option value="complex">Complex · 32k context floor</option></select></label>
-          <label className="settings-field"><span>Pace preference</span><select value={routingPace} onChange={(event) => setRoutingPace(event.target.value as RoutingPace)}><option value="fast">Fast · recent latency first</option><option value="balanced">Balanced · quality, quota, latency</option><option value="thorough">Thorough · quality and reasoning</option><option value="economy">Economy · fresh spend and quota</option></select></label>
-          <label className="settings-field"><span>Manual override</span><select value={manualRoute} onChange={(event) => setManualRoute(event.target.value)}><option value="">Automatic recommendation</option>{settings.providers.flatMap((provider) => provider.models.map((model) => <option key={`${provider.id}/${model.id}`} value={JSON.stringify([provider.id, model.id])}>{provider.name} · {model.name}</option>))}</select></label>
-          <label className="settings-field"><span>Desired completion time (minutes)</span><input type="number" min="1" max="1440" value={desiredMinutes} onChange={(event) => setDesiredMinutes(event.target.value)} placeholder="Optional" /><small>A preference only; task completion is not guaranteed.</small></label>
-          <label className="routing-checkbox"><input type="checkbox" checked={routingRequireTools} onChange={(event) => setRoutingRequireTools(event.target.checked)} /> Require known tool support</label>
-          <label className="routing-checkbox"><input type="checkbox" checked={routingLocalOnly} onChange={(event) => setRoutingLocalOnly(event.target.checked)} /> Local-only privacy</label>
+          <label className="settings-field"><span>Task complexity</span><select value={routingComplexity} onChange={(event) => { setRoutingComplexity(event.target.value as RoutingComplexity); invalidateRoutingDecision(); }}><option value="simple">Simple · 8k context floor</option><option value="standard">Standard · 16k context floor</option><option value="complex">Complex · 32k context floor</option></select></label>
+          <label className="settings-field"><span>Pace preference</span><select value={routingPace} onChange={(event) => { setRoutingPace(event.target.value as RoutingPace); invalidateRoutingDecision(); }}><option value="fast">Fast · recent latency first</option><option value="balanced">Balanced · quality, quota, latency</option><option value="thorough">Thorough · quality and reasoning</option><option value="economy">Economy · fresh spend and quota</option></select></label>
+          <label className="settings-field"><span>Manual override</span><select value={manualRoute} onChange={(event) => { setManualRoute(event.target.value); invalidateRoutingDecision(); }}><option value="">Automatic recommendation</option>{settings.providers.flatMap((provider) => provider.models.map((model) => <option key={`${provider.id}/${model.id}`} value={JSON.stringify([provider.id, model.id])}>{provider.name} · {model.name}</option>))}</select></label>
+          <label className="settings-field"><span>Desired completion time (minutes)</span><input type="number" min="1" max="1440" value={desiredMinutes} onChange={(event) => { setDesiredMinutes(event.target.value); invalidateRoutingDecision(); }} placeholder="Optional" /><small>A preference only; task completion is not guaranteed.</small></label>
+          <label className="routing-checkbox"><input type="checkbox" checked={routingRequireTools} onChange={(event) => { setRoutingRequireTools(event.target.checked); invalidateRoutingDecision(); }} /> Require known tool support</label>
+          <label className="routing-checkbox"><input type="checkbox" checked={routingLocalOnly} onChange={(event) => { setRoutingLocalOnly(event.target.checked); invalidateRoutingDecision(); }} /> Local-only privacy</label>
         </div>
-        <label className="settings-field"><span>Short task summary for Jev</span><textarea rows={2} maxLength={1024} value={taskSummary} onChange={(event) => setTaskSummary(event.target.value)} placeholder="Describe the task in a sentence. Do not include repository files, diffs, credentials, or full issue text." /><small>Only this summary and capability requirements are sent to TypeSafe when Jev is enabled.</small></label>
+        <label className="settings-field"><span>Short task summary for Jev</span><textarea rows={2} maxLength={1024} value={taskSummary} onChange={(event) => { setTaskSummary(event.target.value); invalidateRoutingDecision(); }} placeholder="Describe the task in a sentence. Do not include repository files, diffs, credentials, or full issue text." /><small>When Jev is enabled, TypeSafe receives this summary, required capabilities, and up to 32 healthy eligible route IDs with provider/model names, context size, tool support, and local or remote status. Files, diffs, issue text, and credentials are not sent.</small></label>
         <div className="settings-actions routing-actions">
           <button className="button button-secondary" type="button" disabled={!desktop || routingBusy || !settings.providers.some((provider) => provider.models.length)} onClick={() => { void recommendModel(false); }}>{routingBusy ? "Evaluating…" : "Recommend a model"}</button>
           <button className="button button-primary" type="button" disabled={!desktop || routingBusy || !taskSummary.trim() || !settings.providers.some((provider) => provider.models.length)} onClick={() => { void recommendModel(true); }}>{routingBusy ? "Evaluating…" : "Recommend with Jev"}</button>

@@ -2018,6 +2018,12 @@ fn evaluate_jev_routing(
             })
         })
         .collect::<Vec<_>>();
+    let preferred_route_id = fallback
+        .selected_provider_id
+        .as_ref()
+        .zip(fallback.selected_model_id.as_ref())
+        .map(|(provider_id, model_id)| format!("{provider_id}:{model_id}"));
+    let eligible = jev::limit_eligible_routes(eligible, preferred_route_id.as_deref());
     let route_ids = eligible
         .iter()
         .map(|route| route.id.clone())

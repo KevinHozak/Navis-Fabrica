@@ -93,6 +93,7 @@ pub struct RoutingEvaluation {
     pub deterministic_model_id: Option<String>,
     pub usage: Option<JevUsage>,
     pub estimated_cost_usd: Option<f64>,
+    pub jev_called: bool,
 }
 
 /// Applies a Jev suggestion only after the caller has produced a deterministic
@@ -120,6 +121,7 @@ where
             deterministic_model_id,
             usage: None,
             estimated_cost_usd: None,
+            jev_called: false,
         };
     }
     if manual_override {
@@ -132,6 +134,7 @@ where
             deterministic_model_id,
             usage: None,
             estimated_cost_usd: None,
+            jev_called: false,
         };
     }
     if !jev_enabled {
@@ -144,6 +147,7 @@ where
             deterministic_model_id,
             usage: None,
             estimated_cost_usd: None,
+            jev_called: false,
         };
     }
     if route_ids.len() < 2 {
@@ -156,6 +160,7 @@ where
             deterministic_model_id,
             usage: None,
             estimated_cost_usd: None,
+            jev_called: false,
         };
     }
     let choice = match call_jev() {
@@ -170,6 +175,7 @@ where
                 deterministic_model_id,
                 usage: choice.usage,
                 estimated_cost_usd: choice.usage.and_then(JevUsage::estimated_cost_usd),
+                jev_called: true,
             };
         }
         Err(error) => {
@@ -182,6 +188,7 @@ where
                 deterministic_model_id,
                 usage: None,
                 estimated_cost_usd: None,
+                jev_called: true,
             };
         }
     };
@@ -199,6 +206,7 @@ where
             deterministic_model_id,
             usage: choice.usage,
             estimated_cost_usd: choice.usage.and_then(JevUsage::estimated_cost_usd),
+            jev_called: true,
         };
     };
     let provider_id = selected.provider_id.clone();
@@ -229,6 +237,7 @@ where
         deterministic_model_id,
         usage: choice.usage,
         estimated_cost_usd: choice.usage.and_then(JevUsage::estimated_cost_usd),
+        jev_called: true,
     }
 }
 
@@ -624,6 +633,7 @@ mod tests {
                 || result,
             );
             assert_eq!(evaluation.source, "deterministic");
+            assert!(evaluation.jev_called);
             assert_eq!(
                 evaluation.routing.selected_provider_id.as_deref(),
                 Some("codex")
@@ -664,6 +674,7 @@ mod tests {
                 panic!("Jev must not be called")
             });
             assert_ne!(evaluation.source, "jev");
+            assert!(!evaluation.jev_called);
         }
     }
 

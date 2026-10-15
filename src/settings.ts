@@ -82,6 +82,7 @@ export type JevRoutingEvaluation = {
   deterministicModelId: string | null;
   usage: { inputTokens: number | null; outputTokens: number | null } | null;
   estimatedCostUsd: number | null;
+  jevCalled: boolean;
 };
 export type JevRoutingHistoryEntry = {
   evaluatedAtMs: number; source: string; selectedProviderId: string | null; selectedModelId: string | null;

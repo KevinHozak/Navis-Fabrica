@@ -9,6 +9,7 @@ import {
   cancelProjectScan,
   discoverWorkflowSkills,
   getCachedGitHubActivity,
+  getProjectInventory,
   GitHubActivity,
   isDesktopApp,
   loadSettings,
@@ -42,6 +43,7 @@ function sectionFromHash(): Section {
 function App() {
   const [section, setSection] = useState<Section>(sectionFromHash);
   const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
+  const [scanListenersReady, setScanListenersReady] = useState(false);
   const [scanId, setScanId] = useState("");
   const [progress, setProgress] = useState<ProjectScanProgress | null>(null);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
@@ -95,6 +97,11 @@ function App() {
     let unlistenFinished: (() => void) | undefined;
     let unlistenInvalidated: (() => void) | undefined;
     let unlistenWatchError: (() => void) | undefined;
+    let readyListeners = 0;
+    const markScanListenerReady = () => {
+      readyListeners += 1;
+      if (active && readyListeners === 2) setScanListenersReady(true);
+    };
 
     onProjectScanProgress((next) => {
       if (!active || next.scanId !== activeScanId.current) return;
@@ -107,6 +114,7 @@ function App() {
     }).then((stop) => {
       if (active) unlistenProgress = stop;
       else stop();
+      markScanListenerReady();
     }).catch((error: unknown) => {
       if (active) {
         setScanStatus("error");
@@ -138,6 +146,7 @@ function App() {
     }).then((stop) => {
       if (active) unlistenFinished = stop;
       else stop();
+      markScanListenerReady();
     }).catch((error: unknown) => {
       if (active) {
         setScanStatus("error");
@@ -171,6 +180,20 @@ function App() {
       unlistenWatchError?.();
     };
   }, [desktop]);
+
+  useEffect(() => {
+    if (!desktop || !scanListenersReady) return;
+    let active = true;
+    getProjectInventory()
+      .catch(() => [] as ProjectEntry[])
+      .then((savedProjects) => {
+        if (!active) return;
+        if (activeScanId.current) return;
+        setProjects(savedProjects);
+        beginScanRef.current(false);
+      });
+    return () => { active = false; };
+  }, [desktop, scanListenersReady]);
 
   useEffect(() => {
     setSelectedProjectId((selected) => projects.some((project) => project.id === selected) ? selected : projects[0]?.id ?? null);

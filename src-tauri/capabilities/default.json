@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window access to saved settings and bounded project discovery events.",
+  "description": "Main window access to saved settings, cached project inventory, and bounded project discovery events.",
   "windows": ["main"],
   "permissions": [
     "allow-get-settings",
@@ -37,6 +37,7 @@
     "allow-evaluate-routing",
     "allow-evaluate-provider-fallback",
     "allow-calibrate-routing",
+    "allow-get-project-inventory",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

@@ -2,6 +2,14 @@
 
 The initial scaffold delivered only the basic structure. Its original verification is followed by phase-specific delivery evidence below.
 
+## Jev-P2 bounded task-triage contract (issue #60)
+
+- Rust accepts only a UTF-8 task summary (up to 1 KiB), up to eight typed capability requirements, and 2–32 eligible route IDs with bounded provider/model labels and minimal comparison metadata. Unknown input fields are rejected. The TypeSafe `systemone` Choice request is pinned to `jev-1.14.0`, limited to 8 KiB, and contains no repository files, diffs, credentials, or issue body fields.
+- Responses are limited to 32 KiB and a 10-second HTTP timeout. The parser requires the pinned model and a Choice answer, rejects route IDs outside the submitted eligible set, requires exactly one valid probability per eligible route with a normalized sum, and uses the selected route's probability as confidence. HTTP and parse errors map to sanitized static messages.
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml jev::`: 6 passed, 0 failed. Fixtures cover a valid Choice, malformed/missing response fields, unknown routes, missing/extra/out-of-range/non-finite probabilities, request/response bounds, unknown sensitive input fields, and sanitized transport errors.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` and `git diff --check`: passed. No real API key or live TypeSafe request was used.
+- TypeSafe API reference: [TypeSafe API Swagger](https://api.typesafe.ai/docs).
+
 - `npm install --ignore-scripts`: locked dependencies installed; audit reported zero vulnerabilities.
 - `npm run build`: TypeScript and Vite production build passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml --locked -j 2` with `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_DEV_INCREMENTAL=false`: passed on Windows after removing this scaffold's generated cache and adding the required Windows icon. An earlier attempt hit low disk space.

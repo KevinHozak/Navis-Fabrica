@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 
 mod github;
 mod inventory;
+pub mod jev;
 mod process;
 pub mod providers;
 mod routing;

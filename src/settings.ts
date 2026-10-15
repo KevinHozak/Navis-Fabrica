@@ -59,7 +59,7 @@ export type UsageSignal = {
 export type RoutingComplexity = "simple" | "standard" | "complex";
 export type RoutingPace = "fast" | "balanced" | "thorough" | "economy";
 export type RoutingCandidate = {
-  providerId: string; providerName: string; modelId: string; modelName: string; isLocal: boolean;
+  providerId: string; telemetryProviderId: string; providerName: string; modelId: string; modelName: string; isLocal: boolean;
   contextTokens: number | null; supportsTools: boolean | null; reasoningEfforts: string[];
   qualityRating: number | null; latencyMs: number | null; latencyCollectedAtMs: number | null;
 };

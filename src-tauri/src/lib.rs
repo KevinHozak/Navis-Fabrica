@@ -1589,12 +1589,15 @@ fn evaluate_routing(mut request: routing::Request) -> Result<routing::Decision, 
     if request.candidates.iter().any(|candidate| {
         candidate.provider_id.trim().is_empty()
             || candidate.provider_id.len() > 80
+            || candidate.telemetry_provider_id.trim().is_empty()
+            || candidate.telemetry_provider_id.len() > 80
             || candidate.model_id.trim().is_empty()
             || candidate.model_id.len() > 160
             || candidate.provider_name.len() > 100
             || candidate.model_name.len() > 160
             || [
                 &candidate.provider_id,
+                &candidate.telemetry_provider_id,
                 &candidate.model_id,
                 &candidate.provider_name,
                 &candidate.model_name,

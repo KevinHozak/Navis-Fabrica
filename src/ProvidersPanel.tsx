@@ -40,6 +40,10 @@ const executableDefaults: Record<ProviderKind, string> = {
   custom: "",
 };
 
+function telemetryProviderId(kind: ProviderKind): string {
+  return kind === "openRouter" ? "openrouter" : kind;
+}
+
 const capabilityLabels: [keyof ProviderAvailability["capabilities"], string][] = [
   ["discovery", "Executable discovery"], ["health", "Health"], ["modelListing", "Model listing"],
   ["skillSupport", "Skills"],
@@ -295,13 +299,14 @@ export function ProvidersPanel() {
       const candidates: RoutingCandidate[] = settings.providers.flatMap((provider) => provider.models.map((model) => {
         const ollamaModel = provider.kind === "ollama" ? ollamaProbes[provider.id]?.models.find((item) => item.id === model.id) : undefined;
         const openRouterModel = provider.kind === "openRouter" ? openRouterProbes[provider.id]?.models.find((item) => item.id === model.id) : undefined;
-        const completedRun = latestRuns.filter((run) => run.state === "completed" && run.provider === provider.kind && run.modelId === model.id && run.latencyMs !== null && run.finishedAtMs !== null)
+        const telemetryId = telemetryProviderId(provider.kind);
+        const completedRun = latestRuns.filter((run) => run.state === "completed" && run.provider === telemetryId && run.modelId === model.id && run.latencyMs !== null && run.finishedAtMs !== null)
           .sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0))[0];
         const discoveredTools = ollamaModel ? ollamaModel.toolsSupported : openRouterModel?.supportedParameters
           ? openRouterModel.supportedParameters.includes("tools") || openRouterModel.supportedParameters.includes("tool_choice")
           : null;
         return {
-          providerId: provider.id, providerName: provider.name, modelId: model.id, modelName: model.name,
+          providerId: provider.id, telemetryProviderId: telemetryId, providerName: provider.name, modelId: model.id, modelName: model.name,
           isLocal: provider.kind === "ollama",
           contextTokens: ollamaModel?.contextTokens ?? openRouterModel?.contextLength ?? model.contextWindowTokens ?? null,
           supportsTools: discoveredTools ?? model.supportsTools ?? null,

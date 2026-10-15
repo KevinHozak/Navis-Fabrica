@@ -37,6 +37,7 @@ pub enum Pace {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Candidate {
     pub provider_id: String,
+    pub telemetry_provider_id: String,
     pub provider_name: String,
     pub model_id: String,
     pub model_name: String,
@@ -86,11 +87,11 @@ pub struct Decision {
     pub candidates: Vec<CandidateDecision>,
 }
 
-fn measured_signal<'a>(
+fn measured_signals<'a>(
     request: &'a Request,
     candidate: &Candidate,
     category: UsageCategory,
-) -> Option<&'a UsageSignal> {
+) -> Vec<&'a UsageSignal> {
     request
         .usage_signals
         .iter()
@@ -98,7 +99,7 @@ fn measured_signal<'a>(
             signal.category == category
                 && signal.status == UsageStatus::Available
                 && signal.confidence == "measured"
-                && signal.provider_id.as_deref() == Some(candidate.provider_id.as_str())
+                && signal.provider_id.as_deref() == Some(candidate.telemetry_provider_id.as_str())
                 && signal
                     .model_id
                     .as_deref()
@@ -110,13 +111,37 @@ fn measured_signal<'a>(
                     .is_some_and(|value| value.is_finite() && value >= 0.0)
                 && match category {
                     UsageCategory::SubscriptionWindow => {
-                        signal.unit == "% used" && signal.value.is_some_and(|value| value <= 100.0)
+                        signal.unit == "% used"
+                            && signal.value.is_some_and(|value| value <= 100.0)
+                            && signal
+                                .reset_at_ms
+                                .is_none_or(|reset_at| reset_at > request.now_ms)
                     }
                     UsageCategory::ApiSpend => matches!(signal.unit.as_str(), "USD" | "$"),
                     UsageCategory::ContextLimit | UsageCategory::LocalResource => false,
                 }
         })
+        .collect()
+}
+
+fn measured_signal<'a>(
+    request: &'a Request,
+    candidate: &Candidate,
+    category: UsageCategory,
+) -> Option<&'a UsageSignal> {
+    measured_signals(request, candidate, category)
+        .into_iter()
         .max_by_key(|signal| signal.collected_at_ms)
+}
+
+fn subscription_window_usage(request: &Request, candidate: &Candidate) -> Option<(f64, usize)> {
+    let signals = measured_signals(request, candidate, UsageCategory::SubscriptionWindow);
+    let count = signals.len();
+    let most_used = signals
+        .into_iter()
+        .filter_map(|signal| signal.value)
+        .max_by(f64::total_cmp)?;
+    Some((most_used, count))
 }
 
 fn max_age_ms(category: UsageCategory) -> u128 {
@@ -192,6 +217,9 @@ fn desired_latency_ordering(request: &Request, a: &Candidate, b: &Candidate) -> 
 }
 
 fn usage_value(request: &Request, candidate: &Candidate, category: UsageCategory) -> Option<f64> {
+    if category == UsageCategory::SubscriptionWindow {
+        return subscription_window_usage(request, candidate).map(|(value, _)| value);
+    }
     measured_signal(request, candidate, category)?
         .value
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -251,8 +279,8 @@ pub fn decide(request: Request) -> Decision {
         } else {
             reasons.push("No fresh completed-run latency measurement is available.".into());
         }
-        if let Some(value) = usage_value(&request, &candidate, UsageCategory::SubscriptionWindow) {
-            reasons.push(format!("Fresh measured subscription usage: {value}% used."));
+        if let Some((value, window_count)) = subscription_window_usage(&request, &candidate) {
+            reasons.push(format!("Fresh measured subscription usage: {value}% used in the most constrained of {window_count} active window(s)."));
         } else {
             reasons.push("No fresh measured subscription usage is available.".into());
         }
@@ -409,6 +437,7 @@ mod tests {
     ) -> Candidate {
         Candidate {
             provider_id: id.into(),
+            telemetry_provider_id: id.into(),
             provider_name: id.into(),
             model_id: "model".into(),
             model_name: "model".into(),
@@ -543,6 +572,52 @@ mod tests {
             decide(request).selected_provider_id.as_deref(),
             Some("cheap")
         );
+    }
+
+    #[test]
+    fn economy_uses_profile_adapter_identity_and_most_constrained_subscription_window() {
+        let mut profile = candidate(
+            "codex-profile",
+            false,
+            Some(32_000),
+            Some(true),
+            Some(4),
+            None,
+        );
+        profile.telemetry_provider_id = "codex".into();
+        let other = candidate("other", false, Some(32_000), Some(true), Some(4), None);
+        let mut request = request(vec![profile, other]);
+        request.pace = Pace::Economy;
+        let signal =
+            |id: &str, provider: &str, metric: &str, value: f64, reset_at_ms| UsageSignal {
+                id: id.into(),
+                provider_id: Some(provider.into()),
+                model_id: Some("model".into()),
+                category: UsageCategory::SubscriptionWindow,
+                metric: metric.into(),
+                label: metric.into(),
+                value: Some(value),
+                unit: "% used".into(),
+                window_duration_seconds: Some(3_600),
+                reset_at_ms: Some(reset_at_ms),
+                collected_at_ms: 10_000,
+                source: "provider telemetry".into(),
+                confidence: "measured".into(),
+                status: UsageStatus::Available,
+                note: None,
+            };
+        request.usage_signals = vec![
+            signal("primary", "codex", "primaryUsagePercent", 100.0, 20_000),
+            signal("secondary", "codex", "secondaryUsagePercent", 10.0, 30_000),
+            signal("other-window", "other", "primaryUsagePercent", 50.0, 20_000),
+        ];
+
+        let decision = decide(request);
+        assert_eq!(decision.selected_provider_id.as_deref(), Some("other"));
+        assert!(decision.candidates[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("100% used") && reason.contains("2 active window(s)")));
     }
 
     #[test]

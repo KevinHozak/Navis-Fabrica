@@ -13,6 +13,31 @@ The initial scaffold delivered only the basic structure. Its original verificati
 
 Do not interpret compile checks as live desktop UX or provider integration verification.
 
+## Release-P3 Windows installer and release process (issue #30)
+
+### Release configuration
+
+- The application version is synchronized to `0.19.0` in `package.json`, the package-lock root and app entry, `src-tauri/Cargo.toml`, the `navis-fabrica` package entry in `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`.
+- Tauri bundling is enabled for the NSIS target only. The existing 512×512 PNG and six-image ICO are included. NSIS defaults to current-user installation; WebView2 uses the silent `downloadBootstrapper` mode. Windows 10 (April 2018 or later) and Windows 11 normally include WebView2. On a clean machine without the runtime, setup requires internet access to download it. This follows the documented [Tauri Windows installer modes](https://v2.tauri.app/distribute/windows-installer/).
+- Node.js `24.14.0`, npm `11.11.1`, and Rust `1.96.0`/`x86_64-pc-windows-msvc` are pinned. `npm run release:verify` validates source versions, icons, release targets, WebView2 setup, stable app identity, and unsigned/no-updater configuration. `npm run release:windows` performs locked install, format, test, release build, artifact metadata checks, and an isolated executable launch smoke test.
+- Artifacts are unsigned and updater generation is disabled. No release was published or distributed.
+
+### Windows release evidence
+
+- Host toolchain: Node.js `24.14.0`, npm `11.11.1`, Rust `1.96.0`, Windows MSVC x64.
+- `npm run release:verify`: passed.
+- `npm run release:windows`: passed, including `npm ci` (72 packages), `cargo fmt --check`, all 102 Rust unit tests, the Vite production build, and Tauri `build --bundles nsis --ci -- --locked`.
+- Produced `src-tauri/target/release/navis-fabrica.exe` (15,558,144 bytes) and `src-tauri/target/release/bundle/nsis/Navis-Fabrica_0.19.0_x64-setup.exe` (4,178,548 bytes / 3.98 MiB). Both report FileVersion `0.19.0`, ProductVersion `0.19.0`, and ProductName `Navis-Fabrica`.
+- SHA-256 executable: `45FF3C581172FE37A785886C2A1C17C27BEA4B72CE06C7D88C4DAFE429085337`.
+- SHA-256 installer: `42341858301FC3B62F37C147D67E9A6E990BE7AD6D729B529F75047885C9EAEE`.
+- The release executable stayed running for 8 seconds with `APPDATA` and `LOCALAPPDATA` pointed to a disposable temporary profile, then closed successfully. This avoids changing the signed-in user's app data.
+
+### Not verified in this environment
+
+- No clean Windows VM or Windows Sandbox was available. Therefore setup behavior on a machine without WebView2, WebView2 installation from the bootstrapper, and installation over a prior released installer were not observed live.
+- Upgrade preservation is supported by keeping identifier `com.navis.fabrica` unchanged and keeping settings/run data in the existing Tauri per-app config/data directories; this source/configuration check is not a live installer-upgrade test. The release checklist in `docs/windows-release.md` keeps the clean-VM cases as required pre-distribution evidence.
+- The local executable launch confirms this host can start the app. It does not establish clean-machine compatibility or authorize distribution.
+
 ## Release-P2 performance, accessibility, and diagnostics (issue #29)
 
 ### Measurement boundaries and baselines

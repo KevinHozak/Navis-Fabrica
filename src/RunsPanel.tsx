@@ -69,7 +69,12 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           updates.forEach(([id, item]) => byRun.set(id, [...(byRun.get(id) ?? []), item]));
           setRuns((items) => items.map((run) => {
             const additions = byRun.get(run.id);
-            return additions ? { ...run, nextSequence: Math.max(run.nextSequence, ...additions.map((item) => item.sequence + 1)), events: [...run.events, ...additions].slice(-maxPendingRunEvents) } : run;
+            if (!additions) return run;
+            const unseen = additions.filter((item) => item.sequence >= run.nextSequence);
+            if (unseen.length === 0) return run;
+            const unique = new Map(unseen.map((item) => [item.sequence, item]));
+            const nextEvents = [...unique.values()].sort((left, right) => left.sequence - right.sequence);
+            return { ...run, nextSequence: Math.max(run.nextSequence, ...nextEvents.map((item) => item.sequence + 1)), events: [...run.events, ...nextEvents].slice(-maxPendingRunEvents) };
           }));
         });
       }

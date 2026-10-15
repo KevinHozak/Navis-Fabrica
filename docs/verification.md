@@ -97,13 +97,16 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 - Models are eligible only when Ollama reports `tools` and at least 8,192 context tokens. Missing metadata is shown as unknown and is not eligible. Aider's documentation warns that small Ollama contexts can silently discard work; the adapter uses the available physical-memory to model-size ratio to choose a bounded timeout from 300 to 3,600 seconds. GPU memory is not measured, so this timeout is an estimate based on system RAM, not a GPU-capacity claim.
 - Optional tests use a user-entered test command passed as one process argument to Aider. It can modify the selected project, and its result is visible in the managed run output.
 - A handoff packet is saved on a terminal source run with goal, scope, diff, prior checks, pending work, and recorded commit/branch/PR effects. The user chooses a target provider, saves the checkpoint, then separately presses Start. The target prompt explicitly says not to repeat recorded remote effects; no provider switch or side effect is automatic.
+- Aider receives the prompt through `--message` (inline text), not `--message-file` (which expects a path). After navigation or restart, a saved packet has an explicit Load action; it is enabled only when its target provider is selected.
+- Handoffs capture their canonical project worktree, changed paths, staged and unstaged binary diffs, and hashes for untracked files. A target run may proceed with the exact saved snapshot only; changed paths, changed content, a different worktree, or additional unrelated edits require a fresh handoff and are left untouched. Older packets without a snapshot still require a clean worktree.
 - Live Windows probe: `ollama.exe` is installed, but `http://127.0.0.1:11434/api/tags` was unavailable; Aider is not installed/on PATH. Therefore no live Ollama model capability or Aider run is claimed. The UI surfaces these states and fixture tests cover parsing/eligibility.
 - `cargo check --manifest-path src-tauri/Cargo.toml --locked --offline`: passed.
 - `npm ci --ignore-scripts` restored locked dependencies; `npm run build`: passed (TypeScript and Vite).
 - `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline providers::tests::ollama -- --nocapture`: 3 passed (loopback policy, context/tool eligibility, and RAM-based timeout policy).
 - `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline providers::tests::aider_invocation_pins_local_chat_model_and_disables_remote_side_effects -- --nocapture`: 1 passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline runs::tests::history_survives_restart_and_orphans_become_interrupted -- --nocapture`: 1 passed, including handoff packet persistence and completed side-effect retention.
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline`: full current suite passed, 74 passed, 0 failed. This supersedes earlier baseline failures recorded above for the issue #24 verification run.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked --offline`: full current suite passed, 75 passed, 0 failed. This supersedes earlier baseline failures recorded above for the issue #24 verification run.
+- Focused regression fixtures cover Aider inline-message arguments and exact dirty-worktree handoff matching, including rejection of changed and unrelated files.
 - `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` and `git diff --check`: passed.
 
 ## Routing-P1 usage and latency signals (issue #25)

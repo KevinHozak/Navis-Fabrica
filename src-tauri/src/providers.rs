@@ -343,7 +343,7 @@ pub fn aider_ollama_arguments(
     let mut args = vec![
         "--model".into(),
         format!("ollama_chat/{model_id}"),
-        "--message-file".into(),
+        "--message".into(),
         prompt_file.into(),
         "--yes".into(),
         "--no-auto-commits".into(),
@@ -1163,6 +1163,10 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--model", "ollama_chat/qwen3"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--message", "Change the module"]));
+        assert!(!args.contains(&"--message-file".into()));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--test-cmd", "cargo test"]));

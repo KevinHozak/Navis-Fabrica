@@ -126,7 +126,7 @@ export type WorkflowRun = {
   workflow: WorkflowRunMetadata | null;
   handoff: ProviderHandoff | null;
 };
-export type ProviderHandoff = { version: number; sourceRunId: string; targetProviderId: string; goal: string; scope: string; diff: string; checks: string; pendingWork: string; completedSideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null; createdAtMs: number };
+export type ProviderHandoff = { version: number; sourceRunId: string; targetProviderId: string; workingTreeRoot: string; workingTreePaths: string[]; workingTreeFingerprint: string | null; goal: string; scope: string; diff: string; checks: string; pendingWork: string; completedSideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null; createdAtMs: number };
 export type HandoffInput = { sourceRunId: string; targetProviderId: string; goal: string; scope: string; diff: string; checks: string; pendingWork: string };
 export type WorkflowRunMetadata = {
   action: "dev-work" | "dev-push" | "dev-build";

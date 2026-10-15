@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import type { GitHubIssue, ProjectEntry, WorkflowRunMetadata } from "./settings";
+import type { GitHubIssue, ProjectEntry, ProviderHandoff, WorkflowRunMetadata } from "./settings";
 import {
   cancelWorkflowRun, createProviderHandoff, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
   loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
@@ -106,6 +106,16 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       setError("Handoff saved. Review the target provider and press Start to switch manually.");
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
+  }
+
+  function loadSavedHandoff(packet: ProviderHandoff) {
+    if (selectedProviderId !== packet.targetProviderId) {
+      setError("Select this handoff's target provider in Providers before loading it.");
+      return;
+    }
+    setHandoffSourceRunId(packet.sourceRunId);
+    setCodexPrompt("Continue this work from the saved handoff. Verify the recorded worktree and continue only with pending work. Do not repeat recorded remote effects.");
+    setError("Saved handoff loaded. Review the prompt and press Start to continue manually.");
   }
 
   async function startAgentWorkflow(event: FormEvent) {
@@ -303,7 +313,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           {selected.workflow?.action === "dev-build" && selected.state === "interrupted" && selected.processId !== null && <p className="registry-context-note">The previous build process (PID {selected.processId}) is still running. Retry will appear after it exits.</p>}
           {selected.workflow?.action === "dev-build" && selected.processId === null && ["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state) && <button className="button button-secondary" type="button" disabled={busy || selectedProviderKind !== "codex"} onClick={() => { void retryBuild(); }}>Retry build safely</button>}
           {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
-          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}</div>}
+          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}<div className="run-launch-options"><button className="button button-secondary" type="button" disabled={busy || selectedProviderId !== selected.handoff.targetProviderId} onClick={() => loadSavedHandoff(selected.handoff!)}>Load saved handoff into launch form</button>{selectedProviderId !== selected.handoff.targetProviderId && <small>Select the saved target provider in Providers to continue this handoff.</small>}</div></div>}
           {selected.finishedAtMs !== null && !activeStates.has(selected.state) && <details className="work-context"><summary>Prepare a manual provider handoff</summary><p>Creates a saved checkpoint for the currently selected target provider. The next run starts only when you press Start.</p><form className="run-launch-form" onSubmit={(event) => { void createHandoff(event); }}>
             <label>Goal<input required maxLength={8000} value={handoffGoal} onChange={(event) => setHandoffGoal(event.target.value)} /></label>
             <label>Scope<textarea required rows={2} maxLength={8000} value={handoffScope} onChange={(event) => setHandoffScope(event.target.value)} /></label>

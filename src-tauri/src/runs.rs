@@ -232,6 +232,12 @@ pub struct ProviderHandoff {
     pub version: u32,
     pub source_run_id: String,
     pub target_provider_id: String,
+    #[serde(default)]
+    pub working_tree_root: String,
+    #[serde(default)]
+    pub working_tree_paths: Vec<String>,
+    #[serde(default)]
+    pub working_tree_fingerprint: Option<String>,
     pub goal: String,
     pub scope: String,
     pub diff: String,
@@ -496,6 +502,158 @@ fn mutation_scope(cwd: &Path) -> String {
         .unwrap_or(cwd)
         .to_string_lossy()
         .to_lowercase()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeSnapshot {
+    root: PathBuf,
+    changed_paths: Vec<String>,
+    fingerprint: String,
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|_| "Could not verify the Git worktree for this handoff.".to_string())
+}
+
+fn git_worktree_snapshot(cwd: &Path) -> Result<Option<GitWorktreeSnapshot>, String> {
+    let Some(root) = cwd.ancestors().find(|folder| folder.join(".git").exists()) else {
+        return Ok(None);
+    };
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| "The Git worktree root could not be resolved.".to_string())?;
+    let status = git_output(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    if !status.status.success() {
+        return Err("Could not verify Git status for this handoff.".into());
+    }
+    let mut changed_paths = Vec::new();
+    for entry in status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        if entry.len() < 4 {
+            return Err("Git returned an unreadable status for this handoff.".into());
+        }
+        if entry[..2].contains(&b'R') || entry[..2].contains(&b'C') {
+            return Err(
+                "Renamed or copied files need a clean worktree before a provider handoff.".into(),
+            );
+        }
+        let path = std::str::from_utf8(&entry[3..])
+            .map_err(|_| "Git returned a path that cannot be safely scoped.".to_string())?
+            .replace('\\', "/");
+        changed_paths.push(path);
+    }
+    changed_paths.sort_by_key(|path| path.to_lowercase());
+
+    let cached_diff = git_output(root, &["diff", "--binary", "--cached"])?;
+    let working_diff = git_output(root, &["diff", "--binary"])?;
+    if !cached_diff.status.success() || !working_diff.status.success() {
+        return Err("Could not capture the tracked Git diff for this handoff.".into());
+    }
+    let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if !untracked.status.success() {
+        return Err("Could not capture untracked files for this handoff.".into());
+    }
+
+    let mut snapshot = status.stdout;
+    snapshot.extend_from_slice(&cached_diff.stdout);
+    snapshot.extend_from_slice(&working_diff.stdout);
+    for path_bytes in untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path_bytes)
+            .map_err(|_| "Git returned a path that cannot be safely scoped.".to_string())?;
+        let full_path = root.join(path);
+        let canonical = full_path
+            .canonicalize()
+            .map_err(|_| "An untracked handoff file could not be resolved.".to_string())?;
+        if !canonical.starts_with(&canonical_root) || !canonical.is_file() {
+            return Err(
+                "Untracked handoff files must be regular files inside the selected worktree."
+                    .into(),
+            );
+        }
+        let blob = git_output(root, &["hash-object", "--", path])?;
+        if !blob.status.success() {
+            return Err("Could not fingerprint an untracked handoff file.".into());
+        }
+        snapshot.extend_from_slice(path.as_bytes());
+        snapshot.push(0);
+        snapshot.extend_from_slice(&blob.stdout);
+    }
+
+    let mut hash = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| "Could not fingerprint the Git worktree for this handoff.".to_string())?;
+    hash.stdin
+        .take()
+        .ok_or("Could not fingerprint the Git worktree for this handoff.")?
+        .write_all(&snapshot)
+        .map_err(|_| "Could not fingerprint the Git worktree for this handoff.".to_string())?;
+    let fingerprint = hash
+        .wait_with_output()
+        .map_err(|_| "Could not fingerprint the Git worktree for this handoff.".to_string())?;
+    if !fingerprint.status.success() {
+        return Err("Could not fingerprint the Git worktree for this handoff.".into());
+    }
+    let fingerprint = String::from_utf8_lossy(&fingerprint.stdout)
+        .trim()
+        .to_owned();
+    if fingerprint.is_empty() {
+        return Err("Could not fingerprint the Git worktree for this handoff.".into());
+    }
+    Ok(Some(GitWorktreeSnapshot {
+        root: canonical_root,
+        changed_paths,
+        fingerprint,
+    }))
+}
+
+fn ensure_handoff_worktree(cwd: &Path, handoff: &ProviderHandoff) -> Result<(), String> {
+    if handoff.working_tree_root.is_empty() {
+        return ensure_clean_git_worktree(cwd);
+    }
+    let expected_root = handoff.working_tree_root.to_lowercase();
+    let current = git_worktree_snapshot(cwd)?;
+    let current_root = current
+        .as_ref()
+        .map(|snapshot| snapshot.root.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| cwd.to_string_lossy().to_lowercase());
+    if current_root != expected_root {
+        return Err("This handoff belongs to a different project worktree.".into());
+    }
+    match current {
+        Some(snapshot)
+            if snapshot.changed_paths == handoff.working_tree_paths
+                && handoff.working_tree_fingerprint.as_deref()
+                    == Some(snapshot.fingerprint.as_str()) =>
+        {
+            Ok(())
+        }
+        None if handoff.working_tree_paths.is_empty()
+            && handoff.working_tree_fingerprint.is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err("The project worktree changed after this handoff was saved. Review the changes and prepare a new handoff.".into()),
+    }
 }
 
 fn interrupted_process_owns_scope(records: &[RunRecord], canonical_key: &str) -> bool {
@@ -2067,6 +2225,8 @@ pub fn start_codex_workflow_run(
             ));
         }
         preflight_agent_workflow(&config.executable, &cwd, workflow)?;
+    } else if let Some(packet) = config.handoff.as_ref() {
+        ensure_handoff_worktree(&cwd, packet)?;
     } else {
         ensure_clean_git_worktree(&cwd)?;
     }
@@ -2118,7 +2278,11 @@ pub fn start_antigravity_workflow_run(
     if !cwd.is_dir() {
         return Err("The selected project must be an existing folder.".into());
     }
-    ensure_clean_git_worktree(&cwd)?;
+    if let Some(packet) = handoff.as_ref() {
+        ensure_handoff_worktree(&cwd, packet)?;
+    } else {
+        ensure_clean_git_worktree(&cwd)?;
+    }
     let request = StartRequest {
         executable: config.executable.to_string_lossy().into_owned(),
         arguments: crate::providers::antigravity_arguments(
@@ -2171,7 +2335,7 @@ pub fn create_provider_handoff(
     }
     let source = state
         .records
-        .iter_mut()
+        .iter()
         .find(|record| record.id == input.source_run_id)
         .ok_or("The source run is no longer in saved workflow history.")?;
     if !matches!(
@@ -2180,10 +2344,31 @@ pub fn create_provider_handoff(
     ) {
         return Err("Finish or cancel the source run before preparing a manual handoff.".into());
     }
+    let source_cwd = Path::new(&source.cwd)
+        .canonicalize()
+        .map_err(|_| "The source run's project folder could not be resolved.".to_string())?;
+    let source_root = source_cwd
+        .ancestors()
+        .find(|folder| folder.join(".git").exists())
+        .unwrap_or(&source_cwd)
+        .canonicalize()
+        .map_err(|_| "The source run's project folder could not be resolved.".to_string())?;
+    let snapshot = git_worktree_snapshot(&source_cwd)?;
+    let source = state
+        .records
+        .iter_mut()
+        .find(|record| record.id == input.source_run_id)
+        .ok_or("The source run is no longer in saved workflow history.")?;
     let packet = ProviderHandoff {
-        version: 1,
+        version: 2,
         source_run_id: source.id.clone(),
         target_provider_id: input.target_provider_id,
+        working_tree_root: source_root.to_string_lossy().into_owned(),
+        working_tree_paths: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.changed_paths.clone())
+            .unwrap_or_default(),
+        working_tree_fingerprint: snapshot.map(|snapshot| snapshot.fingerprint),
         goal: validate("goal", &input.goal)?,
         scope: validate("scope", &input.scope)?,
         diff: validate("diff", &input.diff)?,
@@ -2277,8 +2462,15 @@ pub fn start_ollama_workflow_run(
     if !cwd.is_dir() {
         return Err("The selected project must be an existing folder.".into());
     }
-    ensure_clean_git_worktree(&cwd)?;
-    if handoff.as_ref().is_some_and(|packet| packet.version != 1) {
+    if let Some(packet) = handoff.as_ref() {
+        ensure_handoff_worktree(&cwd, packet)?;
+    } else {
+        ensure_clean_git_worktree(&cwd)?;
+    }
+    if handoff
+        .as_ref()
+        .is_some_and(|packet| ![1, 2].contains(&packet.version))
+    {
         return Err("This handoff packet version is unsupported.".into());
     }
     let prompt = handoff
@@ -2911,6 +3103,81 @@ mod tests {
         }
     }
 
+    fn git_fixture(path: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Navis Fixture"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+        ] {
+            let output = Command::new("git")
+                .current_dir(path)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(path.join("tracked.txt"), "baseline\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(path)
+            .args(["add", "tracked.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(path)
+            .args(["commit", "-qm", "baseline"])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn handoff_accepts_only_the_exact_saved_worktree_snapshot() {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        git_fixture(directory.path());
+        fs::write(directory.path().join("tracked.txt"), "recorded edit\n").unwrap();
+        fs::write(directory.path().join("new.txt"), "recorded new file\n").unwrap();
+        let snapshot = git_worktree_snapshot(directory.path()).unwrap().unwrap();
+        assert_eq!(snapshot.changed_paths, vec!["new.txt", "tracked.txt"]);
+        let handoff = ProviderHandoff {
+            version: 2,
+            source_run_id: "source".into(),
+            target_provider_id: "ollama".into(),
+            working_tree_root: snapshot.root.to_string_lossy().into_owned(),
+            working_tree_paths: snapshot.changed_paths,
+            working_tree_fingerprint: Some(snapshot.fingerprint),
+            goal: "continue".into(),
+            scope: "tracked.txt and new.txt".into(),
+            diff: "saved diff".into(),
+            checks: "none".into(),
+            pending_work: "finish".into(),
+            completed_side_effects: None,
+            created_at_ms: 1,
+        };
+        assert!(ensure_handoff_worktree(directory.path(), &handoff).is_ok());
+
+        fs::write(
+            directory.path().join("unrelated.txt"),
+            "keep this user change\n",
+        )
+        .unwrap();
+        let error = ensure_handoff_worktree(directory.path(), &handoff).unwrap_err();
+        assert!(error.contains("worktree changed after this handoff"));
+        fs::remove_file(directory.path().join("unrelated.txt")).unwrap();
+
+        fs::write(
+            directory.path().join("new.txt"),
+            "changed after checkpoint\n",
+        )
+        .unwrap();
+        let error = ensure_handoff_worktree(directory.path(), &handoff).unwrap_err();
+        assert!(error.contains("worktree changed after this handoff"));
+    }
+
     #[test]
     fn rejects_invalid_cwd_timeout_and_argument_arrays() {
         assert!(validate_request(&request("echo", "relative", vec![])).is_err());
@@ -2966,6 +3233,14 @@ mod tests {
                 version: 1,
                 source_run_id: "fixture".into(),
                 target_provider_id: "ollama-local".into(),
+                working_tree_root: directory
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                working_tree_paths: vec![],
+                working_tree_fingerprint: None,
                 goal: "Finish the requested change".into(),
                 scope: "src/main.rs".into(),
                 diff: "One file changed".into(),

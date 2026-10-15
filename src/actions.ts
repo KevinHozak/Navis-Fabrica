@@ -115,6 +115,9 @@ export function actionDisabledReason(
   if (action.id === "dev-build") {
     const cargo = project.workflowPrerequisites.find((item) => item.name === "cargo" && item.requiredFor.includes("Tauri"));
     if (!cargo?.available) return "The Rust cargo prerequisite is unavailable.";
+    return skills.some((entry) => entry.id === "dev-build" && entry.status === "available" && entry.compatibleAgents.includes("Codex"))
+      ? null
+      : "A compatible Codex dev-build skill is unavailable.";
   }
   return "The workflow execution adapter is not available in this phase.";
 }

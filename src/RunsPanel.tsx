@@ -26,7 +26,8 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [respondedRequests, setRespondedRequests] = useState<Set<string>>(() => new Set());
   const [codexAnswers, setCodexAnswers] = useState<Record<string, Record<string, string>>>({});
   const [selectedProviderKind, setSelectedProviderKind] = useState<string | null>(null);
-  const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push">("dev-work");
+  const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push" | "dev-build">("dev-work");
+  const [buildProfile, setBuildProfile] = useState<"release" | "debug">("release");
   const [workflowIntent, setWorkflowIntent] = useState("");
   const [scopePathsText, setScopePathsText] = useState("");
   const [requestedEffects, setRequestedEffects] = useState<Set<"commit" | "push" | "createPullRequest">>(() => new Set());
@@ -44,8 +45,12 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
         ? { ...item, nextSequence: Math.max(item.nextSequence, next.sequence + 1), events: [...item.events, next].slice(-2000) }
         : item));
     });
+    const recoveryPoll = window.setInterval(() => {
+      listWorkflowRuns().then((items) => { if (active) setRuns(items); }).catch(() => undefined);
+    }, 5000);
     return () => {
       active = false;
+      window.clearInterval(recoveryPoll);
       void update.then((stop) => stop());
       void event.then((stop) => stop());
     };
@@ -78,7 +83,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     if (workflowAction === "dev-work" && (!issue?.selectable || issue.blocked)) {
       setError("Choose an open, unblocked issue from this project's GitHub context."); return;
     }
-    if (!project.isGitRepository || project.git.status !== "available" || !project.git.branch) {
+    if (workflowAction !== "dev-build" && (!project.isGitRepository || project.git.status !== "available" || !project.git.branch)) {
       setError("Git branch and repository status must be available before this workflow can start."); return;
     }
     if (workflowAction === "dev-work" && project.git.dirty !== false) {
@@ -89,6 +94,12 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       .map((item) => item.name);
     if (missingTools.length) {
       setError(`Required project tools are unavailable: ${missingTools.join(", ")}. Install or configure them before starting this workflow.`); return;
+    }
+    if (workflowAction === "dev-build" && (!project.detectedStacks.includes("Tauri") || !project.workflowPrerequisites.some((item) => item.name === "cargo" && item.available && item.requiredFor.includes("Tauri")))) {
+      setError("A Tauri project and available Cargo toolchain are required for a verified build profile."); return;
+    }
+    if (workflowAction === "dev-build" && selectedProviderKind !== "codex") {
+      setError("The dev-build action requires the configured Codex provider."); return;
     }
     if (workflowAction === "dev-push" && (!project.git.remotes.some((remote) => remote.github) || project.git.dirty !== true)) {
       setError("Push changes needs a GitHub remote and a verified set of changed files."); return;
@@ -104,16 +115,18 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     if (requestedEffects.has("createPullRequest") && !requestedEffects.has("push")) {
       setError("Creating a pull request requires opting in to push as well."); return;
     }
-    const issueUrl = issue?.url ?? null;
-    const operationData = JSON.stringify({ action: workflowAction, cwd: defaultCwd, issueUrl, issueTitle: issue?.title ?? null, issueBody: issue?.body ?? null, acceptanceCriteria: issue?.acceptanceCriteria ?? [], blockers: issue?.blockedBy ?? [], parentEpic: issue?.parentEpic ?? null, pullRequestUrls: issue?.pullRequestUrls ?? [], paths, intent: workflowIntent.trim(), effects: [...requestedEffects].sort() });
+    const issueUrl = workflowAction === "dev-work" ? issue?.url ?? null : null;
+    const operationData = JSON.stringify({ action: workflowAction, cwd: defaultCwd, issueUrl, issueTitle: issue?.title ?? null, issueBody: issue?.body ?? null, acceptanceCriteria: issue?.acceptanceCriteria ?? [], blockers: issue?.blockedBy ?? [], parentEpic: issue?.parentEpic ?? null, pullRequestUrls: issue?.pullRequestUrls ?? [], paths, intent: workflowIntent.trim(), effects: workflowAction === "dev-build" ? [] : [...requestedEffects].sort(), buildProfile: workflowAction === "dev-build" ? buildProfile : null, retryNonce: workflowAction === "dev-build" ? crypto.randomUUID() : null });
     setBusy(true);
     try {
       const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(operationData));
       const operationKey = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-      const workflow: WorkflowRunMetadata = { action: workflowAction, operationKey, intent: workflowIntent.trim(), issueUrl, scopePaths: paths, requestedEffects: [...requestedEffects], sideEffects: null };
+      const workflow: WorkflowRunMetadata = { action: workflowAction, operationKey, intent: workflowIntent.trim(), buildProfile: workflowAction === "dev-build" ? buildProfile : undefined, issueUrl, scopePaths: paths, requestedEffects: workflowAction === "dev-build" ? [] : [...requestedEffects], sideEffects: null };
       const issueContext = issue ? JSON.stringify({ url: issue.url, title: issue.title, body: issue.body, acceptanceCriteria: issue.acceptanceCriteria, blockedBy: issue.blockedBy, parentEpic: issue.parentEpic, pullRequestUrls: issue.pullRequestUrls }) : "None selected.";
       const prompt = [
-        `Run the ${workflowAction} skill for the selected project.`,
+        workflowAction === "dev-build"
+          ? `Run the dev-build skill for the selected Tauri project using the ${buildProfile} profile. Verify the generated artifact exists and inspect its embedded FileVersion and ProductVersion. Report this exact machine-readable line: NAVIS_BUILD_ARTIFACT:{"profile":"${buildProfile}","path":"<absolute path>","fileVersion":"<FileVersion>","productVersion":"<ProductVersion>"}. Clearly label the profile as ${buildProfile.toUpperCase()}${buildProfile === "debug" ? " (DEBUG BUILD; NOT A RELEASE ARTIFACT)" : " (RELEASE)"}. Do not commit, push, or create a pull request.`
+          : `Run the ${workflowAction} skill for the selected project.`,
         `User's intentional scope: ${workflowIntent.trim()}`,
         `Selected issue context (read-only): ${issueContext}`,
         `Detected project stacks and prerequisite status: ${JSON.stringify({ stacks: project.detectedStacks, prerequisites: project.workflowPrerequisites })}`,
@@ -171,17 +184,35 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   }
 
+  async function retryBuild() {
+    if (!selected?.workflow || selected.workflow.action !== "dev-build" || selected.processId !== null || !["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state)) return;
+    setBusy(true);
+    setError("");
+    try {
+      const profile = selected.workflow.buildProfile ?? "release";
+      const operationKey = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${selected.id}:${crypto.randomUUID()}`))), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const workflow: WorkflowRunMetadata = { action: "dev-build", operationKey, intent: selected.workflow.intent, buildProfile: profile, issueUrl: null, scopePaths: [], requestedEffects: [], sideEffects: null, buildArtifact: null };
+      const prompt = `Retry the interrupted ${profile} Tauri build for this project. Run the dev-build skill. Do not commit, push, or open a pull request. Verify the generated artifact's FileVersion and ProductVersion and report an absolute artifact path in this exact line: NAVIS_BUILD_ARTIFACT:{"profile":"${profile}","path":"<absolute path>","fileVersion":"<FileVersion>","productVersion":"<ProductVersion>"}. Label the result ${profile.toUpperCase()}${profile === "debug" ? " (DEBUG BUILD; NOT A RELEASE ARTIFACT)" : " (RELEASE)"}.`;
+      const run = await startCodexWorkflowRun({ cwd: selected.cwd, prompt, skillId: "dev-build", timeoutSeconds: codexTimeout, workflow });
+      setRuns((items) => [run, ...items.filter((item) => item.id !== run.id)].slice(0, 100));
+      setSelectedId(run.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusy(false); }
+  }
+
   return <div className="runs-workspace">
     <section className="panel run-launch-panel" aria-labelledby="agent-workflow-title">
       <div className="panel-heading"><div><h2 id="agent-workflow-title">Agent-backed project actions</h2><p>Runs the installed workflow through the configured Codex provider and records its output.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgentWorkflow(event); }}>
-        <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push")}><option value="dev-work">Work on selected issue</option><option value="dev-push">Review and push selected changes</option></select></label>
+        <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push" | "dev-build")}><option value="dev-work">Work on selected issue</option><option value="dev-push">Review and push selected changes</option><option value="dev-build">Build project</option></select></label>
         <label>Project<input value={`${project.name} · ${project.path}`} readOnly aria-readonly="true" /></label>
-        {workflowAction === "dev-work" ? <label>Issue context<input value={issue ? `#${issue.number} · ${issue.title}${issue.blocked ? " · blocked" : ""}` : "No issue selected"} readOnly aria-readonly="true" /></label> : <label>Changed file paths, one per line<textarea rows={3} required value={scopePathsText} onChange={(event) => setScopePathsText(event.target.value)} placeholder="src/file.ts" /></label>}
-        <label>Intentional change scope<textarea rows={3} required maxLength={8000} value={workflowIntent} onChange={(event) => setWorkflowIntent(event.target.value)} placeholder="What should the agent change, and what should it leave alone?" /></label>
-        <fieldset className="run-effect-options"><legend>Allow side effects (each requires an explicit choice)</legend>{(["commit", "push", "createPullRequest"] as const).map((effect) => <label key={effect} className="run-checkbox"><input type="checkbox" checked={requestedEffects.has(effect)} disabled={effect === "createPullRequest" && !requestedEffects.has("push")} onChange={(event) => setRequestedEffects((prior) => { const next = new Set(prior); if (event.target.checked) next.add(effect); else { next.delete(effect); if (effect === "push") next.delete("createPullRequest"); } return next; })} /><span>{effect === "createPullRequest" ? "Create or update pull request" : effect === "push" ? "Push branch" : "Commit changes"}</span></label>)}</fieldset>
-        <div className="run-launch-options"><p className="registry-context-note">{workflowAction === "dev-work" ? "Requires a clean Git checkout. The dev-work skill creates an isolated worktree when appropriate." : "Preflight verifies that selected paths match every changed file. No automatic staging or stashing."} Codex authentication is checked before launch; GitHub CLI authentication is checked before a permitted push.</p><button className="button button-primary" type="submit" disabled={busy || !workflowIntent.trim()}>{busy ? "Starting…" : "Start selected action"}</button></div>
+        {workflowAction === "dev-work" && <label>Issue context<input value={issue ? `#${issue.number} · ${issue.title}${issue.blocked ? " · blocked" : ""}` : "No issue selected"} readOnly aria-readonly="true" /></label>}
+        {workflowAction === "dev-push" && <label>Changed file paths, one per line<textarea rows={3} required value={scopePathsText} onChange={(event) => setScopePathsText(event.target.value)} placeholder="src/file.ts" /></label>}
+        {workflowAction === "dev-build" && <label>Build profile<select value={buildProfile} onChange={(event) => setBuildProfile(event.target.value as "release" | "debug")}><option value="release">Release (default)</option><option value="debug">Debug (development only)</option></select></label>}
+        <label>Intentional change scope<textarea rows={3} required maxLength={8000} value={workflowIntent} onChange={(event) => setWorkflowIntent(event.target.value)} placeholder={workflowAction === "dev-build" ? "Describe the build target or relevant constraints." : "What should the agent change, and what should it leave alone?"} /></label>
+        {workflowAction !== "dev-build" && <fieldset className="run-effect-options"><legend>Allow side effects (each requires an explicit choice)</legend>{(["commit", "push", "createPullRequest"] as const).map((effect) => <label key={effect} className="run-checkbox"><input type="checkbox" checked={requestedEffects.has(effect)} disabled={effect === "createPullRequest" && !requestedEffects.has("push")} onChange={(event) => setRequestedEffects((prior) => { const next = new Set(prior); if (event.target.checked) next.add(effect); else { next.delete(effect); if (effect === "push") next.delete("createPullRequest"); } return next; })} /><span>{effect === "createPullRequest" ? "Create or update pull request" : effect === "push" ? "Push branch" : "Commit changes"}</span></label>)}</fieldset>}
+        <div className="run-launch-options"><p className="registry-context-note">{workflowAction === "dev-work" ? "Requires a clean Git checkout. The dev-work skill creates an isolated worktree when appropriate." : workflowAction === "dev-push" ? "Preflight verifies that selected paths match every changed file. No automatic staging or stashing." : `Tauri only. ${buildProfile === "release" ? "Release is the default." : "DEBUG BUILD; it is not a release artifact."} The run records its output; inspect reported artifact path and version before use.`} Codex authentication is checked before launch; GitHub CLI authentication is checked before a permitted push.</p><button className="button button-primary" type="submit" disabled={busy || !workflowIntent.trim()}>{busy ? "Starting…" : "Start selected action"}</button></div>
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
@@ -233,7 +264,10 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
         {selected ? <>
           {selected.workflow && <div className="work-context"><strong>Recorded action scope</strong><p>{selected.workflow.intent}</p>{selected.workflow.issueUrl && <a href={selected.workflow.issueUrl} target="_blank" rel="noreferrer">Issue context ↗</a>}{selected.workflow.scopePaths.length > 0 && <ul>{selected.workflow.scopePaths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>}<small>Requested effects: {selected.workflow.requestedEffects.length ? selected.workflow.requestedEffects.join(", ") : "none"}</small></div>}
           <pre className="run-output" aria-live="polite">{selected.events.map((item) => `[${item.sequence}] ${item.kind}: ${item.text}`).join("\n") || "Waiting for process output…"}</pre>
+          {selected.workflow?.buildArtifact && <p className="registry-context-note">{selected.workflow.buildArtifact.verified ? "Artifact verified: " : "Artifact receipt unverified: "}{selected.workflow.buildArtifact.profile.toUpperCase()}{selected.workflow.buildArtifact.profile === "debug" ? " (DEBUG BUILD)" : " (RELEASE)"} · FileVersion {selected.workflow.buildArtifact.fileVersion} · ProductVersion {selected.workflow.buildArtifact.productVersion} · <code>{selected.workflow.buildArtifact.path}</code> · {selected.workflow.buildArtifact.verificationMessage}</p>}
           {selected.workflow?.sideEffects && <p className="registry-context-note">{selected.workflow.sideEffects.verified ? "Verified side effects: " : "Agent-reported side effects, not fully verified: "}{selected.workflow.sideEffects.commitSha ? `commit ${selected.workflow.sideEffects.commitSha} · ` : ""}{selected.workflow.sideEffects.remoteBranch ? `branch ${selected.workflow.sideEffects.remoteBranch} · ` : ""}{selected.workflow.sideEffects.pullRequestUrl ? <a href={selected.workflow.sideEffects.pullRequestUrl} target="_blank" rel="noreferrer">pull request</a> : ""}{selected.workflow.sideEffects.verificationMessage ? ` · ${selected.workflow.sideEffects.verificationMessage}` : ""}</p>}
+          {selected.workflow?.action === "dev-build" && selected.state === "interrupted" && selected.processId !== null && <p className="registry-context-note">The previous build process (PID {selected.processId}) is still running. Retry will appear after it exits.</p>}
+          {selected.workflow?.action === "dev-build" && selected.processId === null && ["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state) && <button className="button button-secondary" type="button" disabled={busy || selectedProviderKind !== "codex"} onClick={() => { void retryBuild(); }}>Retry build safely</button>}
           {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
           {selected.state === "needsInput" && selected.events.filter((item) => item.kind === "approvalRequest" || item.kind === "userInputRequest").map((item) => <CodexRequestCard key={`${item.sequence}-${item.kind}`} runId={selected.id} event={item} onResolved={(requestId) => setRespondedRequests((prior) => new Set(prior).add(requestId))} isResolved={(requestId) => respondedRequests.has(requestId)} />)}
           {selected.state === "needsInput" && selected.provider !== "codex" && selected.provider !== "antigravity" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>

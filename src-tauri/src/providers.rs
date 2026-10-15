@@ -46,6 +46,13 @@ impl ProviderKind {
             Self::Custom => "custom",
         }
     }
+
+    pub fn supports_workflow_run(self) -> bool {
+        matches!(
+            self,
+            Self::Codex | Self::Antigravity | Self::Ollama | Self::OpenRouter
+        )
+    }
 }
 
 pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
@@ -1349,6 +1356,15 @@ mod tests {
                 && !status.capabilities.interactive_input
                 && !status.capabilities.checkpoints
         );
+    }
+
+    #[test]
+    fn only_implemented_provider_adapters_are_valid_fallback_targets() {
+        assert!(ProviderKind::Codex.supports_workflow_run());
+        assert!(ProviderKind::Antigravity.supports_workflow_run());
+        assert!(ProviderKind::Ollama.supports_workflow_run());
+        assert!(ProviderKind::OpenRouter.supports_workflow_run());
+        assert!(!ProviderKind::Custom.supports_workflow_run());
     }
 
     #[test]

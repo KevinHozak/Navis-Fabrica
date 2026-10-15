@@ -156,7 +156,7 @@ export type GitHubIssue = GitHubIssueSummary & {
 
 export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
 export type WorkflowRun = {
-  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; timeoutSeconds: number; state: string;
+  id: string; executable: string; provider: string | null; providerProfileId?: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; timeoutSeconds: number; state: string;
   modelId: string | null; startedAtMs: number; finishedAtMs: number | null; latencyMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
   workflow: WorkflowRunMetadata | null;

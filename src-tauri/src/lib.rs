@@ -1011,6 +1011,7 @@ fn start_openrouter_workflow_run(
             executable,
             cwd,
             model_id: model.id.clone(),
+            provider_profile_id: profile.id.clone(),
             api_key: key,
             prompt: request.prompt,
             test_command: request.test_command,
@@ -1110,6 +1111,7 @@ fn start_codex_workflow_run(
             executable,
             cwd,
             model_id: model.id.clone(),
+            provider_profile_id: provider.id.clone(),
             reasoning_effort: selection.reasoning_effort.clone(),
             prompt: request.prompt,
             skill_id: request.skill_id,
@@ -1195,6 +1197,7 @@ fn start_antigravity_workflow_run(
             executable,
             cwd,
             model_id: model.id.clone(),
+            provider_profile_id: provider.id.clone(),
             prompt: request.prompt,
             timeout_seconds: request.timeout_seconds,
         },
@@ -1292,6 +1295,7 @@ fn start_ollama_workflow_run(
             cwd,
             endpoint,
             model_id: model.id.clone(),
+            provider_profile_id: provider.id.clone(),
             prompt: request.prompt,
             test_command: request.test_command,
             timeout_seconds,
@@ -1657,6 +1661,7 @@ fn evaluate_provider_fallback(
             .models
             .iter()
             .any(|model| model.id == candidate.model_id)
+            || !profile.kind.supports_workflow_run()
             || profile.kind.telemetry_id() != candidate.telemetry_provider_id
             || candidate.provider_id.len() > 80
             || candidate.model_id.len() > 160

@@ -110,10 +110,12 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       if (evaluateFallback && !["failed", "timedOut", "interrupted"].includes(selected.state)) {
         throw new Error("Fallback evaluation is available only for failed, timed-out, or interrupted runs.");
       }
-      const sourceProfile = currentSettings.providers.find((profile) => {
-        const telemetryId = profile.kind === "openRouter" ? "openrouter" : profile.kind;
-        return telemetryId === selected.provider && profile.models.some((model) => model.id === selected.modelId);
-      });
+      if (evaluateFallback && !selected.providerProfileId) {
+        throw new Error("This saved run has no provider profile identity. Start a new run before evaluating fallback.");
+      }
+      const sourceProfile = selected.providerProfileId
+        ? currentSettings.providers.find((profile) => profile.id === selected.providerProfileId)
+        : undefined;
       const targetModelId = currentSettings.providerSelection.modelId;
       if (evaluateFallback && (!sourceProfile || !selected.modelId || sourceProfile.id === targetProviderId || !targetModelId)) {
         throw new Error("Choose a different configured provider and model as the fallback target.");
@@ -125,7 +127,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       setRuns((items) => items.map((run) => run.id === selected.id ? { ...run, handoff: packet } : run));
       if (evaluateFallback && sourceProfile && targetModelId) {
         const latestRuns = await listWorkflowRuns();
-        const candidates = currentSettings.providers.flatMap((profile) => profile.models.map((model) => {
+        const candidates = currentSettings.providers.filter((profile) => profile.kind !== "custom").flatMap((profile) => profile.models.map((model) => {
           const telemetryProviderId = profile.kind === "openRouter" ? "openrouter" : profile.kind;
           const latest = latestRuns.filter((run) => run.state === "completed" && run.provider === telemetryProviderId && run.modelId === model.id && run.latencyMs !== null && run.finishedAtMs !== null)
             .sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0))[0];

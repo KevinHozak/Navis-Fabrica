@@ -12,6 +12,10 @@ import {
   Settings,
   inspectProviders,
   probeAntigravityCli,
+  listUsageSignals,
+  recordManualUsageEstimate,
+  UsageCategory,
+  UsageSignal,
 } from "./settings";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -45,6 +49,14 @@ export function ProvidersPanel() {
   const [runtimeId, setRuntimeId] = useState("");
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState("");
+  const [usageSignals, setUsageSignals] = useState<UsageSignal[]>([]);
+  const [estimateCategory, setEstimateCategory] = useState<UsageCategory>("apiSpend");
+  const [estimateValue, setEstimateValue] = useState("");
+  const [estimateUnit, setEstimateUnit] = useState("USD");
+  const [estimateWindowMinutes, setEstimateWindowMinutes] = useState("");
+  const [estimateResetAt, setEstimateResetAt] = useState("");
+  const [usageMessage, setUsageMessage] = useState("");
+  const [savingEstimate, setSavingEstimate] = useState(false);
   const desktop = isDesktopApp();
 
   const selectedProvider = settings?.providers.find((provider) => provider.id === settings.providerSelection.providerId);
@@ -57,6 +69,10 @@ export function ProvidersPanel() {
       if (!active) return;
       setSettings(value);
       setRuntimeId(value.providerSelection.runtimeId ?? "");
+      if (desktop) {
+        try { setUsageSignals(await listUsageSignals()); }
+        catch (error) { if (active) setUsageMessage(error instanceof Error ? error.message : String(error)); }
+      }
       if (desktop && value.providers.length) {
         try {
           const status = await inspectProviders(value.providers);
@@ -107,6 +123,30 @@ export function ProvidersPanel() {
     } catch (error) {
       setProbes((current) => ({ ...current, [providerId]: { version: null, state: "unavailable", models: [], note: error instanceof Error ? error.message : String(error) } }));
     } finally { setProbingId(null); }
+  }
+
+  async function saveEstimate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const value = Number(estimateValue);
+    const minutes = estimateWindowMinutes.trim() ? Number(estimateWindowMinutes) : null;
+    const resetAtMs = estimateResetAt ? new Date(estimateResetAt).getTime() : null;
+    if (!Number.isFinite(value) || value < 0 || (minutes !== null && (!Number.isFinite(minutes) || minutes <= 0)) || (resetAtMs !== null && !Number.isFinite(resetAtMs))) {
+      setUsageMessage("Enter a valid value, optional positive window, and reset time.");
+      return;
+    }
+    setSavingEstimate(true);
+    setUsageMessage("");
+    try {
+      setUsageSignals(await recordManualUsageEstimate({
+        category: estimateCategory,
+        value,
+        unit: estimateUnit.trim(),
+        windowDurationSeconds: minutes === null ? null : Math.round(minutes * 60),
+        resetAtMs,
+      }));
+      setUsageMessage("Manual estimate saved and labelled as estimated.");
+    } catch (error) { setUsageMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setSavingEstimate(false); }
   }
 
   function addProvider(event: FormEvent<HTMLFormElement>) {
@@ -215,6 +255,33 @@ export function ProvidersPanel() {
           </div>
           <label className="settings-field" htmlFor="model-efforts"><span>{kind === "antigravity" ? "Reasoning effort labels (unsupported by installed CLI)" : "Supported reasoning effort labels"}</span><input id="model-efforts" value={efforts} disabled={kind === "antigravity"} onChange={(event) => setEfforts(event.target.value)} /><small>{kind === "antigravity" ? "The installed agy CLI help does not expose an effort flag." : "Comma-separated manual labels, for example low, medium, high."}</small></label>
           <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Codex and Antigravity headless runs are available from Runs; other provider operations remain unsupported."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
+        </form>
+      </section>
+
+      <section className="panel settings-panel" aria-labelledby="usage-signals-title">
+        <div className="panel-heading"><div><h2 id="usage-signals-title">Usage and latency signals</h2><p>Subscription windows, API spend, context limits, and local resources are tracked separately.</p></div>
+          <button className="button button-secondary" type="button" disabled={!desktop} onClick={() => { void listUsageSignals().then(setUsageSignals).catch((error: unknown) => setUsageMessage(error instanceof Error ? error.message : String(error))); }}>Refresh readings</button>
+        </div>
+        <p className="registry-context-note">Codex subscription windows are read from its app-server when a run starts. Context usage is recorded only when reported. This adapter does not expose API spend or local resource telemetry; missing values stay unknown.</p>
+        <ul className="provider-list usage-signal-list">{usageSignals.map((signal) => <li className="provider-card" key={signal.id}>
+          <div className="provider-card-heading"><div><strong>{signal.label}</strong><span>{signal.category} · {signal.metric}</span></div><span className={signal.status === "available" ? "status-supported" : "status-unsupported"}>{signal.status}{signal.confidence === "estimated" ? " · estimate" : ""}</span></div>
+          <p className="provider-models">{signal.value === null ? "Unknown" : `${signal.value.toLocaleString()} ${signal.unit}`}{signal.windowDurationSeconds ? ` · window ${Math.round(signal.windowDurationSeconds / 60)} min` : ""}{signal.resetAtMs ? ` · resets ${new Date(signal.resetAtMs).toLocaleString()}` : ""}</p>
+          <small>{signal.source} · collected {new Date(signal.collectedAtMs).toLocaleString()}{signal.providerId ? ` · ${signal.providerId}` : ""}{signal.modelId ? ` · ${signal.modelId}` : ""}</small>
+          {signal.note && <small>{signal.note}</small>}
+        </li>)}</ul>
+        <form className="provider-form" onSubmit={(event) => { void saveEstimate(event); }}>
+          <h3>Record a manual estimate</h3>
+          <p className="registry-context-note">Manual entries are labelled estimates and remain separate from provider measurements.</p>
+          <div className="provider-inline-fields">
+            <label className="settings-field"><span>Category</span><select value={estimateCategory} onChange={(event) => setEstimateCategory(event.target.value as UsageCategory)}><option value="subscriptionWindow">Subscription window</option><option value="apiSpend">API spend</option><option value="contextLimit">Context limit</option><option value="localResource">Local resource</option></select></label>
+            <label className="settings-field"><span>Value</span><input type="number" min="0" step="any" required value={estimateValue} onChange={(event) => setEstimateValue(event.target.value)} /></label>
+            <label className="settings-field"><span>Unit</span><input required maxLength={40} value={estimateUnit} onChange={(event) => setEstimateUnit(event.target.value)} placeholder="USD, tokens, % used" /></label>
+          </div>
+          <div className="provider-inline-fields">
+            <label className="settings-field"><span>Window length (minutes, optional)</span><input type="number" min="1" step="1" value={estimateWindowMinutes} onChange={(event) => setEstimateWindowMinutes(event.target.value)} /></label>
+            <label className="settings-field"><span>Reset time (optional)</span><input type="datetime-local" value={estimateResetAt} onChange={(event) => setEstimateResetAt(event.target.value)} /></label>
+          </div>
+          <div className="settings-actions"><p className="settings-feedback" role="status">{usageMessage}</p><button className="button button-primary" type="submit" disabled={!desktop || savingEstimate}>{savingEstimate ? "Saving…" : "Save estimate"}</button></div>
         </form>
       </section>
     </div>

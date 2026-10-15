@@ -26,8 +26,8 @@ Do not interpret compile checks as live desktop UX or provider integration verif
 
 - Host toolchain: Node.js `24.14.0`, npm `11.11.1`, Rust `1.96.0`, Windows MSVC x64.
 - `npm run release:verify`: passed.
-- `npm run release:windows`: passed, including `npm ci` (72 packages), `cargo fmt --check`, all 102 Rust unit tests, the Vite production build, and Tauri `build --bundles nsis --ci -- --locked`.
-- Produced `src-tauri/target/release/navis-fabrica.exe` (15,558,144 bytes) and `src-tauri/target/release/bundle/nsis/Navis-Fabrica_0.19.0_x64-setup.exe` (4,178,548 bytes / 3.98 MiB). Both report FileVersion `0.19.0`, ProductVersion `0.19.0`, and ProductName `Navis-Fabrica`.
+- `npm run release:windows`: passed, including `npm ci` (72 packages), `cargo fmt --check`, 102 Rust unit tests, 6 Rust release contract tests, the Vite production build, and Tauri `build --bundles nsis --ci -- --locked`.
+- Produced `src-tauri/target/release/navis-fabrica.exe` (15,558,144 bytes) and `src-tauri/target/release/bundle/nsis/Navis-Fabrica_0.19.0_x64-setup.exe` (4,175,666 bytes / 3.98 MiB). Both report FileVersion `0.19.0`, ProductVersion `0.19.0`, and ProductName `Navis-Fabrica`.
 - SHA-256 executable: `45FF3C581172FE37A785886C2A1C17C27BEA4B72CE06C7D88C4DAFE429085337`.
 - SHA-256 installer: `42341858301FC3B62F37C147D67E9A6E990BE7AD6D729B529F75047885C9EAEE`.
 - The release executable stayed running for 8 seconds with `APPDATA` and `LOCALAPPDATA` pointed to a disposable temporary profile, then closed successfully. This avoids changing the signed-in user's app data.

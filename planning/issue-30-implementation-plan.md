@@ -21,6 +21,6 @@
 ## Verification results
 
 - `npm run release:verify`: passed for synchronized `0.19.0` manifests, icons, NSIS target, WebView2 mode, and release policy.
-- `npm run release:windows`: passed on Windows with Node.js 24.14.0, npm 11.11.1, and Rust 1.96.0. The run completed locked dependency installation, formatting, 102 Rust tests, the frontend build, the NSIS release bundle, artifact metadata verification, and isolated executable launch.
+- `npm run release:windows`: passed on Windows with Node.js 24.14.0, npm 11.11.1, and Rust 1.96.0. The run completed locked dependency installation, formatting, 102 Rust unit tests, 6 release contract tests, the frontend build, the NSIS release bundle, artifact metadata verification, and isolated executable launch.
 - Both executable and installer metadata report product/version `Navis-Fabrica` / `0.19.0`; their SHA-256 hashes and sizes are recorded in `docs/verification.md`.
 - Clean-machine WebView2 setup and a live install-over-upgrade data preservation test remain pending because this environment has no disposable Windows VM. Do not claim these from source/configuration checks.

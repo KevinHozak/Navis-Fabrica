@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Receiver;
@@ -11,6 +12,7 @@ pub enum ProviderKind {
     Codex,
     Antigravity,
     Ollama,
+    OpenRouter,
     Custom,
 }
 
@@ -20,6 +22,7 @@ impl ProviderKind {
             Self::Codex => "Codex",
             Self::Antigravity => "Antigravity",
             Self::Ollama => "Ollama",
+            Self::OpenRouter => "OpenRouter",
             Self::Custom => "Custom runtime",
         }
     }
@@ -29,9 +32,200 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::Antigravity => "agy",
             Self::Ollama => "aider",
+            Self::OpenRouter => "aider",
             Self::Custom => "",
         }
     }
+}
+
+pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+pub const OPENROUTER_MAX_MODELS: usize = 500;
+pub const OPENROUTER_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRouterModel {
+    pub id: String,
+    pub name: String,
+    pub context_length: Option<u64>,
+    pub prompt_price: Option<String>,
+    pub completion_price: Option<String>,
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
+    pub supported_parameters: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRouterProbe {
+    pub state: String,
+    pub models: Vec<OpenRouterModel>,
+    pub note: String,
+}
+
+pub fn parse_openrouter_models(value: &Value) -> Vec<OpenRouterModel> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item.get("id")?.as_str()?.trim();
+            let name = item.get("name")?.as_str()?.trim();
+            if id.is_empty()
+                || id.len() > 160
+                || name.is_empty()
+                || name.len() > 160
+                || id.chars().any(char::is_control)
+                || name.chars().any(char::is_control)
+            {
+                return None;
+            }
+            let architecture = item.get("architecture");
+            let pricing = item.get("pricing");
+            Some(OpenRouterModel {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                context_length: item.get("context_length").and_then(Value::as_u64),
+                prompt_price: pricing
+                    .and_then(|v| v.get("prompt"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                completion_price: pricing
+                    .and_then(|v| v.get("completion"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                input_modalities: architecture
+                    .and_then(|v| v.get("input_modalities"))
+                    .and_then(string_array),
+                output_modalities: architecture
+                    .and_then(|v| v.get("output_modalities"))
+                    .and_then(string_array),
+                supported_parameters: item.get("supported_parameters").and_then(string_array),
+            })
+        })
+        .take(OPENROUTER_MAX_MODELS)
+        .collect()
+}
+
+fn string_array(value: &Value) -> Option<Vec<String>> {
+    Some(
+        value
+            .as_array()?
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?,
+    )
+}
+
+pub fn openrouter_probe_with<F>(api_key: &str, request: F) -> OpenRouterProbe
+where
+    F: FnOnce(&str) -> Result<Value, u16>,
+{
+    if !valid_openrouter_key(api_key) {
+        return OpenRouterProbe {
+            state: "authenticationRequired".into(),
+            models: Vec::new(),
+            note: "Save a valid OpenRouter API key in Windows Credential Manager first.".into(),
+        };
+    }
+    match request(api_key) {
+        Ok(value) => {
+            let models = parse_openrouter_models(&value);
+            if models.is_empty() { return OpenRouterProbe { state: "unavailable".into(), models, note: "OpenRouter returned no valid model catalog entries.".into() }; }
+            OpenRouterProbe { state: "ready".into(), note: format!("OpenRouter returned {} models. Missing metadata remains unknown.", models.len()), models }
+        }
+        Err(401 | 403) => OpenRouterProbe { state: "authenticationRequired".into(), models: Vec::new(), note: "OpenRouter rejected the saved API key. Check its validity and access.".into() },
+        Err(429) => OpenRouterProbe { state: "rateLimited".into(), models: Vec::new(), note: "OpenRouter rate limited model discovery. Try again later.".into() },
+        Err(_) => OpenRouterProbe { state: "unavailable".into(), models: Vec::new(), note: "OpenRouter model discovery failed. The response was omitted to protect credentials.".into() },
+    }
+}
+
+pub fn valid_openrouter_key(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
+}
+
+pub fn openrouter_credential_target(provider_id: &str) -> Result<String, String> {
+    if provider_id.is_empty()
+        || provider_id.len() > 80
+        || !provider_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+    {
+        return Err("The OpenRouter provider ID is invalid.".into());
+    }
+    Ok(format!("navis-fabrica-openrouter-{provider_id}"))
+}
+
+pub fn openrouter_credential_reference_matches(provider_id: &str, reference: &str) -> bool {
+    openrouter_credential_target(provider_id)
+        .map(|target| reference == format!("credential-store:{target}"))
+        .unwrap_or(false)
+}
+
+pub fn aider_openrouter_arguments(
+    model_id: &str,
+    prompt_file: &str,
+    test_command: Option<&str>,
+    empty_env_file: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "--model".into(),
+        format!("openrouter/{model_id}"),
+        "--message".into(),
+        prompt_file.into(),
+        "--yes".into(),
+        "--no-auto-commits".into(),
+        "--no-gitignore".into(),
+        "--no-add-gitignore-files".into(),
+        "--no-analytics".into(),
+        "--no-check-update".into(),
+        "--no-restore-chat-history".into(),
+        "--no-suggest-shell-commands".into(),
+        "--no-stream".into(),
+        "--no-pretty".into(),
+        "--env-file".into(),
+        empty_env_file.into(),
+    ];
+    if let Some(command) = test_command.filter(|value| !value.trim().is_empty()) {
+        args.extend(["--test-cmd".into(), command.into(), "--auto-test".into()]);
+    }
+    args
+}
+
+pub fn openrouter_http_probe(api_key: &str) -> OpenRouterProbe {
+    openrouter_probe_with(api_key, |key| {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| 0u16)?;
+        let response = client
+            .get(format!("{OPENROUTER_API_BASE}/models").as_str())
+            .bearer_auth(key)
+            .send()
+            .map_err(|_| 0u16)?;
+        if !response.status().is_success() {
+            return Err(response.status().as_u16());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > OPENROUTER_MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(0);
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(OPENROUTER_MAX_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| 0u16)?;
+        if bytes.len() > OPENROUTER_MAX_RESPONSE_BYTES {
+            return Err(0);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| 0u16)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +1017,15 @@ pub fn inspect(
             checkpoints: true,
             ..AdapterCapabilities::local_preflight()
         },
+        ProviderKind::OpenRouter => AdapterCapabilities {
+            health: true,
+            model_listing: true,
+            run_start: true,
+            run_cancel: true,
+            event_stream: true,
+            checkpoints: true,
+            ..AdapterCapabilities::local_preflight()
+        },
         _ => AdapterCapabilities::local_preflight(),
     };
     ProviderAvailability {
@@ -845,6 +1048,8 @@ pub fn inspect(
             "Antigravity uses the installed agy --print CLI with process output and cancellation. This version does not expose structured progress or reasoning-effort flags; model listing requires sign-in. Headless approvals, interactive input, and resumable checkpoints are unavailable.".into()
         } else if profile.kind == ProviderKind::Ollama {
             "Ollama discovery is restricted to a numeric loopback endpoint. Aider provides model-driven edits and configured test execution; model tool-call support and context are checked before runs. Portable handoff is explicit and does not resume completed side effects.".into()
+        } else if profile.kind == ProviderKind::OpenRouter {
+            "OpenRouter provides a model catalog and API access. Aider is the separately configured coding harness; shell and file-edit behavior comes from that harness. Authentication is stored in Windows Credential Manager.".into()
         } else {
             "Executable presence is checked without launching it. Authentication validity and provider operations are not implemented by this adapter.".into()
         },
@@ -910,15 +1115,22 @@ pub fn validate_profiles(
         }) {
             return Err("Use an opaque reference such as credential-store:provider-name; secret values are not accepted.".into());
         }
-        if profile.models.len() > 200 {
-            return Err("Configure 200 or fewer manual model profiles per provider.".into());
+        let (model_limit, model_name_limit) = if profile.kind == ProviderKind::OpenRouter {
+            (OPENROUTER_MAX_MODELS, 160)
+        } else {
+            (200, 100)
+        };
+        if profile.models.len() > model_limit {
+            return Err(format!(
+                "Configure {model_limit} or fewer model profiles per provider."
+            ));
         }
         let mut model_ids = Vec::new();
         for model in &profile.models {
             if model.id.trim().is_empty()
                 || model.id.len() > 160
                 || model.name.trim().is_empty()
-                || model.name.len() > 100
+                || model.name.len() > model_name_limit
                 || model.id.chars().any(char::is_control)
                 || model.name.chars().any(char::is_control)
             {
@@ -1293,5 +1505,98 @@ mod tests {
         assert_eq!(event.terminal_state.as_deref(), Some("failed"));
         assert_eq!(event.text, "Codex authentication is required or expired.");
         assert!(normalize_codex_stderr("temporary filesystem warning").is_none());
+    }
+
+    #[test]
+    fn openrouter_catalog_preserves_reported_metadata_and_unknowns() {
+        let value = json!({"data": [
+            {"id":"vendor/model-a", "name":"Model A", "context_length":32768,
+             "pricing":{"prompt":"0.000001", "completion":"0.000002"},
+             "architecture":{"input_modalities":["text"], "output_modalities":["text"]},
+             "supported_parameters":["tools"]},
+            {"id":"vendor/model-b", "name":"Model B", "pricing":{}, "architecture":{}},
+            {"id":"bad", "name":""}
+        ]});
+        let models = parse_openrouter_models(&value);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].context_length, Some(32768));
+        assert_eq!(models[0].prompt_price.as_deref(), Some("0.000001"));
+        assert_eq!(
+            models[0].supported_parameters.as_deref(),
+            Some(["tools".to_string()].as_slice())
+        );
+        assert_eq!(models[1].context_length, None);
+        assert_eq!(models[1].prompt_price, None);
+        assert_eq!(models[1].input_modalities, None);
+    }
+
+    #[test]
+    fn openrouter_probe_maps_auth_rate_limit_and_malformed_catalog_without_leaking() {
+        let rejected = openrouter_probe_with("sk-or-valid", |_| Err(401));
+        assert_eq!(rejected.state, "authenticationRequired");
+        let limited = openrouter_probe_with("sk-or-valid", |_| Err(429));
+        assert_eq!(limited.state, "rateLimited");
+        let malformed =
+            openrouter_probe_with("sk-or-valid", |_| Ok(json!({"error":"sk-or-secret"})));
+        assert_eq!(malformed.state, "unavailable");
+        assert!(!malformed.note.contains("sk-or-secret"));
+        assert_eq!(
+            openrouter_probe_with("", |_| panic!("must not request")).state,
+            "authenticationRequired"
+        );
+    }
+
+    #[test]
+    fn openrouter_credentials_are_validated_and_aider_receives_no_key_in_arguments() {
+        assert_eq!(
+            openrouter_credential_target("openRouter-a1b2").unwrap(),
+            "navis-fabrica-openrouter-openRouter-a1b2"
+        );
+        assert!(openrouter_credential_target("../key").is_err());
+        assert!(openrouter_credential_reference_matches(
+            "openRouter-a1b2",
+            "credential-store:navis-fabrica-openrouter-openRouter-a1b2"
+        ));
+        assert!(!openrouter_credential_reference_matches(
+            "openRouter-a1b2",
+            "credential-store:github-session"
+        ));
+        assert!(!openrouter_credential_reference_matches(
+            "openRouter-a1b2",
+            "provider-managed:navis-fabrica-openrouter-openRouter-a1b2"
+        ));
+        assert!(valid_openrouter_key("sk-or-v1-value"));
+        assert!(!valid_openrouter_key("bad\nkey"));
+        let args =
+            aider_openrouter_arguments("vendor/model", "change files", Some("npm test"), "NUL");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "openrouter/vendor/model"]));
+        assert!(args.windows(2).any(|pair| pair == ["--env-file", "NUL"]));
+        assert!(!args.iter().any(|arg| arg.contains("sk-or-")));
+    }
+
+    #[test]
+    fn openrouter_catalog_limit_matches_settings_validation() {
+        let models: Vec<ModelProfile> = (0..OPENROUTER_MAX_MODELS)
+            .map(|index| ModelProfile {
+                id: format!("model-{index}"),
+                name: format!("Model {index}"),
+                reasoning_efforts: Vec::new(),
+            })
+            .collect();
+        let mut provider = profile();
+        provider.id = "openRouter-a1b2".into();
+        provider.kind = ProviderKind::OpenRouter;
+        provider.secret_ref =
+            Some("credential-store:navis-fabrica-openrouter-openRouter-a1b2".into());
+        provider.models = models;
+        assert!(validate_profiles(&[provider.clone()], &ProviderSelection::default()).is_ok());
+        provider.models.push(ModelProfile {
+            id: "model-over-limit".into(),
+            name: "Model over limit".into(),
+            reasoning_efforts: Vec::new(),
+        });
+        assert!(validate_profiles(&[provider], &ProviderSelection::default()).is_err());
     }
 }

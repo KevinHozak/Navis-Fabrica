@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-probe-openrouter"
+description = "Enables the probe_openrouter command without any pre-configured scope."
+commands.allow = ["probe_openrouter"]
+
+[[permission]]
+identifier = "deny-probe-openrouter"
+description = "Denies the probe_openrouter command without any pre-configured scope."
+commands.deny = ["probe_openrouter"]

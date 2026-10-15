@@ -21,7 +21,7 @@ export type GitHubAccount = { id: string; login: string; credentialRef: string |
 
 export type SettingsInput = Omit<Settings, "schemaVersion">;
 
-export type ProviderKind = "codex" | "antigravity" | "ollama" | "custom";
+export type ProviderKind = "codex" | "antigravity" | "ollama" | "openRouter" | "custom";
 export type ModelProfile = { id: string; name: string; reasoningEfforts: string[] };
 export type ProviderProfile = {
   id: string;
@@ -78,6 +78,8 @@ export type ProviderAvailability = {
 export type AntigravityProbe = { version: string | null; state: "ready" | "authenticationRequired" | "unavailable"; models: string[]; note: string };
 export type OllamaModel = { id: string; sizeBytes: number; contextTokens: number | null; toolsSupported: boolean; eligible: boolean; note: string };
 export type OllamaProbe = { state: "ready" | "unavailable"; endpoint: string; models: OllamaModel[]; availableMemoryBytes: number | null; note: string };
+export type OpenRouterModel = { id: string; name: string; contextLength: number | null; promptPrice: string | null; completionPrice: string | null; inputModalities: string[] | null; outputModalities: string[] | null; supportedParameters: string[] | null };
+export type OpenRouterProbe = { state: "ready" | "authenticationRequired" | "rateLimited" | "unavailable"; models: OpenRouterModel[]; note: string };
 
 export type ProjectEntry = {
   id: string;
@@ -239,6 +241,10 @@ export const probeAntigravityCli = (providerId: string) =>
   invoke<AntigravityProbe>("probe_antigravity_cli", { providerId });
 export const probeOllama = (providerId: string) =>
   invoke<OllamaProbe>("probe_ollama", { providerId });
+export const saveOpenRouterCredential = (providerId: string, apiKey: string) =>
+  invoke<Settings>("save_openrouter_credential", { providerId, apiKey });
+export const probeOpenRouter = (providerId: string) =>
+  invoke<OpenRouterProbe>("probe_openrouter", { providerId });
 export const listUsageSignals = () => invoke<UsageSignal[]>("list_usage_signals");
 export const recordManualUsageEstimate = (estimate: {
   category: UsageCategory;
@@ -272,6 +278,9 @@ export const createProviderHandoff = (input: HandoffInput) =>
 export type OllamaStartRequest = { cwd: string; prompt: string; testCommand: string | null; handoffSourceRunId?: string | null };
 export const startOllamaWorkflowRun = (request: OllamaStartRequest) =>
   invoke<WorkflowRun>("start_ollama_workflow_run", { request });
+export type OpenRouterStartRequest = { cwd: string; prompt: string; testCommand: string | null; timeoutSeconds: number; handoffSourceRunId?: string | null };
+export const startOpenRouterWorkflowRun = (request: OpenRouterStartRequest) =>
+  invoke<WorkflowRun>("start_openrouter_workflow_run", { request });
 export const respondCodexApproval = (runId: string, requestId: string, decision: string) =>
   invoke<boolean>("respond_codex_approval", { runId, requestId, decision });
 export const respondCodexUserInput = (runId: string, requestId: string, answers: Record<string, string[]>) =>

@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
 
 mod github;
+mod process;
 pub mod providers;
 mod routing;
 mod runs;

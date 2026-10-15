@@ -116,7 +116,7 @@ struct ArtifactVersionInfo {
 fn read_embedded_artifact_version(path: &Path) -> Option<ArtifactVersionInfo> {
     #[cfg(windows)]
     {
-        let output = Command::new("powershell.exe")
+        let output = crate::process::command("powershell.exe")
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -414,7 +414,7 @@ fn process_is_running(process_id: u32) -> bool {
     #[cfg(windows)]
     {
         let query = format!("(Get-Process -Id {process_id} -ErrorAction SilentlyContinue).Id");
-        let output = Command::new("powershell.exe")
+        let output = crate::process::command("powershell.exe")
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
             .arg(query)
             .output();
@@ -428,7 +428,7 @@ fn process_is_running(process_id: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        Command::new("kill")
+        crate::process::command("kill")
             .args(["-0", &process_id.to_string()])
             .status()
             .is_ok_and(|status| status.success())
@@ -541,7 +541,7 @@ struct GitWorktreeSnapshot {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    crate::process::command("git")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -623,7 +623,7 @@ fn git_worktree_snapshot(cwd: &Path) -> Result<Option<GitWorktreeSnapshot>, Stri
         snapshot.extend_from_slice(&blob.stdout);
     }
 
-    let mut hash = Command::new("git")
+    let mut hash = crate::process::command("git")
         .arg("-C")
         .arg(root)
         .args(["hash-object", "--stdin"])
@@ -711,7 +711,7 @@ fn ensure_git_scope(cwd: &Path, allowed_dirty_paths: &[String]) -> Result<(), St
     let Some(repo_root) = cwd.ancestors().find(|folder| folder.join(".git").exists()) else {
         return Ok(());
     };
-    let status = Command::new("git")
+    let status = crate::process::command("git")
         .arg("-C")
         .arg(repo_root)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
@@ -870,7 +870,7 @@ fn verify_workflow_repository(cwd: &Path, workflow: &WorkflowRunMetadata) -> Res
         .ancestors()
         .find(|folder| folder.join(".git").exists())
         .ok_or("Agent-backed repository workflows require a Git checkout.")?;
-    let branch = Command::new("git")
+    let branch = crate::process::command("git")
         .arg("-C")
         .arg(root)
         .args(["branch", "--show-current"])
@@ -881,7 +881,7 @@ fn verify_workflow_repository(cwd: &Path, workflow: &WorkflowRunMetadata) -> Res
             "A named Git branch is required; detached HEAD workflows are unsupported.".into(),
         );
     }
-    let remotes = Command::new("git")
+    let remotes = crate::process::command("git")
         .arg("-C")
         .arg(root)
         .args(["remote", "-v"])
@@ -924,7 +924,7 @@ fn command_for(
 ) -> Result<Command, String> {
     let mut command = match host {
         "powershell" => {
-            let mut command = Command::new("powershell.exe");
+            let mut command = crate::process::command("powershell.exe");
             command.args([
                 "-NoLogo",
                 "-NoProfile",
@@ -938,7 +938,7 @@ fn command_for(
             command
         }
         "cmd" => {
-            let mut command = Command::new("cmd.exe");
+            let mut command = crate::process::command("cmd.exe");
             command.args(["/d", "/v:off", "/s", "/c"]);
             let mut line = format!("\"\"{}\"", executable.display());
             for arg in args {
@@ -956,7 +956,7 @@ fn command_for(
             command
         }
         _ => {
-            let mut command = Command::new(executable);
+            let mut command = crate::process::command(executable);
             command.args(args);
             command
         }
@@ -3160,7 +3160,7 @@ fn terminate_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         let id = child.id().to_string();
-        let _ = Command::new("taskkill.exe")
+        let _ = crate::process::command("taskkill.exe")
             .args(["/pid", id.as_str(), "/t", "/f"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

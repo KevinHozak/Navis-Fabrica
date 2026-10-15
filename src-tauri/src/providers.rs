@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -597,7 +596,7 @@ pub fn probe_antigravity(executable: &Path) -> AntigravityProbe {
             }
         }
     };
-    let version = Command::new(executable)
+    let version = crate::process::command(executable)
         .current_dir(temp.path())
         .arg("--version")
         .output()
@@ -617,7 +616,7 @@ pub fn probe_antigravity(executable: &Path) -> AntigravityProbe {
             note: "The Antigravity CLI version probe could not complete.".into(),
         };
     }
-    let models = Command::new(executable)
+    let models = crate::process::command(executable)
         .current_dir(temp.path())
         .arg("models")
         .output();

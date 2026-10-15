@@ -836,7 +836,7 @@ fn git_output(
     args: &[&str],
     cancelled: &AtomicBool,
 ) -> Result<Option<String>, String> {
-    let mut command = Command::new("git");
+    let mut command = crate::process::command("git");
     command
         .arg("-C")
         .arg(path)

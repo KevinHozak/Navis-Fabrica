@@ -52,6 +52,8 @@ pub struct RunRecord {
     pub executable: String,
     #[serde(default)]
     pub provider: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub cwd: String,
     #[serde(default)]
     pub thread_id: Option<String>,
@@ -59,6 +61,8 @@ pub struct RunRecord {
     pub state: String,
     pub started_at_ms: u128,
     pub finished_at_ms: Option<u128>,
+    #[serde(default)]
+    pub latency_ms: Option<u128>,
     pub exit_code: Option<i32>,
     pub next_sequence: u64,
     pub events: Vec<RunEvent>,
@@ -855,7 +859,7 @@ fn verify_run_side_effects(app: &AppHandle, path: &Path, run_id: &str) {
     }
 }
 
-fn history_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn history_path(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .app_data_dir()
@@ -932,6 +936,7 @@ fn load_records(path: &Path) -> Result<Vec<RunRecord>, String> {
         ) {
             record.state = "interrupted".into();
             record.finished_at_ms = Some(now_ms());
+            record.latency_ms = None;
             recovered = true;
         }
     }
@@ -1088,11 +1093,16 @@ fn set_state(app: &AppHandle, path: &Path, id: &str, state: &str, exit_code: Opt
     if let Some(record) = store.records.iter_mut().find(|record| record.id == id) {
         record.state = state.into();
         record.exit_code = exit_code;
-        if matches!(
-            state,
-            "completed" | "failed" | "cancelled" | "timedOut" | "interrupted"
-        ) {
+        if record.finished_at_ms.is_none()
+            && matches!(
+                state,
+                "completed" | "failed" | "cancelled" | "timedOut" | "interrupted"
+            )
+        {
             record.finished_at_ms = Some(now_ms());
+            record.latency_ms = record
+                .finished_at_ms
+                .map(|finished| crate::usage::latency_ms(record.started_at_ms, finished));
         }
         let snapshot = record.clone();
         let _ = persist_records(path, &store.records);
@@ -1278,6 +1288,52 @@ fn drive_codex_protocol(
         );
         return;
     }
+    let provider_model = store()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .records
+                .iter()
+                .find(|record| record.id == run_id)
+                .map(|record| {
+                    (
+                        record.provider.clone().unwrap_or_else(|| "codex".into()),
+                        record
+                            .model_id
+                            .clone()
+                            .unwrap_or_else(|| config.model_id.clone()),
+                    )
+                })
+        })
+        .unwrap_or_else(|| ("codex".into(), config.model_id.clone()));
+    let rate_limits_read =
+        serde_json::json!({ "id": 4, "method": "account/rateLimits/read", "params": {} });
+    let rate_limit_signals = if send_codex_message(&writer, &rate_limits_read).is_ok() {
+        match wait_for_codex_response(&app, &path, &run_id, &receiver, &child, 4) {
+            Some(Ok(result)) => crate::usage::signals_from_codex_rate_limits(
+                &serde_json::json!({ "result": result }),
+                &provider_model.0,
+                &provider_model.1,
+                now_ms(),
+            ),
+            Some(Err(error)) => crate::usage::signals_from_codex_rate_limits(
+                &serde_json::json!({ "error": error }),
+                &provider_model.0,
+                &provider_model.1,
+                now_ms(),
+            ),
+            None => return,
+        }
+    } else {
+        crate::usage::signals_from_codex_rate_limits(
+            &serde_json::json!({ "error": { "message": "app-server request unavailable" } }),
+            &provider_model.0,
+            &provider_model.1,
+            now_ms(),
+        )
+    };
+    let _ = crate::usage::record_signals(&path, &rate_limit_signals);
     let cwd = config.cwd.to_string_lossy().into_owned();
     let thread_start = crate::providers::app_server_thread_start(2, &cwd, &config.model_id);
     if send_codex_message(&writer, &thread_start).is_err() {
@@ -1502,6 +1558,26 @@ fn handle_codex_message(
     if message.get("method").is_none() {
         return;
     }
+    if message.get("method").and_then(serde_json::Value::as_str)
+        == Some("thread/tokenUsage/updated")
+    {
+        let metadata = store().lock().ok().and_then(|state| {
+            state
+                .records
+                .iter()
+                .find(|record| record.id == run_id)
+                .and_then(|record| Some((record.provider.clone()?, record.model_id.clone()?)))
+        });
+        if let Some((provider_id, model_id)) = metadata {
+            let signals = crate::usage::signals_from_codex_token_usage(
+                message,
+                &provider_id,
+                &model_id,
+                now_ms(),
+            );
+            let _ = crate::usage::record_signals(path, &signals);
+        }
+    }
     if let Some(method) = message.get("method").and_then(serde_json::Value::as_str) {
         if matches!(
             method,
@@ -1664,7 +1740,7 @@ pub fn list_workflow_runs(app: AppHandle) -> Result<Vec<RunRecord>, String> {
 
 #[tauri::command]
 pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRecord, String> {
-    start_run(app, request, None, None)
+    start_run(app, request, None, None, None)
 }
 
 pub fn start_codex_workflow_run(
@@ -1723,7 +1799,8 @@ pub fn start_codex_workflow_run(
         timeout_seconds,
         mutating: true,
     };
-    start_run(app, request, Some(config), Some("codex"))
+    let model_id = config.model_id.clone();
+    start_run(app, request, Some(config), Some("codex"), Some(model_id))
 }
 
 pub fn start_antigravity_workflow_run(
@@ -1761,7 +1838,8 @@ pub fn start_antigravity_workflow_run(
         timeout_seconds: config.timeout_seconds,
         mutating: true,
     };
-    start_run(app, request, None, Some("antigravity"))
+    let model_id = config.model_id.clone();
+    start_run(app, request, None, Some("antigravity"), Some(model_id))
 }
 
 fn start_run(
@@ -1769,6 +1847,7 @@ fn start_run(
     request: StartRequest,
     codex: Option<CodexRunConfig>,
     provider: Option<&'static str>,
+    model_id: Option<String>,
 ) -> Result<RunRecord, String> {
     let codex_run = codex.is_some();
     let (executable, cwd, host) = validate_request(&request)?;
@@ -1808,12 +1887,14 @@ fn start_run(
         id: id.clone(),
         executable: executable.to_string_lossy().into_owned(),
         provider: provider.map(str::to_owned),
+        model_id: model_id.map(|value| crate::usage::safe_identity(&value)),
         cwd: cwd.to_string_lossy().into_owned(),
         thread_id: None,
         mutating: request.mutating,
         state: "queued".into(),
         started_at_ms: now_ms(),
         finished_at_ms: None,
+        latency_ms: None,
         exit_code: None,
         next_sequence: 1,
         events: Vec::new(),
@@ -2331,12 +2412,14 @@ mod tests {
             id: "fixture".into(),
             executable: "test".into(),
             provider: None,
+            model_id: None,
             cwd: directory.path().display().to_string(),
             thread_id: None,
             mutating: true,
             state: "running".into(),
             started_at_ms: 1,
             finished_at_ms: None,
+            latency_ms: None,
             exit_code: None,
             next_sequence: 1,
             events: vec![],

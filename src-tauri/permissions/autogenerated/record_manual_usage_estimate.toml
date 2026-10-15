@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-record-manual-usage-estimate"
+description = "Enables the record_manual_usage_estimate command without any pre-configured scope."
+commands.allow = ["record_manual_usage_estimate"]
+
+[[permission]]
+identifier = "deny-record-manual-usage-estimate"
+description = "Denies the record_manual_usage_estimate command without any pre-configured scope."
+commands.deny = ["record_manual_usage_estimate"]

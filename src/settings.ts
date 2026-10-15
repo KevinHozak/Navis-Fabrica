@@ -37,6 +37,24 @@ export type ProviderSelection = {
   reasoningEffort: string | null;
   runtimeId: string | null;
 };
+export type UsageCategory = "subscriptionWindow" | "apiSpend" | "contextLimit" | "localResource";
+export type UsageSignal = {
+  id: string;
+  providerId: string | null;
+  modelId: string | null;
+  category: UsageCategory;
+  metric: string;
+  label: string;
+  value: number | null;
+  unit: string;
+  windowDurationSeconds: number | null;
+  resetAtMs: number | null;
+  collectedAtMs: number;
+  source: string;
+  confidence: string;
+  status: "available" | "estimated" | "unknown" | "stale" | "unavailable" | "rateLimited";
+  note: string | null;
+};
 export type ProviderAvailability = {
   providerId: string;
   executableFound: boolean;
@@ -100,7 +118,7 @@ export type GitHubIssue = GitHubIssueSummary & {
 export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
 export type WorkflowRun = {
   id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; mutating: boolean; state: string;
-  startedAtMs: number; finishedAtMs: number | null; exitCode: number | null;
+  modelId: string | null; startedAtMs: number; finishedAtMs: number | null; latencyMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
   workflow: WorkflowRunMetadata | null;
 };
@@ -211,6 +229,14 @@ export const inspectProviders = (profiles: ProviderProfile[]) =>
   invoke<ProviderAvailability[]>("inspect_providers", { profiles });
 export const probeAntigravityCli = (providerId: string) =>
   invoke<AntigravityProbe>("probe_antigravity_cli", { providerId });
+export const listUsageSignals = () => invoke<UsageSignal[]>("list_usage_signals");
+export const recordManualUsageEstimate = (estimate: {
+  category: UsageCategory;
+  value: number;
+  unit: string;
+  windowDurationSeconds: number | null;
+  resetAtMs: number | null;
+}) => invoke<UsageSignal[]>("record_manual_usage_estimate", { estimate });
 
 export const getCachedGitHubActivity = (owner: string, repository: string) =>
   invoke<GitHubActivity>("get_cached_github_activity", { owner, repository });

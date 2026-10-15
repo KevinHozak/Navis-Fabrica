@@ -12,7 +12,9 @@ pub const MAX_ROUTES: usize = 32;
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Kept at 75%; any future adjustment is gated on the planned calibration process.
 pub const MIN_CONFIDENCE: f64 = 0.75;
+pub const INPUT_PRICE_USD_PER_MILLION_TOKENS: f64 = 0.042;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +65,21 @@ pub struct JevChoice {
     /// Probability for each submitted route. `confidence` is the selected route's probability.
     pub probabilities: BTreeMap<String, f64>,
     pub confidence: f64,
+    pub usage: Option<JevUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+impl JevUsage {
+    pub fn estimated_cost_usd(self) -> Option<f64> {
+        self.input_tokens
+            .map(|tokens| tokens as f64 * INPUT_PRICE_USD_PER_MILLION_TOKENS / 1_000_000.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +89,10 @@ pub struct RoutingEvaluation {
     pub source: String,
     pub confidence: Option<f64>,
     pub explanation: String,
+    pub deterministic_provider_id: Option<String>,
+    pub deterministic_model_id: Option<String>,
+    pub usage: Option<JevUsage>,
+    pub estimated_cost_usd: Option<f64>,
 }
 
 /// Applies a Jev suggestion only after the caller has produced a deterministic
@@ -87,12 +108,18 @@ pub fn select_with_jev<F>(
 where
     F: FnOnce() -> Result<JevChoice, TriageError>,
 {
+    let deterministic_provider_id = fallback.selected_provider_id.clone();
+    let deterministic_model_id = fallback.selected_model_id.clone();
     if fallback.selected_provider_id.is_none() || fallback.selected_model_id.is_none() {
         return RoutingEvaluation {
             routing: fallback,
             source: "deterministic".into(),
             confidence: None,
             explanation: "No eligible route is available; Jev was not called.".into(),
+            deterministic_provider_id,
+            deterministic_model_id,
+            usage: None,
+            estimated_cost_usd: None,
         };
     }
     if manual_override {
@@ -101,6 +128,10 @@ where
             source: "manual".into(),
             confidence: None,
             explanation: "The eligible manual route override takes precedence.".into(),
+            deterministic_provider_id,
+            deterministic_model_id,
+            usage: None,
+            estimated_cost_usd: None,
         };
     }
     if !jev_enabled {
@@ -109,6 +140,10 @@ where
             source: "deterministic".into(),
             confidence: None,
             explanation: "Jev is disabled; the deterministic router selected this route.".into(),
+            deterministic_provider_id,
+            deterministic_model_id,
+            usage: None,
+            estimated_cost_usd: None,
         };
     }
     if route_ids.len() < 2 {
@@ -117,6 +152,10 @@ where
             source: "deterministic".into(),
             confidence: None,
             explanation: "Fewer than two healthy eligible routes are available for Jev.".into(),
+            deterministic_provider_id,
+            deterministic_model_id,
+            usage: None,
+            estimated_cost_usd: None,
         };
     }
     let choice = match call_jev() {
@@ -127,6 +166,10 @@ where
                 source: "deterministic".into(),
                 confidence: Some(choice.confidence),
                 explanation: format!("Jev confidence {:.0}% is below the 75% threshold; the deterministic route was kept.", choice.confidence * 100.0),
+                deterministic_provider_id,
+                deterministic_model_id,
+                usage: choice.usage,
+                estimated_cost_usd: choice.usage.and_then(JevUsage::estimated_cost_usd),
             };
         }
         Err(error) => {
@@ -135,6 +178,10 @@ where
                 source: "deterministic".into(),
                 confidence: None,
                 explanation: error.sanitized_message().into(),
+                deterministic_provider_id,
+                deterministic_model_id,
+                usage: None,
+                estimated_cost_usd: None,
             };
         }
     };
@@ -148,6 +195,10 @@ where
             source: "deterministic".into(),
             confidence: Some(choice.confidence),
             explanation: "Jev selected a route outside the healthy eligible set; the deterministic route was kept.".into(),
+            deterministic_provider_id,
+            deterministic_model_id,
+            usage: choice.usage,
+            estimated_cost_usd: choice.usage.and_then(JevUsage::estimated_cost_usd),
         };
     };
     let provider_id = selected.provider_id.clone();
@@ -174,6 +225,10 @@ where
         confidence: Some(choice.confidence),
         explanation:
             "Jev selected the route with at least 75% confidence after eligibility checks.".into(),
+        deterministic_provider_id,
+        deterministic_model_id,
+        usage: choice.usage,
+        estimated_cost_usd: choice.usage.and_then(JevUsage::estimated_cost_usd),
     }
 }
 
@@ -325,8 +380,10 @@ struct ChoiceAnswer {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Usage {
-    input_tokens: u64,
-    output_tokens: u64,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 pub fn parse_response(body: &[u8], input: &TaskTriageInput) -> Result<JevChoice, TriageError> {
@@ -339,9 +396,10 @@ pub fn parse_response(body: &[u8], input: &TaskTriageInput) -> Result<JevChoice,
     if response.model != JEV_MODEL {
         return Err(TriageError::InvalidResponse);
     }
-    let _usage = response
-        .usage
-        .map(|usage| (usage.input_tokens, usage.output_tokens));
+    let usage = response.usage.map(|usage| JevUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    });
     let answer = response.answers.route;
     if answer.answer_type != "choice" {
         return Err(TriageError::InvalidResponse);
@@ -400,6 +458,7 @@ pub fn parse_response(body: &[u8], input: &TaskTriageInput) -> Result<JevChoice,
         route_id: answer.choice,
         probabilities: answer.probabilities,
         confidence,
+        usage,
     })
 }
 
@@ -493,6 +552,10 @@ mod tests {
             route_id: route_id.into(),
             probabilities: BTreeMap::new(),
             confidence,
+            usage: Some(JevUsage {
+                input_tokens: Some(30),
+                output_tokens: Some(5),
+            }),
         }
     }
 
@@ -718,6 +781,8 @@ mod tests {
         .unwrap();
         assert_eq!(choice.route_id, "codex:gpt-6.1-sol");
         assert_eq!(choice.confidence, 0.9);
+        assert_eq!(choice.usage.unwrap().input_tokens, Some(30));
+        assert!((choice.usage.unwrap().estimated_cost_usd().unwrap() - 0.00000126).abs() < 1e-12);
 
         let tied_choice = parse_response(
             &response(
@@ -729,6 +794,70 @@ mod tests {
         .unwrap();
         assert_eq!(tied_choice.route_id, "ollama:qwen");
         assert_eq!(tied_choice.confidence, 0.5);
+    }
+
+    #[test]
+    fn missing_or_partial_usage_stays_unknown_and_cost_uses_input_only() {
+        let input = input();
+        let without_usage = serde_json::to_vec(&json!({
+            "model": JEV_MODEL,
+            "answers": { "route": {
+                "type": "choice", "choice": "codex:gpt-6.1-sol",
+                "probabilities": {"codex:gpt-6.1-sol": 0.9, "ollama:qwen": 0.1}
+            }}
+        }))
+        .unwrap();
+        let parsed = parse_response(&without_usage, &input).unwrap();
+        assert_eq!(parsed.usage, None);
+
+        let partial = serde_json::to_vec(&json!({
+            "model": JEV_MODEL,
+            "answers": { "route": {
+                "type": "choice", "choice": "codex:gpt-6.1-sol",
+                "probabilities": {"codex:gpt-6.1-sol": 0.9, "ollama:qwen": 0.1}
+            }},
+            "usage": {"input_tokens": 1_000_000}
+        }))
+        .unwrap();
+        let parsed = parse_response(&partial, &input).unwrap();
+        assert_eq!(parsed.usage.unwrap().output_tokens, None);
+        assert_eq!(parsed.usage.unwrap().estimated_cost_usd(), Some(0.042));
+    }
+
+    #[test]
+    fn routing_fixture_summary_compares_jev_and_deterministic_fallbacks() {
+        let cases = [
+            select_with_jev(
+                routing_decision(Some(("codex", "model-a"))),
+                true,
+                false,
+                &["codex:model-a".into(), "ollama:model-b".into()],
+                || Ok(choice("ollama:model-b", 0.9)),
+            ),
+            select_with_jev(
+                routing_decision(Some(("codex", "model-a"))),
+                true,
+                false,
+                &["codex:model-a".into(), "ollama:model-b".into()],
+                || Ok(choice("ollama:model-b", 0.74)),
+            ),
+            select_with_jev(
+                routing_decision(Some(("codex", "model-a"))),
+                true,
+                false,
+                &["codex:model-a".into(), "ollama:model-b".into()],
+                || Err(TriageError::Unavailable),
+            ),
+        ];
+        let jev_selected = cases.iter().filter(|case| case.source == "jev").count();
+        let deterministic_fallbacks = cases
+            .iter()
+            .filter(|case| case.source == "deterministic")
+            .count();
+        assert_eq!((jev_selected, deterministic_fallbacks), (1, 2));
+        assert_eq!(cases[1].confidence, Some(0.74));
+        assert_eq!(cases[2].confidence, None);
+        assert_eq!(MIN_CONFIDENCE, 0.75);
     }
 
     #[test]

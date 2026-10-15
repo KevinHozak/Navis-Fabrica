@@ -21,6 +21,8 @@ import {
   saveTypeSafeCredential,
   TypeSafeProbe,
   listUsageSignals,
+  listJevRoutingHistory,
+  JevRoutingHistoryEntry,
   recordManualUsageEstimate,
   UsageCategory,
   UsageSignal,
@@ -96,6 +98,7 @@ export function ProvidersPanel() {
   const [manualRoute, setManualRoute] = useState("");
   const [routingDecision, setRoutingDecision] = useState<RoutingDecision | null>(null);
   const [jevEvaluation, setJevEvaluation] = useState<JevRoutingEvaluation | null>(null);
+  const [jevHistory, setJevHistory] = useState<JevRoutingHistoryEntry[]>([]);
   const [taskSummary, setTaskSummary] = useState("");
   const [routingCalibration, setRoutingCalibration] = useState<RoutingCalibrationSummary[]>([]);
   const [routingBusy, setRoutingBusy] = useState(false);
@@ -116,6 +119,8 @@ export function ProvidersPanel() {
       if (desktop) {
         try { setUsageSignals(await listUsageSignals()); }
         catch (error) { if (active) setUsageMessage(error instanceof Error ? error.message : String(error)); }
+        try { setJevHistory(await listJevRoutingHistory()); }
+        catch { /* Routing history is optional until the next successful evaluation. */ }
       }
       if (desktop && value.providers.length) {
         try {
@@ -372,6 +377,7 @@ export function ProvidersPanel() {
         manualProviderId, manualModelId, candidates, usageSignals: latestUsageSignals, nowMs: Date.now(),
       };
       const evaluation = useJev ? await evaluateJevRouting(request, taskSummary.trim()) : null;
+      if (useJev && desktop) setJevHistory(await listJevRoutingHistory());
       const decision = evaluation?.routing ?? await evaluateRouting(request);
       if (inputRevision !== routingInputRevision.current) return;
       setJevEvaluation(evaluation);
@@ -475,11 +481,31 @@ export function ProvidersPanel() {
           <h3>{routingDecision.selectedProviderId ? `Selected: ${routingDecision.candidates.find((item) => item.selected)?.providerName} · ${routingDecision.candidates.find((item) => item.selected)?.modelName}` : "No eligible model"}</h3>
           <p>{routingDecision.requiredContextTokens.toLocaleString()} tokens required for this complexity. {routingDecision.desiredCompletionNote}</p>
           {jevEvaluation && <p><strong>{jevEvaluation.source === "jev" ? `Jev · ${Math.round((jevEvaluation.confidence ?? 0) * 100)}% confidence` : jevEvaluation.source === "manual" ? "Manual route override" : "Deterministic fallback"}</strong> · {jevEvaluation.explanation}</p>}
+          {jevEvaluation && <p><strong>Jev request cost estimate:</strong> {jevEvaluation.estimatedCostUsd == null ? "Unknown (input token usage is unavailable)." : `$${jevEvaluation.estimatedCostUsd.toFixed(8)} USD estimated from ${jevEvaluation.usage?.inputTokens?.toLocaleString()} input tokens; output is free.`} This is an estimate, not an account bill.</p>}
           <ul className="provider-list">{routingDecision.candidates.map((candidate) => <li className={`provider-card routing-candidate${candidate.selected ? " selected" : ""}`} key={`${candidate.providerId}/${candidate.modelId}`}>
             <strong>{candidate.providerName} · {candidate.modelName}</strong><span>{candidate.selected ? "Selected" : candidate.eligible ? "Eligible alternative" : "Rejected"}</span>
             <ul>{candidate.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
           </li>)}</ul>
           {routingDecision.selectedProviderId && <button className="button button-primary" type="button" disabled={saveState === "saving"} onClick={() => { void applyRoutingSelection(); }}>Apply selected route</button>}
+        </div>}
+        {jevHistory.length > 0 && <div className="routing-results">
+          <h3>Recent Jev routing history</h3>
+          <p>Local records contain routing metadata and reported usage only. Task summaries and repository content are never stored here.</p>
+          <ul className="provider-list">{jevHistory.slice(0, 10).map((entry) => <li className="provider-card" key={`${entry.evaluatedAtMs}-${entry.source}-${entry.selectedProviderId ?? "none"}`}>
+            <div className="provider-card-heading">
+              <div>
+                <strong>{entry.source === "jev" ? "Jev" : entry.source === "manual" ? "Manual" : "Deterministic fallback"}</strong>
+                <span>{entry.selectedProviderId ?? "No provider"} · {entry.selectedModelId ?? "No model"}</span>
+              </div>
+              <span>{entry.confidence == null ? "Confidence unknown" : `${Math.round(entry.confidence * 100)}% confidence`}</span>
+            </div>
+            <p className="provider-models">
+              {entry.inputTokens == null ? "Token usage unknown" : `${entry.inputTokens.toLocaleString()} input tokens`}
+              {entry.outputTokens == null ? " · output usage unknown" : ` · ${entry.outputTokens.toLocaleString()} output tokens`}
+              {entry.estimatedCostUsd == null ? " · cost unknown" : ` · $${entry.estimatedCostUsd.toFixed(8)} estimated`}
+            </p>
+            <small>{new Date(entry.evaluatedAtMs).toLocaleString()} · deterministic comparison: {entry.deterministicProviderId ?? "none"} / {entry.deterministicModelId ?? "none"}</small>
+          </li>)}</ul>
         </div>}
         {routingDecision && <div className="routing-results">
           <h3>Observed calibration</h3>

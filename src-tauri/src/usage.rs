@@ -8,6 +8,22 @@ const MAX_SIGNALS: usize = 500;
 const SUBSCRIPTION_MAX_AGE_MS: u128 = 30 * 60 * 1000;
 const CONTEXT_MAX_AGE_MS: u128 = 4 * 60 * 60 * 1000;
 const LOCAL_MAX_AGE_MS: u128 = 5 * 60 * 1000;
+const MAX_JEV_ROUTING_HISTORY: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevRoutingHistoryEntry {
+    pub evaluated_at_ms: u128,
+    pub source: String,
+    pub selected_provider_id: Option<String>,
+    pub selected_model_id: Option<String>,
+    pub deterministic_provider_id: Option<String>,
+    pub deterministic_model_id: Option<String>,
+    pub confidence: Option<f64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub estimated_cost_usd: Option<f64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -426,6 +442,70 @@ pub fn record_signals(path: &Path, signals: &[UsageSignal]) -> Result<(), String
         .map_err(|_| "Could not commit usage history.".to_string())
 }
 
+pub fn record_jev_routing(path: &Path, entry: &JevRoutingHistoryEntry) -> Result<(), String> {
+    let connection =
+        Connection::open(path).map_err(|_| "Could not open routing history.".to_string())?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|_| "Could not configure routing history.".to_string())?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS jev_routing_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               evaluated_at_ms INTEGER NOT NULL,
+               record_json TEXT NOT NULL
+             );",
+        )
+        .map_err(|_| "Could not initialize routing history.".to_string())?;
+    let json = serde_json::to_string(entry)
+        .map_err(|_| "Could not encode routing history.".to_string())?;
+    connection
+        .execute(
+            "INSERT INTO jev_routing_history (evaluated_at_ms, record_json) VALUES (?1, ?2)",
+            params![entry.evaluated_at_ms as i64, json],
+        )
+        .map_err(|_| "Could not save routing history.".to_string())?;
+    connection
+        .execute(
+            "DELETE FROM jev_routing_history WHERE id NOT IN (SELECT id FROM jev_routing_history ORDER BY evaluated_at_ms DESC, id DESC LIMIT ?1)",
+            [MAX_JEV_ROUTING_HISTORY as i64],
+        )
+        .map_err(|_| "Could not trim routing history.".to_string())?;
+    Ok(())
+}
+
+pub fn list_jev_routing_history(path: &Path) -> Result<Vec<JevRoutingHistoryEntry>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let connection =
+        Connection::open(path).map_err(|_| "Could not open routing history.".to_string())?;
+    let table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jev_routing_history'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT record_json FROM jev_routing_history ORDER BY evaluated_at_ms DESC, id DESC LIMIT ?1")
+        .map_err(|_| "Could not read routing history.".to_string())?;
+    let rows = statement
+        .query_map([MAX_JEV_ROUTING_HISTORY as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| "Could not read routing history.".to_string())?;
+    rows.map(|row| {
+        let json = row.map_err(|_| "Could not read routing history row.".to_string())?;
+        serde_json::from_str(&json)
+            .map_err(|_| "Routing history contains a malformed record.".to_string())
+    })
+    .collect()
+}
+
 pub fn list_signals(path: &Path, at_ms: u128) -> Result<Vec<UsageSignal>, String> {
     if !path.exists() {
         return Ok(default_unknown_signals(at_ms));
@@ -605,6 +685,36 @@ mod tests {
         assert!(validate_manual_estimate(&signal).is_ok());
         signal.value = Some(f64::NAN);
         assert!(validate_manual_estimate(&signal).is_err());
+    }
+
+    #[test]
+    fn jev_history_persists_routing_and_usage_without_task_content() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("usage.sqlite3");
+        let entry = JevRoutingHistoryEntry {
+            evaluated_at_ms: 1234,
+            source: "jev".into(),
+            selected_provider_id: Some("codex".into()),
+            selected_model_id: Some("model-a".into()),
+            deterministic_provider_id: Some("ollama".into()),
+            deterministic_model_id: Some("model-b".into()),
+            confidence: Some(0.91),
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(250),
+            estimated_cost_usd: Some(0.042),
+        };
+        record_jev_routing(&path, &entry).unwrap();
+        let history = list_jev_routing_history(&path).unwrap();
+        assert_eq!(history, vec![entry]);
+        let connection = Connection::open(&path).unwrap();
+        let stored: String = connection
+            .query_row("SELECT record_json FROM jev_routing_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        for forbidden in ["taskSummary", "repositoryContent", "diff", "apiKey"] {
+            assert!(!stored.contains(forbidden));
+        }
     }
 
     #[test]

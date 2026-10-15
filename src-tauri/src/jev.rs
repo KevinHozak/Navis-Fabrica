@@ -253,6 +253,16 @@ pub fn parse_response(body: &[u8], input: &TaskTriageInput) -> Result<JevChoice,
         .probabilities
         .get(&answer.choice)
         .ok_or(TriageError::InvalidProbabilities)?;
+    // TypeSafe requires the selected choice to have the highest probability.
+    // Equality is intentional: any choice tied for the maximum is valid.
+    let highest_probability = answer
+        .probabilities
+        .values()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    if confidence < highest_probability {
+        return Err(TriageError::InvalidProbabilities);
+    }
     if answer
         .confidence
         .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
@@ -405,6 +415,17 @@ mod tests {
         .unwrap();
         assert_eq!(choice.route_id, "codex:gpt-6.1-sol");
         assert_eq!(choice.confidence, 0.9);
+
+        let tied_choice = parse_response(
+            &response(
+                "ollama:qwen",
+                json!({"codex:gpt-6.1-sol": 0.5, "ollama:qwen": 0.5}),
+            ),
+            &input,
+        )
+        .unwrap();
+        assert_eq!(tied_choice.route_id, "ollama:qwen");
+        assert_eq!(tied_choice.confidence, 0.5);
     }
 
     #[test]
@@ -451,6 +472,16 @@ mod tests {
                 Err(TriageError::InvalidProbabilities)
             );
         }
+        assert_eq!(
+            parse_response(
+                &response(
+                    "ollama:qwen",
+                    json!({"codex:gpt-6.1-sol": 0.9, "ollama:qwen": 0.1}),
+                ),
+                &input
+            ),
+            Err(TriageError::InvalidProbabilities)
+        );
         let non_finite = br#"{"model":"jev-1.14.0","answers":{"route":{"type":"choice","choice":"codex:gpt-6.1-sol","probabilities":{"codex:gpt-6.1-sol":NaN,"ollama:qwen":0.1}}}}"#;
         assert_eq!(
             parse_response(non_finite, &input),

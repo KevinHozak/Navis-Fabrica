@@ -1,7 +1,7 @@
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -27,7 +27,6 @@ static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLoc
 static PROJECT_FACT_CACHE: OnceLock<Mutex<HashMap<String, scanner::ProjectEntry>>> =
     OnceLock::new();
 static PROJECT_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
-static PROJECT_CACHE_RESTORED: AtomicBool = AtomicBool::new(false);
 static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
 static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
     OnceLock::new();
@@ -864,6 +863,9 @@ fn resolved_workflow_skill_path(id: &str) -> Result<PathBuf, String> {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, String> {
+    let prior = settings_path(&app)
+        .ok()
+        .and_then(|path| load_settings(&path).ok());
     providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
     validate_github_accounts(
         &settings.github_accounts,
@@ -894,6 +896,15 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
             path: PathBuf::from(&settings.project_root),
             exclusions: settings.exclusions.clone(),
         });
+    }
+    let discovery_changed = prior.map_or(true, |previous| {
+        previous.project_root != settings.project_root
+            || previous.exclusions != settings.exclusions
+            || previous.preferences.include_hidden != settings.preferences.include_hidden
+            || previous.preferences.scan_depth != settings.preferences.scan_depth
+    });
+    if discovery_changed {
+        let _ = app.emit("project-discovery-settings-changed", ());
     }
     Ok(settings)
 }
@@ -1451,7 +1462,12 @@ fn start_ollama_workflow_run(
 }
 
 #[tauri::command]
-fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> Result<(), String> {
+fn start_project_scan(
+    app: AppHandle,
+    scan_id: String,
+    force_refresh: bool,
+    max_directories: Option<usize>,
+) -> Result<(), String> {
     if scan_id.is_empty()
         || scan_id.len() > 80
         || !scan_id
@@ -1463,18 +1479,13 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
     let settings = load_settings(&settings_path(&app)?)?;
     let inventory_path = project_inventory_path(&app)?;
     let prior_inventory = inventory::load(&inventory_path, &settings.project_root);
-    let mut refresh_restored_facts = false;
     if force_refresh {
-        PROJECT_CACHE_RESTORED.store(true, Ordering::Release);
         PROJECT_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed);
         project_fact_cache()
             .lock()
             .map_err(|_| "Could not access cached project facts.".to_string())?
             .clear();
-    } else if !PROJECT_CACHE_RESTORED.swap(true, Ordering::AcqRel) {
-        // Keep the persisted projects available for immediate rendering, but do
-        // not let their Git facts short-circuit the first background scan.
-        refresh_restored_facts = true;
+    } else {
         if !prior_inventory.is_empty() {
             let mut cache = project_fact_cache()
                 .lock()
@@ -1509,20 +1520,17 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
         };
         let prior_inventory = prior_inventory;
         let cache_epoch = PROJECT_CACHE_EPOCH.load(Ordering::Relaxed);
-        let cached_projects = if refresh_restored_facts {
-            HashMap::new()
-        } else {
-            project_fact_cache()
-                .lock()
-                .map(|cache| cache.clone())
-                .unwrap_or_default()
-        };
-        let mut result = scanner::scan(
+        let cached_projects = project_fact_cache()
+            .lock()
+            .map(|cache| cache.clone())
+            .unwrap_or_default();
+        let mut result = scanner::scan_bounded(
             &scan_id,
             Path::new(&settings.project_root),
             &options,
             &cancellation,
             &cached_projects,
+            max_directories.unwrap_or(20_000),
             |progress| {
                 let _ = app.emit("project-scan-progress", progress);
             },
@@ -1554,6 +1562,145 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
                         }
                     }
                 }
+            }
+        }
+        if let Ok(mut scans) = active_scans().lock() {
+            scans.remove(&scan_id);
+        }
+        let _ = app.emit("project-scan-finished", result);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn start_affected_project_refresh(
+    app: AppHandle,
+    scan_id: String,
+    changed_paths: Vec<String>,
+) -> Result<(), String> {
+    if scan_id.is_empty()
+        || scan_id.len() > 80
+        || !scan_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        || changed_paths.len() > 512
+        || changed_paths.iter().any(|path| path.len() > 4096)
+    {
+        return Err("The project refresh request is invalid.".into());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let root = PathBuf::from(&settings.project_root)
+        .canonicalize()
+        .map_err(|_| "The configured project root could not be resolved.".to_string())?;
+    let inventory_path = project_inventory_path(&app)?;
+    let prior = inventory::load(&inventory_path, &settings.project_root);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    {
+        let mut scans = active_scans()
+            .lock()
+            .map_err(|_| "Could not access active scans.".to_string())?;
+        if !scans.is_empty() {
+            return Err("A project scan is already running.".into());
+        }
+        scans.insert(scan_id.clone(), cancellation.clone());
+    }
+    thread::spawn(move || {
+        let mut result = scanner::ScanFinished {
+            scan_id: scan_id.clone(),
+            projects: Vec::new(),
+            errors: Vec::new(),
+            directories_scanned: 0,
+            cancelled: false,
+            fatal_error: None,
+        };
+        let mut candidates = HashSet::new();
+        let affected_paths: Vec<PathBuf> = changed_paths
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| paths_overlap(&normalize_path(path), &normalize_path(&root)))
+            .collect();
+        for changed in changed_paths {
+            if cancellation.load(Ordering::Relaxed) {
+                result.cancelled = true;
+                break;
+            }
+            let changed = PathBuf::from(changed);
+            if !changed.is_absolute() {
+                continue;
+            }
+            let mut candidate = if changed.is_dir() {
+                changed
+            } else {
+                changed.parent().unwrap_or(&root).to_path_buf()
+            };
+            for _ in 0..16 {
+                let Ok(canonical) = candidate.canonicalize() else {
+                    break;
+                };
+                if !canonical.starts_with(&root) || !candidates.insert(normalize_path(&canonical)) {
+                    break;
+                }
+                match scanner::refresh_project_directory(&canonical, &cancellation) {
+                    Ok(Some(project)) => result.projects.push(project),
+                    Ok(None) => {}
+                    Err(error) if result.errors.len() < 500 => result.errors.push(error),
+                    Err(_) => {}
+                }
+                result.directories_scanned += 1;
+                if canonical == root {
+                    break;
+                }
+                let Some(parent) = canonical.parent() else {
+                    break;
+                };
+                candidate = parent.to_path_buf();
+            }
+        }
+        let refreshed_ids: HashSet<String> = result
+            .projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect();
+        let mut updated = HashMap::new();
+        for project in prior {
+            let project_path = Path::new(&project.path);
+            let project_key = normalize_path(project_path);
+            let was_affected = affected_paths
+                .iter()
+                .any(|path| paths_overlap(&normalize_path(path), &project_key));
+            let path_missing = matches!(
+                fs::metadata(project_path),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            let confirmed_non_project = candidates.contains(&project_key)
+                && project_path.is_dir()
+                && result.errors.is_empty()
+                && !refreshed_ids.contains(&project.id);
+            if !was_affected || (!path_missing && !confirmed_non_project) {
+                updated.insert(project.id.clone(), project);
+            }
+        }
+        for project in result.projects.drain(..) {
+            updated.insert(project.id.clone(), project);
+        }
+        result.projects = updated.into_values().collect();
+        result
+            .projects
+            .sort_by_key(|project| (project.name.to_lowercase(), project.path.to_lowercase()));
+        if !result.cancelled {
+            if let Err(error) =
+                inventory::save(&inventory_path, &settings.project_root, &result.projects)
+            {
+                result.errors.push(error);
+            } else if let Ok(mut cache) = project_fact_cache().lock() {
+                cache.clear();
+                cache.extend(
+                    result
+                        .projects
+                        .iter()
+                        .cloned()
+                        .map(|project| (project.id.clone(), project)),
+                );
             }
         }
         if let Ok(mut scans) = active_scans().lock() {
@@ -1698,8 +1845,13 @@ fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>)
                             .retain(|path| !watcher_path_excluded(path, root, &watched_exclusions));
                     }
                     if !changed_paths.is_empty() {
+                        changed_paths.truncate(128);
                         invalidate_project_facts(&changed_paths);
-                        let _ = app.emit("project-scan-invalidated", ());
+                        let paths: Vec<String> = changed_paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect();
+                        let _ = app.emit("project-scan-invalidated", paths);
                     }
                 }
             }
@@ -1756,6 +1908,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             get_project_inventory,
+            start_affected_project_refresh,
             discover_workflow_skills,
             save_settings,
             inspect_providers,

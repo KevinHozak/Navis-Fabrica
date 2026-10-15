@@ -288,8 +288,11 @@ export const isDesktopApp = () => isTauri();
 
 export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
 
-export const startProjectScan = (scanId: string, forceRefresh: boolean) =>
-  invoke<void>("start_project_scan", { scanId, forceRefresh });
+export const startProjectScan = (scanId: string, forceRefresh: boolean, maxDirectories?: number) =>
+  invoke<void>("start_project_scan", { scanId, forceRefresh, maxDirectories: maxDirectories ?? null });
+
+export const startAffectedProjectRefresh = (scanId: string, changedPaths: string[]) =>
+  invoke<void>("start_affected_project_refresh", { scanId, changedPaths });
 
 export const cancelProjectScan = (scanId: string) =>
   invoke<boolean>("cancel_project_scan", { scanId });
@@ -381,8 +384,11 @@ export const onProjectScanProgress = (handler: (progress: ProjectScanProgress) =
 export const onProjectScanFinished = (handler: (result: ProjectScanFinished) => void) =>
   listen<ProjectScanFinished>("project-scan-finished", (event) => handler(event.payload));
 
-export const onProjectScanInvalidated = (handler: () => void) =>
-  listen<void>("project-scan-invalidated", handler);
+export const onProjectScanInvalidated = (handler: (paths: string[]) => void) =>
+  listen<string[]>("project-scan-invalidated", (event) => handler(event.payload));
+
+export const onProjectDiscoverySettingsChanged = (handler: () => void) =>
+  listen<void>("project-discovery-settings-changed", handler);
 
 export const onProjectWatchError = (handler: (message: string) => void) =>
   listen<string>("project-watch-error", (event) => handler(event.payload));

@@ -8,6 +8,7 @@
     "allow-discover-workflow-skills",
     "allow-save-settings",
     "allow-start-project-scan",
+    "allow-start-affected-project-refresh",
     "allow-cancel-project-scan",
     "allow-inspect-providers",
     "allow-probe-antigravity-cli",

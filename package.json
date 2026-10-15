@@ -1,8 +1,10 @@
 {
   "name": "navis-fabrica",
   "private": true,
-  "version": "0.18.3",
+  "version": "0.19.0",
   "type": "module",
+  "packageManager": "npm@11.11.1",
+  "engines": { "node": "24.14.x", "npm": "11.11.x" },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
@@ -11,7 +13,9 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:check": "cargo check --manifest-path src-tauri/Cargo.toml --locked",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "release:verify": "node scripts/verify-release.mjs",
+    "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.3",

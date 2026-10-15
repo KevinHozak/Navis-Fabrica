@@ -1,4 +1,4 @@
-﻿﻿# Release-P2 implementation plan
+﻿# Release-P2 implementation plan
 
 **Issue:** #29 - Performance accessibility and diagnostics
 **Status:** In progress

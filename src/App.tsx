@@ -15,6 +15,7 @@ import {
   loadSettings,
   onProjectScanFinished,
   onProjectScanInvalidated,
+  onProjectDiscoverySettingsChanged,
   onProjectScanProgress,
   onProjectWatchError,
   ProjectEntry,
@@ -23,10 +24,12 @@ import {
   ProjectScanProgress,
   refreshGitHubActivity,
   startProjectScan,
+  startAffectedProjectRefresh,
 } from "./settings";
 
 type Section = "projects" | "runs" | "providers" | "settings";
 type ScanStatus = "idle" | "scanning" | "cancelling" | "complete" | "cancelled" | "error";
+type InventoryFreshness = "loading" | "saved" | "partial" | "refreshing" | "current" | "stale";
 
 const sections: { id: Section; label: string; icon: string }[] = [
   { id: "projects", label: "Projects", icon: "◫" },
@@ -53,6 +56,7 @@ function App() {
   const [firstProjectMs, setFirstProjectMs] = useState<number | null>(null);
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
+  const [inventoryFreshness, setInventoryFreshness] = useState<InventoryFreshness>("loading");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
   const [workContext, setWorkContext] = useState<{ projectId: string; issue: GitHubIssue } | null>(null);
   const [workflowSkills, setWorkflowSkills] = useState<WorkflowSkillStatus[]>([]);
@@ -60,8 +64,11 @@ function App() {
   const scanStartedAt = useRef<number | null>(null);
   const firstProjectMsRef = useRef<number | null>(null);
   const cancelRequested = useRef(false);
-  const refreshAfterScan = useRef(false);
-  const beginScanRef = useRef<(forceRefresh: boolean) => void>(() => undefined);
+  const refreshAfterScan = useRef<string[]>([]);
+  const fullRefreshAfterScan = useRef(false);
+  const partialScanIds = useRef(new Set<string>());
+  const beginScanRef = useRef<(forceRefresh: boolean, maxDirectories?: number) => void>(() => undefined);
+  const beginAffectedRefreshRef = useRef<(paths: string[]) => void>(() => undefined);
   const desktop = isDesktopApp();
 
   useEffect(() => {
@@ -139,9 +146,16 @@ function App() {
       }
       setScanError(result.fatalError ?? "");
       setScanStatus(result.fatalError ? "error" : result.cancelled ? "cancelled" : "complete");
-      if (!result.cancelled && refreshAfterScan.current) {
-        refreshAfterScan.current = false;
-        window.setTimeout(() => beginScanRef.current(false), 0);
+      const partial = partialScanIds.current.delete(result.scanId);
+      setInventoryFreshness(result.fatalError || result.errors.length ? "stale" : result.cancelled ? "saved" : partial ? "partial" : "current");
+      if (!result.cancelled && fullRefreshAfterScan.current) {
+        fullRefreshAfterScan.current = false;
+        refreshAfterScan.current = [];
+        window.setTimeout(() => beginScanRef.current(true), 0);
+      } else if (!result.cancelled && refreshAfterScan.current.length) {
+        const pending = [...new Set(refreshAfterScan.current)];
+        refreshAfterScan.current = [];
+        window.setTimeout(() => beginAffectedRefreshRef.current(pending), 0);
       }
     }).then((stop) => {
       if (active) unlistenFinished = stop;
@@ -154,9 +168,14 @@ function App() {
       }
     });
 
-    onProjectScanInvalidated(() => {
-      if (activeScanId.current) refreshAfterScan.current = true;
-      else beginScanRef.current(false);
+    onProjectScanInvalidated((paths) => {
+      if (activeScanId.current) {
+        if (partialScanIds.current.has(activeScanId.current)) {
+          refreshAfterScan.current.push(...paths.slice(0, 512));
+        } else {
+          fullRefreshAfterScan.current = true;
+        }
+      } else beginAffectedRefreshRef.current(paths);
     }).then((stop) => {
       if (active) unlistenInvalidated = stop;
       else stop();
@@ -164,7 +183,10 @@ function App() {
       if (active) setWatchError(error instanceof Error ? error.message : String(error));
     });
     onProjectWatchError((message) => {
-      if (active) setWatchError(message);
+      if (active) {
+        setWatchError(message);
+        if (message) setInventoryFreshness("stale");
+      }
     }).then((stop) => {
       if (active) unlistenWatchError = stop;
       else stop();
@@ -182,17 +204,42 @@ function App() {
   }, [desktop]);
 
   useEffect(() => {
+    if (!desktop) return;
+    const unlisten = onProjectDiscoverySettingsChanged(() => {
+      if (activeScanId.current) fullRefreshAfterScan.current = true;
+      else beginScanRef.current(true);
+    });
+    return () => { void unlisten.then((stop) => stop()); };
+  }, [desktop]);
+
+  useEffect(() => {
     if (!desktop || !scanListenersReady) return;
     let active = true;
     getProjectInventory()
-      .catch(() => [] as ProjectEntry[])
+      .catch((error: unknown) => {
+        if (active) {
+          setInventoryFreshness("stale");
+          setScanError(error instanceof Error ? error.message : String(error));
+        }
+        return null;
+      })
       .then((savedProjects) => {
-        if (!active) return;
+        if (!active || !savedProjects) return;
         if (activeScanId.current) return;
         setProjects(savedProjects);
-        beginScanRef.current(false);
+        setInventoryFreshness("saved");
       });
     return () => { active = false; };
+  }, [desktop, scanListenersReady]);
+
+  useEffect(() => {
+    if (!desktop || !scanListenersReady) return;
+    const startupRefresh = window.setTimeout(() => beginScanRef.current(false, 2_000), 1_500);
+    const fallbackRefresh = window.setInterval(() => beginScanRef.current(true, 20_000), 15 * 60 * 1_000);
+    return () => {
+      window.clearTimeout(startupRefresh);
+      window.clearInterval(fallbackRefresh);
+    };
   }, [desktop, scanListenersReady]);
 
   useEffect(() => {
@@ -204,8 +251,18 @@ function App() {
   const workIssue = workContext && selectedProject?.id === workContext.projectId ? workContext.issue : null;
   const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Work context" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
+  const freshnessLabel = inventoryFreshness === "loading" ? "Loading saved projects…"
+    : inventoryFreshness === "saved" ? "Saved project list · background refresh is scheduled"
+      : inventoryFreshness === "partial" ? "Saved project list · changed repositories refreshed"
+      : inventoryFreshness === "refreshing" ? "Refreshing project details in the background…"
+        : inventoryFreshness === "stale" ? "Showing saved project details · refresh needed"
+          : "Project list is up to date";
 
-  async function beginScan(forceRefresh = true) {
+  async function beginScan(forceRefresh = true, maxDirectories?: number) {
+    if (activeScanId.current) {
+      if (forceRefresh) fullRefreshAfterScan.current = true;
+      return;
+    }
     if (!desktop) {
       setScanStatus("error");
       setScanError("Project scanning is available in the Navis-Fabrica desktop app.");
@@ -216,6 +273,7 @@ function App() {
     cancelRequested.current = false;
     setScanId(id);
     setScanStatus("scanning");
+    setInventoryFreshness("refreshing");
     setScanResult(null);
     setProgress(null);
     setScanDurationMs(null);
@@ -226,11 +284,39 @@ function App() {
       const settings = await loadSettings();
       setProjectRoot(settings.projectRoot);
       scanStartedAt.current = performance.now();
-      await startProjectScan(id, forceRefresh);
+      await startProjectScan(id, forceRefresh, maxDirectories);
       if (cancelRequested.current) await cancelProjectScan(id);
     } catch (error) {
       activeScanId.current = "";
       setScanStatus("error");
+      setInventoryFreshness("stale");
+      setScanError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function beginAffectedRefresh(paths: string[]) {
+    if (!desktop || !paths.length) return;
+    if (activeScanId.current) {
+      refreshAfterScan.current.push(...paths.slice(0, 512));
+      return;
+    }
+    const id = crypto.randomUUID();
+    partialScanIds.current.add(id);
+    activeScanId.current = id;
+    cancelRequested.current = false;
+    setScanId(id);
+    setScanStatus("scanning");
+    setInventoryFreshness("refreshing");
+    setScanResult(null);
+    setProgress(null);
+    setScanError("");
+    try {
+      await startAffectedProjectRefresh(id, paths.slice(0, 512));
+    } catch (error) {
+      activeScanId.current = "";
+      partialScanIds.current.delete(id);
+      setScanStatus("error");
+      setInventoryFreshness("stale");
       setScanError(error instanceof Error ? error.message : String(error));
     }
   }
@@ -247,7 +333,8 @@ function App() {
     }
   }
 
-  beginScanRef.current = (forceRefresh) => { void beginScan(forceRefresh); };
+  beginScanRef.current = (forceRefresh, maxDirectories) => { void beginScan(forceRefresh, maxDirectories); };
+  beginAffectedRefreshRef.current = (paths) => { void beginAffectedRefresh(paths); };
 
   return (
     <div className="app-shell">
@@ -313,10 +400,12 @@ function App() {
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">
-                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? `Scanning ${projectRoot} and its configured folders.` : "This workspace section is part of the foundation shell."}</p></div>
+                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? `Workspace: ${projectRoot}` : "This workspace section is part of the foundation shell."}</p></div>
                 <span className="project-count" aria-live="polite">{section === "projects" ? projects.length : ""}</span>
               </div>
               <div className="panel-rule" />
+
+              {section === "projects" && <p className="scan-measurement" role="status" aria-live="polite">{freshnessLabel}</p>}
 
               {section === "projects" && scanResult && scanDurationMs !== null && <p className="scan-measurement" role="status" aria-live="polite">Last scan: {scanDurationMs} ms · {scanResult.directoriesScanned} folders · {scanResult.projects.length} projects{firstProjectMs === null ? "." : ` · first project in ${firstProjectMs} ms.`}</p>}
 

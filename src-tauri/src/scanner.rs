@@ -21,6 +21,28 @@ pub struct ScanOptions {
     pub exclusions: Vec<String>,
 }
 
+pub fn directory_is_in_discovery_scope(path: &Path, root: &Path, options: &ScanOptions) -> bool {
+    let path = path_key(path);
+    let root = path_key(root);
+    let root = root.trim_end_matches('/');
+    if path == root {
+        return true;
+    }
+    let Some(relative) = path
+        .strip_prefix(&format!("{root}/"))
+        .filter(|relative| !relative.is_empty())
+    else {
+        return false;
+    };
+    let components: Vec<_> = relative.split('/').collect();
+    components.len() <= usize::from(options.depth)
+        && (options.include_hidden
+            || components
+                .iter()
+                .all(|component| !component.starts_with('.')))
+        && !excluded(Path::new(relative), &options.exclusions)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectEntry {
@@ -106,12 +128,33 @@ pub struct ScanFinished {
     pub fatal_error: Option<String>,
 }
 
-pub fn scan(
+#[cfg(test)]
+fn scan(
     scan_id: &str,
     root: &Path,
     options: &ScanOptions,
     cancelled: &AtomicBool,
     cached_projects: &HashMap<String, ProjectEntry>,
+    progress: impl FnMut(ScanProgress),
+) -> ScanFinished {
+    scan_bounded(
+        scan_id,
+        root,
+        options,
+        cancelled,
+        cached_projects,
+        MAX_DIRECTORIES,
+        progress,
+    )
+}
+
+pub fn scan_bounded(
+    scan_id: &str,
+    root: &Path,
+    options: &ScanOptions,
+    cancelled: &AtomicBool,
+    cached_projects: &HashMap<String, ProjectEntry>,
+    directory_limit: usize,
     mut progress: impl FnMut(ScanProgress),
 ) -> ScanFinished {
     let root = match fs::canonicalize(root) {
@@ -156,14 +199,20 @@ pub fn scan(
         if !visited.insert(path_key(&canonical)) {
             continue;
         }
-        if directories_scanned >= MAX_DIRECTORIES {
+        if directories_scanned >= directory_limit.min(MAX_DIRECTORIES) {
             push_error(
                 &mut errors,
-                format!("Scan stopped at the {MAX_DIRECTORIES} folder safety limit."),
+                format!(
+                    "Scan stopped at the {} folder safety limit.",
+                    directory_limit.min(MAX_DIRECTORIES)
+                ),
             );
             break;
         }
         directories_scanned += 1;
+        if directories_scanned % 32 == 0 {
+            thread::yield_now();
+        }
 
         let (is_git_repository, is_worktree) = git_marker(&canonical, &mut errors);
         let mut children = Vec::new();
@@ -306,6 +355,58 @@ fn failed(scan_id: &str, message: &str) -> ScanFinished {
         cancelled: false,
         fatal_error: Some(message.to_owned()),
     }
+}
+
+pub fn refresh_project_directory(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<Option<ProjectEntry>, String> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("Could not resolve a changed project folder: {error}"))?;
+    if !canonical.is_dir() || cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let mut errors = Vec::new();
+    let (is_git_repository, is_worktree) = git_marker(&canonical, &mut errors);
+    if let Some(error) = errors.first() {
+        return Err(error.clone());
+    }
+    if !is_git_repository {
+        return Ok(None);
+    }
+    let mut names = HashSet::new();
+    for entry in fs::read_dir(&canonical)
+        .map_err(|error| format!("Could not inspect a changed project folder: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("Could not inspect a changed project entry: {error}"))?;
+        names.insert(entry.file_name().to_string_lossy().to_lowercase());
+    }
+    let git = inspect_git(&canonical, true, cancelled);
+    if cancelled.load(Ordering::Relaxed)
+        || !git.remotes.iter().any(|remote| remote.github.is_some())
+    {
+        return Ok(None);
+    }
+    let mut tool_availability = HashMap::new();
+    Ok(Some(ProjectEntry {
+        id: project_identity(&canonical),
+        name: canonical
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| canonical.to_string_lossy().into_owned()),
+        path: canonical.to_string_lossy().into_owned(),
+        is_git_repository,
+        is_worktree,
+        detected_stacks: detect_stacks(&canonical, &names),
+        git,
+        workflow_prerequisites: workflow_prerequisites(
+            &canonical,
+            &names,
+            is_git_repository,
+            &mut tool_availability,
+        ),
+    }))
 }
 
 fn path_key(path: &Path) -> String {
@@ -1507,6 +1608,47 @@ mod tests {
         assert!(scan_fixture(root.path(), 2).projects.is_empty());
         let included = scan_fixture(root.path(), 3);
         assert!(included.projects.is_empty());
+    }
+
+    #[test]
+    fn targeted_refresh_scope_matches_depth_hidden_and_exclusion_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let options = options(2);
+        assert!(directory_is_in_discovery_scope(
+            root.path(),
+            root.path(),
+            &options
+        ));
+        assert!(directory_is_in_discovery_scope(
+            &root.path().join("one/two"),
+            root.path(),
+            &options
+        ));
+        assert!(!directory_is_in_discovery_scope(
+            &root.path().join("one/two/three"),
+            root.path(),
+            &options
+        ));
+        assert!(!directory_is_in_discovery_scope(
+            &root.path().join(".hidden/repo"),
+            root.path(),
+            &options
+        ));
+        assert!(!directory_is_in_discovery_scope(
+            &root.path().join("node_modules/repo"),
+            root.path(),
+            &options
+        ));
+
+        let include_hidden = ScanOptions {
+            include_hidden: true,
+            ..options
+        };
+        assert!(directory_is_in_discovery_scope(
+            &root.path().join(".hidden/repo"),
+            root.path(),
+            &include_hidden
+        ));
     }
 
     #[test]

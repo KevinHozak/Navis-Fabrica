@@ -21,6 +21,13 @@ import {
   recordManualUsageEstimate,
   UsageCategory,
   UsageSignal,
+  evaluateRouting,
+  listWorkflowRuns,
+  WorkflowRun,
+  RoutingCandidate,
+  RoutingDecision,
+  RoutingComplexity,
+  RoutingPace,
 } from "./settings";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -67,6 +74,16 @@ export function ProvidersPanel() {
   const [estimateResetAt, setEstimateResetAt] = useState("");
   const [usageMessage, setUsageMessage] = useState("");
   const [savingEstimate, setSavingEstimate] = useState(false);
+  const [workflowRuns, setWorkflowRuns] = useState<WorkflowRun[]>([]);
+  const [routingComplexity, setRoutingComplexity] = useState<RoutingComplexity>("standard");
+  const [routingPace, setRoutingPace] = useState<RoutingPace>("balanced");
+  const [routingRequireTools, setRoutingRequireTools] = useState(true);
+  const [routingLocalOnly, setRoutingLocalOnly] = useState(false);
+  const [desiredMinutes, setDesiredMinutes] = useState("");
+  const [manualRoute, setManualRoute] = useState("");
+  const [routingDecision, setRoutingDecision] = useState<RoutingDecision | null>(null);
+  const [routingBusy, setRoutingBusy] = useState(false);
+  const [routingError, setRoutingError] = useState("");
   const desktop = isDesktopApp();
 
   const selectedProvider = settings?.providers.find((provider) => provider.id === settings.providerSelection.providerId);
@@ -97,6 +114,13 @@ export function ProvidersPanel() {
         setMessage(error instanceof Error ? error.message : String(error));
       }
     });
+    return () => { active = false; };
+  }, [desktop]);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let active = true;
+    listWorkflowRuns().then((runs) => { if (active) setWorkflowRuns(runs); }).catch(() => undefined);
     return () => { active = false; };
   }, [desktop]);
 
@@ -143,7 +167,10 @@ export function ProvidersPanel() {
       if (result.state === "ready" && settings) {
         const profile = settings.providers.find((item) => item.id === providerId);
         if (profile?.kind === "ollama") {
-          const eligible = result.models.filter((item) => item.eligible).map((item) => ({ id: item.id, name: item.id, reasoningEfforts: [] }));
+          const eligible = result.models.filter((item) => item.eligible).map((item) => {
+            const previous = profile.models.find((model) => model.id === item.id);
+            return { ...previous, id: item.id, name: previous?.name ?? item.id, reasoningEfforts: previous?.reasoningEfforts ?? [], contextWindowTokens: item.contextTokens, supportsTools: item.toolsSupported, qualityRating: previous?.qualityRating ?? null };
+          });
           const providers = settings.providers.map((item) => item.id === providerId ? { ...item, models: eligible } : item);
           const selection = settings.providerSelection.providerId === providerId && !eligible.some((item) => item.id === settings.providerSelection.modelId)
             ? { ...settings.providerSelection, modelId: eligible[0]?.id ?? null, reasoningEffort: null }
@@ -177,7 +204,12 @@ export function ProvidersPanel() {
       const result = await probeOpenRouter(providerId);
       setOpenRouterProbes((current) => ({ ...current, [providerId]: result }));
       if (result.state === "ready" && settings) {
-        const models: ModelProfile[] = result.models.map((item) => ({ id: item.id, name: item.name, reasoningEfforts: [] }));
+        const previousModels = settings.providers.find((item) => item.id === providerId)?.models ?? [];
+        const models: ModelProfile[] = result.models.map((item) => {
+          const previous = previousModels.find((model) => model.id === item.id);
+          const supportsTools = item.supportedParameters === null ? previous?.supportsTools ?? null : item.supportedParameters.includes("tools") || item.supportedParameters.includes("tool_choice");
+          return { ...previous, id: item.id, name: item.name, reasoningEfforts: previous?.reasoningEfforts ?? [], contextWindowTokens: item.contextLength ?? previous?.contextWindowTokens ?? null, supportsTools, qualityRating: previous?.qualityRating ?? null };
+        });
         const providers = settings.providers.map((item) => item.id === providerId ? { ...item, models } : item);
         const selection = settings.providerSelection.providerId === providerId && !models.some((item) => item.id === settings.providerSelection.modelId)
           ? { ...settings.providerSelection, modelId: null, reasoningEffort: null }
@@ -239,6 +271,58 @@ export function ProvidersPanel() {
     void persist({ ...settings, providerSelection: { ...next, runtimeId: runtimeId.trim() || null } });
   }
 
+  function updateSelectedModelRouting(patch: Partial<Pick<ModelProfile, "contextWindowTokens" | "supportsTools" | "qualityRating">>) {
+    if (!settings || !selectedProvider || !selectedModel) return;
+    const providers = settings.providers.map((provider) => provider.id !== selectedProvider.id ? provider : {
+      ...provider,
+      models: provider.models.map((model) => model.id === selectedModel.id ? { ...model, ...patch } : model),
+    });
+    void persist({ ...settings, providers });
+  }
+
+  async function recommendModel() {
+    if (!settings) return;
+    setRoutingBusy(true);
+    setRoutingError("");
+    try {
+      let latestRuns = workflowRuns;
+      let latestUsageSignals = usageSignals;
+      if (desktop) {
+        [latestRuns, latestUsageSignals] = await Promise.all([listWorkflowRuns(), listUsageSignals()]);
+      }
+      setWorkflowRuns(latestRuns);
+      setUsageSignals(latestUsageSignals);
+      const candidates: RoutingCandidate[] = settings.providers.flatMap((provider) => provider.models.map((model) => {
+        const ollamaModel = provider.kind === "ollama" ? ollamaProbes[provider.id]?.models.find((item) => item.id === model.id) : undefined;
+        const openRouterModel = provider.kind === "openRouter" ? openRouterProbes[provider.id]?.models.find((item) => item.id === model.id) : undefined;
+        const completedRun = latestRuns.filter((run) => run.state === "completed" && run.provider === provider.kind && run.modelId === model.id && run.latencyMs !== null && run.finishedAtMs !== null)
+          .sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0))[0];
+        const discoveredTools = ollamaModel ? ollamaModel.toolsSupported : openRouterModel?.supportedParameters
+          ? openRouterModel.supportedParameters.includes("tools") || openRouterModel.supportedParameters.includes("tool_choice")
+          : null;
+        return {
+          providerId: provider.id, providerName: provider.name, modelId: model.id, modelName: model.name,
+          isLocal: provider.kind === "ollama",
+          contextTokens: ollamaModel?.contextTokens ?? openRouterModel?.contextLength ?? model.contextWindowTokens ?? null,
+          supportsTools: discoveredTools ?? model.supportsTools ?? null,
+          reasoningEfforts: model.reasoningEfforts,
+          qualityRating: model.qualityRating ?? null,
+          latencyMs: completedRun?.latencyMs ?? null,
+          latencyCollectedAtMs: completedRun?.finishedAtMs ?? null,
+        };
+      }));
+      const [manualProviderId, manualModelId] = manualRoute ? JSON.parse(manualRoute) as [string, string] : [null, null];
+      const decision = await evaluateRouting({
+        complexity: routingComplexity, pace: routingPace, requireTools: routingRequireTools, localOnly: routingLocalOnly,
+        desiredCompletionMinutes: desiredMinutes.trim() ? Number(desiredMinutes) : null,
+        manualProviderId, manualModelId, candidates, usageSignals: latestUsageSignals, nowMs: Date.now(),
+      });
+      setRoutingDecision(decision);
+    } catch (error) {
+      setRoutingError(error instanceof Error ? error.message : String(error));
+    } finally { setRoutingBusy(false); }
+  }
+
   if (!settings) return <section className="panel settings-panel"><div className="settings-loading" role={saveState === "error" ? "alert" : "status"}>{saveState === "error" ? message : "Loading provider settings…"}</div></section>;
 
   return (
@@ -270,6 +354,36 @@ export function ProvidersPanel() {
           </label>
         </div>
         <div className="provider-feedback" role={saveState === "error" ? "alert" : "status"} aria-live="polite">{message || (desktop ? "Configuration is local to this app." : "Browser preview stores configuration in this browser.")}</div>
+        {selectedModel && <details className="model-routing-settings">
+          <summary>Routing details for {selectedModel.name}</summary>
+          <p className="registry-context-note">Set known model capabilities and your own quality estimate. Estimates are labelled and never treated as measured provider data.</p>
+          <div className="provider-inline-fields">
+            <label className="settings-field"><span>Context window (tokens)</span><input type="number" min="1" max="10000000" value={selectedModel.contextWindowTokens ?? ""} onChange={(event) => updateSelectedModelRouting({ contextWindowTokens: event.target.value ? Number(event.target.value) : null })} /></label>
+            <label className="settings-field"><span>Model reports tool support</span><select value={selectedModel.supportsTools === true ? "yes" : selectedModel.supportsTools === false ? "no" : "unknown"} onChange={(event) => updateSelectedModelRouting({ supportsTools: event.target.value === "unknown" ? null : event.target.value === "yes" })}><option value="unknown">Unknown</option><option value="yes">Yes</option><option value="no">No</option></select></label>
+            <label className="settings-field"><span>Your quality estimate (1–5)</span><select value={selectedModel.qualityRating ?? ""} onChange={(event) => updateSelectedModelRouting({ qualityRating: event.target.value ? Number(event.target.value) : null })}><option value="">Not rated</option>{[1, 2, 3, 4, 5].map((rating) => <option key={rating} value={rating}>{rating}/5</option>)}</select></label>
+          </div>
+        </details>}
+      </section>
+
+      <section className="panel settings-panel routing-panel" aria-labelledby="routing-policy-title">
+        <div className="panel-heading"><div><h2 id="routing-policy-title">Explainable model recommendation</h2><p>Eligibility is checked before pace ranking. Manual selection applies only to an eligible model.</p></div><span className="setting-glyph" aria-hidden="true">⌁</span></div>
+        <div className="provider-inline-fields">
+          <label className="settings-field"><span>Task complexity</span><select value={routingComplexity} onChange={(event) => setRoutingComplexity(event.target.value as RoutingComplexity)}><option value="simple">Simple · 8k context floor</option><option value="standard">Standard · 16k context floor</option><option value="complex">Complex · 32k context floor</option></select></label>
+          <label className="settings-field"><span>Pace preference</span><select value={routingPace} onChange={(event) => setRoutingPace(event.target.value as RoutingPace)}><option value="fast">Fast · recent latency first</option><option value="balanced">Balanced · quality, quota, latency</option><option value="thorough">Thorough · quality and reasoning</option><option value="economy">Economy · fresh spend and quota</option></select></label>
+          <label className="settings-field"><span>Manual override</span><select value={manualRoute} onChange={(event) => setManualRoute(event.target.value)}><option value="">Automatic recommendation</option>{settings.providers.flatMap((provider) => provider.models.map((model) => <option key={`${provider.id}/${model.id}`} value={JSON.stringify([provider.id, model.id])}>{provider.name} · {model.name}</option>))}</select></label>
+          <label className="settings-field"><span>Desired completion time (minutes)</span><input type="number" min="1" max="1440" value={desiredMinutes} onChange={(event) => setDesiredMinutes(event.target.value)} placeholder="Optional" /><small>A preference only; task completion is not guaranteed.</small></label>
+          <label className="routing-checkbox"><input type="checkbox" checked={routingRequireTools} onChange={(event) => setRoutingRequireTools(event.target.checked)} /> Require known tool support</label>
+          <label className="routing-checkbox"><input type="checkbox" checked={routingLocalOnly} onChange={(event) => setRoutingLocalOnly(event.target.checked)} /> Local-only privacy</label>
+        </div>
+        <div className="settings-actions"><button className="button button-primary" type="button" disabled={!desktop || routingBusy || !settings.providers.some((provider) => provider.models.length)} onClick={() => { void recommendModel(); }}>{routingBusy ? "Evaluating…" : "Recommend a model"}</button><p className="settings-feedback" role="status">{routingError}</p></div>
+        {routingDecision && <div className="routing-results" aria-live="polite">
+          <h3>{routingDecision.selectedProviderId ? `Selected: ${routingDecision.candidates.find((item) => item.selected)?.providerName} · ${routingDecision.candidates.find((item) => item.selected)?.modelName}` : "No eligible model"}</h3>
+          <p>{routingDecision.requiredContextTokens.toLocaleString()} tokens required for this complexity. {routingDecision.desiredCompletionNote}</p>
+          <ul className="provider-list">{routingDecision.candidates.map((candidate) => <li className={`provider-card routing-candidate${candidate.selected ? " selected" : ""}`} key={`${candidate.providerId}/${candidate.modelId}`}>
+            <strong>{candidate.providerName} · {candidate.modelName}</strong><span>{candidate.selected ? "Selected" : candidate.eligible ? "Eligible alternative" : "Rejected"}</span>
+            <ul>{candidate.reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul>
+          </li>)}</ul>
+        </div>}
       </section>
 
       <section className="panel settings-panel" aria-labelledby="provider-list-title">

@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 
 mod github;
 pub mod providers;
+mod routing;
 mod runs;
 mod scanner;
 mod usage;
@@ -1561,7 +1562,8 @@ pub fn run() {
             runs::respond_codex_approval,
             runs::respond_codex_user_input,
             list_usage_signals,
-            record_manual_usage_estimate
+            record_manual_usage_estimate,
+            evaluate_routing
         ])
         .run(tauri::generate_context!())
         .expect("error while running Navis-Fabrica");
@@ -1570,6 +1572,49 @@ pub fn run() {
 #[tauri::command]
 fn list_usage_signals(app: AppHandle) -> Result<Vec<usage::UsageSignal>, String> {
     usage::list_signals(&runs::history_path(&app)?, usage::now_ms())
+}
+
+#[tauri::command]
+fn evaluate_routing(mut request: routing::Request) -> Result<routing::Decision, String> {
+    if request.candidates.len() > 3_200 || request.usage_signals.len() > 500 {
+        return Err("Routing input exceeds the supported candidate or signal limit.".into());
+    }
+    if request
+        .desired_completion_minutes
+        .is_some_and(|minutes| !(1..=1_440).contains(&minutes))
+    {
+        return Err("Desired completion time must be between 1 minute and 24 hours.".into());
+    }
+    let mut candidate_keys = std::collections::HashSet::new();
+    if request.candidates.iter().any(|candidate| {
+        candidate.provider_id.trim().is_empty()
+            || candidate.provider_id.len() > 80
+            || candidate.model_id.trim().is_empty()
+            || candidate.model_id.len() > 160
+            || candidate.provider_name.len() > 100
+            || candidate.model_name.len() > 160
+            || [
+                &candidate.provider_id,
+                &candidate.model_id,
+                &candidate.provider_name,
+                &candidate.model_name,
+            ]
+            .iter()
+            .any(|value| value.chars().any(char::is_control))
+            || candidate
+                .quality_rating
+                .is_some_and(|rating| !(1..=5).contains(&rating))
+            || candidate.reasoning_efforts.len() > 8
+            || candidate
+                .reasoning_efforts
+                .iter()
+                .any(|effort| effort.len() > 40 || effort.chars().any(char::is_control))
+            || !candidate_keys.insert((candidate.provider_id.as_str(), candidate.model_id.as_str()))
+    }) {
+        return Err("Routing candidate identities or quality ratings are invalid.".into());
+    }
+    request.now_ms = usage::now_ms();
+    Ok(routing::decide(request))
 }
 
 #[derive(Debug, Deserialize)]

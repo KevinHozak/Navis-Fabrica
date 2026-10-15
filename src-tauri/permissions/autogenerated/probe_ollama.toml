@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-probe-ollama"
+description = "Enables the probe_ollama command without any pre-configured scope."
+commands.allow = ["probe_ollama"]
+
+[[permission]]
+identifier = "deny-probe-ollama"
+description = "Denies the probe_ollama command without any pre-configured scope."
+commands.deny = ["probe_ollama"]

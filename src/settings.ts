@@ -28,6 +28,7 @@ export type ProviderProfile = {
   kind: ProviderKind;
   name: string;
   executable: string;
+  endpoint: string | null;
   secretRef: string | null;
   models: ModelProfile[];
 };
@@ -75,6 +76,8 @@ export type ProviderAvailability = {
   note: string;
 };
 export type AntigravityProbe = { version: string | null; state: "ready" | "authenticationRequired" | "unavailable"; models: string[]; note: string };
+export type OllamaModel = { id: string; sizeBytes: number; contextTokens: number | null; toolsSupported: boolean; eligible: boolean; note: string };
+export type OllamaProbe = { state: "ready" | "unavailable"; endpoint: string; models: OllamaModel[]; availableMemoryBytes: number | null; note: string };
 
 export type ProjectEntry = {
   id: string;
@@ -117,11 +120,14 @@ export type GitHubIssue = GitHubIssueSummary & {
 
 export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
 export type WorkflowRun = {
-  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; state: string;
+  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; timeoutSeconds: number; state: string;
   modelId: string | null; startedAtMs: number; finishedAtMs: number | null; latencyMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
   workflow: WorkflowRunMetadata | null;
+  handoff: ProviderHandoff | null;
 };
+export type ProviderHandoff = { version: number; sourceRunId: string; targetProviderId: string; workingTreeRoot: string; workingTreePaths: string[]; workingTreeFingerprint: string | null; goal: string; scope: string; diff: string; checks: string; pendingWork: string; completedSideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null; createdAtMs: number };
+export type HandoffInput = { sourceRunId: string; targetProviderId: string; goal: string; scope: string; diff: string; checks: string; pendingWork: string };
 export type WorkflowRunMetadata = {
   action: "dev-work" | "dev-push" | "dev-build";
   operationKey: string;
@@ -134,10 +140,10 @@ export type WorkflowRunMetadata = {
   buildArtifact?: { profile: string; path: string; fileVersion: string; productVersion: string; verified: boolean; verificationMessage: string } | null;
 };
 export type CodexStartRequest = {
-  cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number;
+  cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number; handoffSourceRunId?: string | null;
   workflow?: WorkflowRunMetadata;
 };
-export type AntigravityStartRequest = { cwd: string; prompt: string; timeoutSeconds: number };
+export type AntigravityStartRequest = { cwd: string; prompt: string; timeoutSeconds: number; handoffSourceRunId?: string | null };
 export type WorkflowRunRequest = {
   executable: string; arguments: string[]; cwd: string; timeoutSeconds: number; mutating: boolean;
 };
@@ -231,6 +237,8 @@ export const inspectProviders = (profiles: ProviderProfile[]) =>
   invoke<ProviderAvailability[]>("inspect_providers", { profiles });
 export const probeAntigravityCli = (providerId: string) =>
   invoke<AntigravityProbe>("probe_antigravity_cli", { providerId });
+export const probeOllama = (providerId: string) =>
+  invoke<OllamaProbe>("probe_ollama", { providerId });
 export const listUsageSignals = () => invoke<UsageSignal[]>("list_usage_signals");
 export const recordManualUsageEstimate = (estimate: {
   category: UsageCategory;
@@ -259,6 +267,11 @@ export const startCodexWorkflowRun = (request: CodexStartRequest) =>
   invoke<WorkflowRun>("start_codex_workflow_run", { request });
 export const startAntigravityWorkflowRun = (request: AntigravityStartRequest) =>
   invoke<WorkflowRun>("start_antigravity_workflow_run", { request });
+export const createProviderHandoff = (input: HandoffInput) =>
+  invoke<ProviderHandoff>("create_provider_handoff", { input });
+export type OllamaStartRequest = { cwd: string; prompt: string; testCommand: string | null; handoffSourceRunId?: string | null };
+export const startOllamaWorkflowRun = (request: OllamaStartRequest) =>
+  invoke<WorkflowRun>("start_ollama_workflow_run", { request });
 export const respondCodexApproval = (runId: string, requestId: string, decision: string) =>
   invoke<boolean>("respond_codex_approval", { runId, requestId, decision });
 export const respondCodexUserInput = (runId: string, requestId: string, answers: Record<string, string[]>) =>

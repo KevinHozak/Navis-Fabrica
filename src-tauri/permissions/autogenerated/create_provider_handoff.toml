@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-provider-handoff"
+description = "Enables the create_provider_handoff command without any pre-configured scope."
+commands.allow = ["create_provider_handoff"]
+
+[[permission]]
+identifier = "deny-create-provider-handoff"
+description = "Denies the create_provider_handoff command without any pre-configured scope."
+commands.deny = ["create_provider_handoff"]

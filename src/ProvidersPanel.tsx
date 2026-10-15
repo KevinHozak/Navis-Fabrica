@@ -5,6 +5,7 @@ import {
   ModelProfile,
   ProviderAvailability,
   AntigravityProbe,
+  OllamaProbe,
   ProviderKind,
   ProviderProfile,
   ProviderSelection,
@@ -12,6 +13,7 @@ import {
   Settings,
   inspectProviders,
   probeAntigravityCli,
+  probeOllama,
   listUsageSignals,
   recordManualUsageEstimate,
   UsageCategory,
@@ -23,7 +25,7 @@ type SaveState = "idle" | "saving" | "saved" | "error";
 const executableDefaults: Record<ProviderKind, string> = {
   codex: "codex",
   antigravity: "agy",
-  ollama: "ollama",
+  ollama: "aider",
   custom: "",
 };
 
@@ -38,10 +40,12 @@ export function ProvidersPanel() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [availability, setAvailability] = useState<ProviderAvailability[]>([]);
   const [probes, setProbes] = useState<Record<string, AntigravityProbe>>({});
+  const [ollamaProbes, setOllamaProbes] = useState<Record<string, OllamaProbe>>({});
   const [probingId, setProbingId] = useState<string | null>(null);
   const [kind, setKind] = useState<ProviderKind>("codex");
   const [name, setName] = useState("Codex");
   const [executable, setExecutable] = useState("codex");
+  const [endpoint, setEndpoint] = useState("http://127.0.0.1:11434");
   const [secretRef, setSecretRef] = useState("");
   const [modelId, setModelId] = useState("");
   const [modelName, setModelName] = useState("");
@@ -125,6 +129,27 @@ export function ProvidersPanel() {
     } finally { setProbingId(null); }
   }
 
+  async function probeLocalOllama(providerId: string) {
+    setProbingId(providerId);
+    try {
+      const result = await probeOllama(providerId);
+      setOllamaProbes((current) => ({ ...current, [providerId]: result }));
+      if (result.state === "ready" && settings) {
+        const profile = settings.providers.find((item) => item.id === providerId);
+        if (profile?.kind === "ollama") {
+          const eligible = result.models.filter((item) => item.eligible).map((item) => ({ id: item.id, name: item.id, reasoningEfforts: [] }));
+          const providers = settings.providers.map((item) => item.id === providerId ? { ...item, models: eligible } : item);
+          const selection = settings.providerSelection.providerId === providerId && !eligible.some((item) => item.id === settings.providerSelection.modelId)
+            ? { ...settings.providerSelection, modelId: eligible[0]?.id ?? null, reasoningEffort: null }
+            : settings.providerSelection;
+          await persist({ ...settings, providers, providerSelection: selection });
+        }
+      }
+    } catch (error) {
+      setOllamaProbes((current) => ({ ...current, [providerId]: { endpoint: "", state: "unavailable", models: [], availableMemoryBytes: null, note: error instanceof Error ? error.message : String(error) } }));
+    } finally { setProbingId(null); }
+  }
+
   async function saveEstimate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const value = Number(estimateValue);
@@ -151,22 +176,23 @@ export function ProvidersPanel() {
 
   function addProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!settings || !name.trim() || !executable.trim() || !modelId.trim() || !modelName.trim()) return;
-    const model: ModelProfile = {
-      id: modelId.trim(),
-      name: modelName.trim(),
+    if (!settings || !name.trim() || !executable.trim() || (kind !== "ollama" && (!modelId.trim() || !modelName.trim()))) return;
+    const models: ModelProfile[] = modelId.trim() && modelName.trim() ? [{
+      id: modelId.trim(), name: modelName.trim(),
       reasoningEfforts: efforts.split(",").map((effort) => effort.trim()).filter(Boolean),
-    };
+    }] : [];
     const provider: ProviderProfile = {
       id: `${kind}-${crypto.randomUUID().slice(0, 8)}`,
       kind,
       name: name.trim(),
       executable: executable.trim(),
-      secretRef: kind === "antigravity" ? null : secretRef.trim() || null,
-      models: [model],
+      endpoint: kind === "ollama" ? endpoint.trim() : null,
+      secretRef: kind === "antigravity" || kind === "ollama" ? null : secretRef.trim() || null,
+      models,
     };
     const providers = [...settings.providers, provider];
-    void persist({ ...settings, providers, providerSelection: { providerId: provider.id, modelId: model.id, reasoningEffort: null, runtimeId: runtimeId.trim() || null } });
+    const selectedRuntime = kind === "ollama" ? "aider-ollama" : kind === "antigravity" ? "agy-cli" : kind === "codex" ? "codex-app-server" : runtimeId.trim() || null;
+    void persist({ ...settings, providers, providerSelection: { providerId: provider.id, modelId: models[0]?.id ?? null, reasoningEffort: null, runtimeId: selectedRuntime } });
   }
 
   function updateSelection(next: ProviderSelection) {
@@ -191,7 +217,7 @@ export function ProvidersPanel() {
           </label>
           <label className="settings-field" htmlFor="selected-model"><span>Model</span>
             <select id="selected-model" disabled={!selectedProvider} value={settings.providerSelection.modelId ?? ""} onChange={(event) => updateSelection({ ...settings.providerSelection, modelId: event.target.value || null, reasoningEffort: null })}>
-              <option value="">Choose a manual model profile</option>{selectedProvider?.models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+              <option value="">{selectedProvider?.kind === "ollama" ? "Discover and choose an eligible model" : "Choose a manual model profile"}</option>{selectedProvider?.models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
             </select>
           </label>
           <label className="settings-field" htmlFor="reasoning-effort"><span>Reasoning effort</span>
@@ -201,7 +227,7 @@ export function ProvidersPanel() {
           </label>
           <label className="settings-field" htmlFor="runtime-id"><span>Runtime ID</span>
             <input id="runtime-id" value={runtimeId} maxLength={160} placeholder="e.g. codex-cli" onChange={(event) => setRuntimeId(event.target.value)} onBlur={() => settings && void persist({ ...settings, providerSelection: { ...settings.providerSelection, runtimeId: runtimeId.trim() || null } })} />
-            <small>Stored separately from the provider and model. Choose codex-app-server or agy-cli to select the Runs adapter.</small>
+            <small>Stored separately from the provider and model. Runtime IDs include codex-app-server, agy-cli, and aider-ollama.</small>
           </label>
         </div>
         <div className="provider-feedback" role={saveState === "error" ? "alert" : "status"} aria-live="polite">{message || (desktop ? "Configuration is local to this app." : "Browser preview stores configuration in this browser.")}</div>
@@ -219,10 +245,11 @@ export function ProvidersPanel() {
                 void persist({ ...settings, providers, providerSelection: selection });
               }}>Remove</button>
             </div>
-            <p className="provider-models">Manual models: {provider.models.map((model) => `${model.name} (${model.id})`).join(", ")}</p>
+            <p className="provider-models">{provider.kind === "ollama" ? "Last discovered eligible models" : "Manual models"}: {provider.models.map((model) => `${model.name} (${model.id})`).join(", ") || "none yet"}</p>
+            {provider.kind === "ollama" && <small>Local endpoint: {provider.endpoint ?? "http://127.0.0.1:11434"}</small>}
             <div className="provider-status-grid">
               <span className={status?.executableFound ? "status-supported" : "status-unsupported"}>Executable: {status ? status.executableFound ? status.executablePath : "missing" : desktop ? "not checked" : "desktop check unavailable"}</span>
-              <span className="status-unsupported">Authentication: {provider.kind === "antigravity" ? probes[provider.id]?.state ?? "CLI sign-in not probed" : status ? status.authenticationReference === "referenceConfigured" ? "reference configured; validity unknown" : "reference missing" : provider.secretRef ? "reference configured; validity unknown" : "reference missing"}</span>
+              <span className="status-unsupported">Authentication: {provider.kind === "ollama" ? "not used (local-only)" : provider.kind === "antigravity" ? probes[provider.id]?.state ?? "CLI sign-in not probed" : status ? status.authenticationReference === "referenceConfigured" ? "reference configured; validity unknown" : "reference missing" : provider.secretRef ? "reference configured; validity unknown" : "reference missing"}</span>
             </div>
             <div className="provider-capabilities" aria-label="Provider adapter capabilities">{capabilityLabels.map(([key, label]) => {
               const support = status ? status.capabilities[key] ? "supported" : "unsupported" : desktop ? "not checked" : "desktop check unavailable";
@@ -231,6 +258,10 @@ export function ProvidersPanel() {
             {provider.kind === "antigravity" && <div className="settings-actions">
               <button className="button button-secondary" type="button" disabled={!desktop || probingId === provider.id} onClick={() => { void probeAntigravity(provider.id); }}>{probingId === provider.id ? "Probing…" : "Probe agy CLI"}</button>
               {probes[provider.id] && <div className="provider-feedback" role="status"><strong>{probes[provider.id].version ?? "Version unavailable"}</strong> · {probes[provider.id].state}: {probes[provider.id].note}{probes[provider.id].models.length > 0 && <p>Available model IDs: {probes[provider.id].models.join(", ")}</p>}</div>}
+            </div>}
+            {provider.kind === "ollama" && <div className="settings-actions">
+              <button className="button button-secondary" type="button" disabled={!desktop || probingId === provider.id} onClick={() => { void probeLocalOllama(provider.id); }}>{probingId === provider.id ? "Checking local Ollama…" : "Discover local models"}</button>
+              {ollamaProbes[provider.id] && <div className="provider-feedback" role="status"><strong>{ollamaProbes[provider.id].state}</strong> · {ollamaProbes[provider.id].note}{ollamaProbes[provider.id].availableMemoryBytes !== null && <p>Available system memory: {Math.round(ollamaProbes[provider.id].availableMemoryBytes! / 1_073_741_824)} GiB</p>}<ul>{ollamaProbes[provider.id].models.map((model) => <li key={model.id}>{model.id}: {model.eligible ? "eligible" : "unavailable"} · context {model.contextTokens ?? "unknown"} · tools {model.toolsSupported ? "supported" : "unknown"} · {model.note}</li>)}</ul></div>}
             </div>}
           </li>;
         })}</ul> : <div className="provider-empty">No provider profiles yet. Add one below to configure a manual choice.</div>}
@@ -245,16 +276,17 @@ export function ProvidersPanel() {
             setName(nextKind === "custom" ? "Custom runtime" : nextKind[0].toUpperCase() + nextKind.slice(1));
             setExecutable(executableDefaults[nextKind]);
             setEfforts(nextKind === "antigravity" ? "" : "low, medium, high");
-          }}><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="ollama">Ollama</option><option value="custom">Custom runtime</option></select></label>
+          }}><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="ollama">Ollama (local only)</option><option value="custom">Custom runtime</option></select></label>
           <label className="settings-field" htmlFor="provider-name"><span>Display name</span><input id="provider-name" maxLength={100} required value={name} onChange={(event) => setName(event.target.value)} /></label>
-          <label className="settings-field" htmlFor="provider-executable"><span>Executable name or path</span><input id="provider-executable" maxLength={260} required value={executable} onChange={(event) => setExecutable(event.target.value)} /><small>Presence checks do not execute it. Use “Probe agy CLI” on a saved Antigravity profile to check version and model sign-in status.</small></label>
-          <label className="settings-field" htmlFor="provider-secret-ref"><span>Authentication secret reference</span><input id="provider-secret-ref" maxLength={260} value={secretRef} onChange={(event) => setSecretRef(event.target.value)} placeholder={kind === "antigravity" ? "Not used by the agy adapter" : "credential-store:provider-name"} /><small>{kind === "antigravity" ? "Sign-in is managed by the installed agy CLI; do not enter a token here." : "Use credential-store:key or provider-managed:key. Never enter a token or password here."}</small></label>
+          <label className="settings-field" htmlFor="provider-executable"><span>{kind === "ollama" ? "Aider harness executable" : "Executable name or path"}</span><input id="provider-executable" maxLength={260} required value={executable} onChange={(event) => setExecutable(event.target.value)} /><small>{kind === "ollama" ? "Aider is the code-editing harness. Ollama itself is checked at the local endpoint below." : "Presence checks do not execute it. Use “Probe agy CLI” on a saved Antigravity profile to check version and model sign-in status."}</small></label>
+          {kind === "ollama" && <label className="settings-field" htmlFor="provider-endpoint"><span>Local Ollama endpoint</span><input id="provider-endpoint" maxLength={260} value={endpoint} onChange={(event) => setEndpoint(event.target.value)} /><small>Only numeric loopback addresses such as 127.0.0.1 or [::1] are accepted. Remote endpoints and credentials are rejected.</small></label>}
+          {kind !== "ollama" && <label className="settings-field" htmlFor="provider-secret-ref"><span>Authentication secret reference</span><input id="provider-secret-ref" maxLength={260} value={secretRef} onChange={(event) => setSecretRef(event.target.value)} placeholder={kind === "antigravity" ? "Not used by the agy adapter" : "credential-store:provider-name"} /><small>{kind === "antigravity" ? "Sign-in is managed by the installed agy CLI; do not enter a token here." : "Use credential-store:key or provider-managed:key. Never enter a token or password here."}</small></label>}
           <div className="provider-inline-fields">
-            <label className="settings-field" htmlFor="model-id"><span>Model ID</span><input id="model-id" maxLength={160} required value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="provider model identifier" /></label>
-            <label className="settings-field" htmlFor="model-name"><span>Model display name</span><input id="model-name" maxLength={100} required value={modelName} onChange={(event) => setModelName(event.target.value)} /></label>
+            <label className="settings-field" htmlFor="model-id"><span>Model ID</span><input id="model-id" maxLength={160} required={kind !== "ollama"} value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder={kind === "ollama" ? "Optional; discovered models are added by probe" : "provider model identifier"} /></label>
+            <label className="settings-field" htmlFor="model-name"><span>Model display name</span><input id="model-name" maxLength={100} required={kind !== "ollama"} value={modelName} onChange={(event) => setModelName(event.target.value)} /></label>
           </div>
           <label className="settings-field" htmlFor="model-efforts"><span>{kind === "antigravity" ? "Reasoning effort labels (unsupported by installed CLI)" : "Supported reasoning effort labels"}</span><input id="model-efforts" value={efforts} disabled={kind === "antigravity"} onChange={(event) => setEfforts(event.target.value)} /><small>{kind === "antigravity" ? "The installed agy CLI help does not expose an effort flag." : "Comma-separated manual labels, for example low, medium, high."}</small></label>
-          <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Codex and Antigravity headless runs are available from Runs; other provider operations remain unsupported."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
+          <div className="settings-actions"><p className={`settings-feedback ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? message : "Codex and Antigravity runs and local Ollama coding runs are available from Runs. Ollama requires a discovered tool-capable model."}</p><button className="button button-primary" type="submit" disabled={saveState === "saving"}>Add provider</button></div>
         </form>
       </section>
 

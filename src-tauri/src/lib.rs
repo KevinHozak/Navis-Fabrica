@@ -832,6 +832,42 @@ fn probe_antigravity_cli(
 }
 
 #[tauri::command]
+fn probe_ollama(app: AppHandle, provider_id: String) -> Result<providers::OllamaProbe, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    let profile = settings
+        .providers
+        .iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or("The Ollama provider profile no longer exists.")?;
+    if profile.kind != providers::ProviderKind::Ollama {
+        return Err("Choose a local Ollama provider to probe.".into());
+    }
+    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
+    Ok(providers::ollama_probe(
+        profile
+            .endpoint
+            .as_deref()
+            .unwrap_or(providers::OLLAMA_DEFAULT_ENDPOINT),
+    ))
+}
+
+#[tauri::command]
+fn create_provider_handoff(
+    app: AppHandle,
+    input: runs::HandoffInput,
+) -> Result<runs::ProviderHandoff, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    if !settings
+        .providers
+        .iter()
+        .any(|profile| profile.id == input.target_provider_id)
+    {
+        return Err("Select a configured target provider for the handoff.".into());
+    }
+    runs::create_provider_handoff(app, input)
+}
+
+#[tauri::command]
 fn start_codex_workflow_run(
     app: AppHandle,
     request: runs::CodexStartRequest,
@@ -892,6 +928,11 @@ fn start_codex_workflow_run(
     let path = std::env::var_os("PATH");
     let executable = providers::find_executable(&provider.executable, path.as_deref())
         .ok_or("The configured Codex executable is not available on PATH or at its saved path.")?;
+    let handoff = request
+        .handoff_source_run_id
+        .as_deref()
+        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .transpose()?;
     runs::start_codex_workflow_run(
         app,
         runs::CodexRunConfig {
@@ -904,6 +945,7 @@ fn start_codex_workflow_run(
             skill_path,
             timeout_seconds: request.timeout_seconds,
             workflow: request.workflow,
+            handoff,
         },
     )
 }
@@ -969,6 +1011,11 @@ fn start_antigravity_workflow_run(
     let executable = providers::find_executable(&provider.executable, path.as_deref()).ok_or(
         "The configured Antigravity executable is not available on PATH or at its saved path.",
     )?;
+    let handoff = request
+        .handoff_source_run_id
+        .as_deref()
+        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .transpose()?;
     runs::start_antigravity_workflow_run(
         app,
         runs::AntigravityRunConfig {
@@ -978,6 +1025,103 @@ fn start_antigravity_workflow_run(
             prompt: request.prompt,
             timeout_seconds: request.timeout_seconds,
         },
+        handoff,
+    )
+}
+
+#[tauri::command]
+fn start_ollama_workflow_run(
+    app: AppHandle,
+    request: runs::OllamaStartRequest,
+) -> Result<runs::RunRecord, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
+    let selection = &settings.provider_selection;
+    let provider_id = selection
+        .provider_id
+        .as_deref()
+        .ok_or("Choose a local Ollama provider in Providers first.")?;
+    let provider = settings
+        .providers
+        .iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or("The selected provider is no longer configured.")?;
+    if provider.kind != providers::ProviderKind::Ollama {
+        return Err("The selected provider is not local Ollama.".into());
+    }
+    if selection.reasoning_effort.is_some() {
+        return Err(
+            "The Aider Ollama adapter does not expose configured reasoning-effort labels.".into(),
+        );
+    }
+    if selection
+        .runtime_id
+        .as_deref()
+        .is_some_and(|runtime| !runtime.is_empty() && runtime != "aider-ollama")
+    {
+        return Err("This phase supports the Aider Ollama Chat runtime only.".into());
+    }
+    let model_id = selection
+        .model_id
+        .as_deref()
+        .ok_or("Discover local models and select a tool-capable model first.")?;
+    let endpoint_url = providers::validate_ollama_endpoint(
+        provider
+            .endpoint
+            .as_deref()
+            .unwrap_or(providers::OLLAMA_DEFAULT_ENDPOINT),
+    )?;
+    let endpoint = endpoint_url.as_str().trim_end_matches('/').to_owned();
+    let probe = providers::ollama_probe(&endpoint);
+    if probe.state != "ready" {
+        return Err(probe.note);
+    }
+    let model = probe
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or("The selected model is no longer available from local Ollama.")?;
+    if !model.eligible {
+        return Err(format!("Selected model is not eligible: {}", model.note));
+    }
+    let timeout_seconds = providers::ollama_timeout_seconds(
+        model.size_bytes,
+        probe.available_memory_bytes,
+    )
+    .ok_or(
+        "Available system memory is unknown; a hardware-aware Ollama timeout cannot be calculated.",
+    )?;
+    let path = std::env::var_os("PATH");
+    let executable = providers::find_executable(&provider.executable, path.as_deref())
+        .ok_or("The configured Aider executable is not available on PATH or at its saved path.")?;
+    let handoff = request
+        .handoff_source_run_id
+        .as_deref()
+        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .transpose()?;
+    let root = Path::new(&settings.project_root)
+        .canonicalize()
+        .map_err(|_| "The configured project root could not be resolved.".to_string())?;
+    let cwd = Path::new(&request.cwd)
+        .canonicalize()
+        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
+    if !cwd.is_dir() || !cwd.starts_with(&root) {
+        return Err(
+            "Ollama can only run in a project folder inside the configured project root.".into(),
+        );
+    }
+    runs::start_ollama_workflow_run(
+        app,
+        runs::OllamaRunConfig {
+            executable,
+            cwd,
+            endpoint,
+            model_id: model.id.clone(),
+            prompt: request.prompt,
+            test_command: request.test_command,
+            timeout_seconds,
+        },
+        handoff,
     )
 }
 
@@ -1229,8 +1373,11 @@ pub fn run() {
             save_settings,
             inspect_providers,
             probe_antigravity_cli,
+            probe_ollama,
+            create_provider_handoff,
             start_codex_workflow_run,
             start_antigravity_workflow_run,
+            start_ollama_workflow_run,
             get_cached_github_activity,
             refresh_github_activity,
             list_github_issues,

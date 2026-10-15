@@ -101,10 +101,69 @@ pub struct BuildArtifact {
     pub verification_message: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ArtifactVersionInfo {
+    file_version: String,
+    product_version: String,
+}
+
+fn read_embedded_artifact_version(path: &Path) -> Option<ArtifactVersionInfo> {
+    #[cfg(windows)]
+    {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$v = (Get-Item -LiteralPath $env:NAVIS_FABRICA_ARTIFACT).VersionInfo; @{ fileVersion = $v.FileVersion; productVersion = $v.ProductVersion } | ConvertTo-Json -Compress",
+            ])
+            .env("NAVIS_FABRICA_ARTIFACT", path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+        return Some(ArtifactVersionInfo {
+            file_version: value.get("fileVersion")?.as_str()?.to_owned(),
+            product_version: value.get("productVersion")?.as_str()?.to_owned(),
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn artifact_is_in_profile_target(root: &Path, artifact: &Path, profile: &str) -> bool {
+    let Ok(relative) = artifact.strip_prefix(root.join("src-tauri/target")) else {
+        return false;
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    let profile_matches = components
+        .first()
+        .is_some_and(|component| component.as_os_str() == profile)
+        || components
+            .get(1)
+            .is_some_and(|component| component.as_os_str() == profile);
+    profile_matches && components.len() >= 2
+}
+
 fn verify_build_artifact(
     cwd: &Path,
     workflow: &WorkflowRunMetadata,
     text: &str,
+) -> Option<BuildArtifact> {
+    verify_build_artifact_with(cwd, workflow, text, read_embedded_artifact_version)
+}
+
+fn verify_build_artifact_with(
+    cwd: &Path,
+    workflow: &WorkflowRunMetadata,
+    text: &str,
+    read_version: impl FnOnce(&Path) -> Option<ArtifactVersionInfo>,
 ) -> Option<BuildArtifact> {
     let json = text
         .lines()
@@ -125,12 +184,18 @@ fn verify_build_artifact(
     .as_str()?
     .to_owned();
     let file = fs::metadata(&resolved).ok()?;
+    let embedded_version = read_version(&resolved);
     let verified = profile == expected_profile
         && resolved.starts_with(&root)
+        && artifact_is_in_profile_target(&root, &resolved, expected_profile)
         && file.is_file()
         && file.len() > 0
-        && file_version == declared_version
-        && product_version == declared_version;
+        && embedded_version.as_ref().is_some_and(|embedded| {
+            embedded.file_version == declared_version
+                && embedded.product_version == declared_version
+                && file_version == embedded.file_version
+                && product_version == embedded.product_version
+        });
     Some(BuildArtifact {
         profile,
         path: resolved.to_string_lossy().into_owned(),
@@ -138,9 +203,9 @@ fn verify_build_artifact(
         product_version,
         verified,
         verification_message: if verified {
-            "Artifact path exists inside the project and the reported FileVersion and ProductVersion match tauri.conf.json; embedded metadata was read by the dev-build skill.".into()
+            "Artifact is under the selected profile's Tauri target directory; FileVersion and ProductVersion were read from the artifact and match both the receipt and tauri.conf.json.".into()
         } else {
-            "Artifact receipt did not match the selected profile, project path, file, or declared version.".into()
+            "Artifact receipt did not match the selected profile target path, project path, file, or embedded version metadata.".into()
         },
     })
 }
@@ -377,6 +442,24 @@ fn mutation_scope(cwd: &Path) -> String {
         .unwrap_or(cwd)
         .to_string_lossy()
         .to_lowercase()
+}
+
+fn interrupted_process_owns_scope(records: &[RunRecord], canonical_key: &str) -> bool {
+    records.iter().any(|record| {
+        record.mutating
+            && record.state == "interrupted"
+            && record.process_id.is_some_and(process_is_running)
+            && mutation_scope(Path::new(&record.cwd)) == canonical_key
+    })
+}
+
+fn build_result_is_successful(state: &str, exit_code: Option<i32>) -> bool {
+    state == "completed" && exit_code.is_none_or(|code| code == 0)
+}
+
+fn release_failed_checkpoint(state: &mut RunStore, id: &str, canonical_key: &str) {
+    state.mutating_paths.remove(canonical_key);
+    state.redaction_values.remove(id);
 }
 
 pub fn ensure_clean_git_worktree(cwd: &Path) -> Result<(), String> {
@@ -1207,7 +1290,7 @@ fn set_state(app: &AppHandle, path: &Path, id: &str, state: &str, exit_code: Opt
     if let Some(record) = store.records.iter_mut().find(|record| record.id == id) {
         record.state = state.into();
         record.exit_code = exit_code;
-        if state != "completed" || exit_code != Some(0) {
+        if !build_result_is_successful(state, exit_code) {
             if let Some(artifact) = record
                 .workflow
                 .as_mut()
@@ -2053,6 +2136,11 @@ fn start_run(
                 return Err("This exact workflow scope already has a saved run. Review its persisted output and side-effect record before starting another run.".into());
             }
         }
+        if request.mutating && interrupted_process_owns_scope(&state.records, &canonical_key) {
+            return Err(
+                "A prior interrupted workflow process is still running for this repository or worktree.".into(),
+            );
+        }
         if request.mutating && !state.mutating_paths.insert(canonical_key.clone()) {
             return Err(
                 "A mutating workflow is already active for this repository or worktree.".into(),
@@ -2100,6 +2188,9 @@ fn start_run(
     });
     if !process_saved {
         terminate_process_tree(&mut child);
+        if let Ok(mut state) = store().lock() {
+            release_failed_checkpoint(&mut state, &id, &canonical_key);
+        }
         set_state(&app, &path, &id, "failed", None);
         return Err(
             "Could not persist the run process checkpoint; the process was stopped.".into(),
@@ -2604,6 +2695,10 @@ mod tests {
         let restored = load_records(&path).unwrap();
         assert_eq!(restored[0].state, record.state);
         assert_eq!(restored[0].process_id, Some(std::process::id()));
+        assert!(interrupted_process_owns_scope(
+            &restored,
+            &mutation_scope(directory.path())
+        ));
         assert!(restored[0].finished_at_ms.is_some());
         assert!(workflow_key_recorded(&restored, &"a".repeat(64)));
         assert_eq!(
@@ -2714,7 +2809,7 @@ mod tests {
             r#"{"version":"1.2.3"}"#,
         )
         .unwrap();
-        let artifact_path = fixture.path().join("target/release/app.exe");
+        let artifact_path = fixture.path().join("src-tauri/target/release/app.exe");
         fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         fs::write(&artifact_path, b"fixture artifact").unwrap();
         let workflow = WorkflowRunMetadata {
@@ -2747,17 +2842,85 @@ mod tests {
         );
         assert!(artifact_path.canonicalize().is_ok());
         assert!(fixture.path().join("src-tauri/tauri.conf.json").exists());
-        let receipt = verify_build_artifact(fixture.path(), &workflow, &marker).unwrap();
+        let receipt = verify_build_artifact_with(fixture.path(), &workflow, &marker, |_| {
+            Some(ArtifactVersionInfo {
+                file_version: "1.2.3".into(),
+                product_version: "1.2.3".into(),
+            })
+        })
+        .unwrap();
         assert!(receipt.verified);
         assert!(receipt
             .verification_message
-            .contains("FileVersion and ProductVersion match"));
+            .contains("read from the artifact"));
         let mismatch = marker.replace("1.2.3", "9.9.9");
         assert!(
-            !verify_build_artifact(fixture.path(), &workflow, &mismatch)
-                .unwrap()
-                .verified
+            !verify_build_artifact_with(fixture.path(), &workflow, &mismatch, |_| {
+                Some(ArtifactVersionInfo {
+                    file_version: "1.2.3".into(),
+                    product_version: "1.2.3".into(),
+                })
+            })
+            .unwrap()
+            .verified
         );
+        assert!(
+            !verify_build_artifact_with(fixture.path(), &workflow, &marker, |_| {
+                Some(ArtifactVersionInfo {
+                    file_version: "9.9.9".into(),
+                    product_version: "9.9.9".into(),
+                })
+            })
+            .unwrap()
+            .verified
+        );
+        assert!(!artifact_is_in_profile_target(
+            fixture.path(),
+            &artifact_path.canonicalize().unwrap(),
+            "debug"
+        ));
+    }
+
+    #[test]
+    fn completed_codex_builds_without_process_exit_code_remain_successful() {
+        assert!(build_result_is_successful("completed", None));
+        assert!(build_result_is_successful("completed", Some(0)));
+        assert!(!build_result_is_successful("completed", Some(1)));
+        assert!(!build_result_is_successful("failed", None));
+    }
+
+    #[test]
+    fn failed_checkpoint_releases_mutation_scope_and_run_redaction_state() {
+        let mut state = RunStore::default();
+        state.mutating_paths.insert("project".into());
+        state
+            .redaction_values
+            .insert("run-1".into(), vec!["secret".into()]);
+
+        release_failed_checkpoint(&mut state, "run-1", "project");
+
+        assert!(!state.mutating_paths.contains("project"));
+        assert!(!state.redaction_values.contains_key("run-1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn embedded_artifact_version_reader_reads_windows_executable_metadata() {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-Process -Id $PID).Path",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let powershell = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        let version = read_embedded_artifact_version(&powershell).unwrap();
+        assert!(!version.file_version.is_empty());
+        assert!(!version.product_version.is_empty());
     }
 
     #[test]

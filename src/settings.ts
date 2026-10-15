@@ -117,19 +117,21 @@ export type GitHubIssue = GitHubIssueSummary & {
 
 export type WorkflowRunEvent = { sequence: number; timestampMs: number; kind: string; text: string };
 export type WorkflowRun = {
-  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; mutating: boolean; state: string;
+  id: string; executable: string; provider: string | null; cwd: string; threadId: string | null; processId: number | null; mutating: boolean; state: string;
   modelId: string | null; startedAtMs: number; finishedAtMs: number | null; latencyMs: number | null; exitCode: number | null;
   nextSequence: number; events: WorkflowRunEvent[];
   workflow: WorkflowRunMetadata | null;
 };
 export type WorkflowRunMetadata = {
-  action: "dev-work" | "dev-push";
+  action: "dev-work" | "dev-push" | "dev-build";
   operationKey: string;
   intent: string;
+  buildProfile?: "release" | "debug";
   issueUrl: string | null;
   scopePaths: string[];
   requestedEffects: ("commit" | "push" | "createPullRequest")[];
   sideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null;
+  buildArtifact?: { profile: string; path: string; fileVersion: string; productVersion: string; verified: boolean; verificationMessage: string } | null;
 };
 export type CodexStartRequest = {
   cwd: string; prompt: string; skillId: string | null; timeoutSeconds: number;

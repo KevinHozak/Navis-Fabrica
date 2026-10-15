@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
@@ -21,7 +21,7 @@ pub struct ScanOptions {
     pub exclusions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectEntry {
     pub id: String,
@@ -34,7 +34,7 @@ pub struct ProjectEntry {
     pub workflow_prerequisites: Vec<WorkflowPrerequisite>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitFacts {
     /// available, detached, unborn, unsafeOwnership, gitUnavailable, notRepository, or error
@@ -46,14 +46,14 @@ pub struct GitFacts {
     pub upstream: UpstreamDivergence,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatestCommit {
     pub short_hash: String,
     pub subject: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitRemote {
     pub name: String,
@@ -61,7 +61,7 @@ pub struct GitRemote {
     pub github: Option<GitHubRepository>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubRepository {
     pub owner: String,
@@ -69,7 +69,7 @@ pub struct GitHubRepository {
     pub canonical_url: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpstreamDivergence {
     /// tracking, noUpstream, or unavailable
@@ -78,7 +78,7 @@ pub struct UpstreamDivergence {
     pub behind: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowPrerequisite {
     pub name: String,
@@ -931,7 +931,7 @@ fn terminate_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn sanitize_remote(value: &str) -> String {
+pub fn sanitize_remote(value: &str) -> String {
     let without_credentials = if let Some((scheme, rest)) = value.split_once("://") {
         let authority_end = rest.find('/').unwrap_or(rest.len());
         let (authority, suffix) = rest.split_at(authority_end);

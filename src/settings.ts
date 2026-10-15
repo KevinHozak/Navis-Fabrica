@@ -263,6 +263,8 @@ function validatePreviewSecretReferences(providers: ProviderProfile[]): void {
 
 export const isDesktopApp = () => isTauri();
 
+export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
+
 export const startProjectScan = (scanId: string, forceRefresh: boolean) =>
   invoke<void>("start_project_scan", { scanId, forceRefresh });
 

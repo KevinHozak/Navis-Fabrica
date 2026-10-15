@@ -24,7 +24,7 @@ fn default_capability_is_scoped_to_registered_commands() {
         .filter(|permission| !event_permissions.contains(permission))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(app_permissions.len(), 33);
+    assert_eq!(app_permissions.len(), 34);
     assert_eq!(
         permissions
             .iter()

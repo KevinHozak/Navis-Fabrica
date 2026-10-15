@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
 
 mod github;
+mod inventory;
 mod process;
 pub mod providers;
 mod routing;
@@ -25,6 +26,7 @@ static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLoc
 static PROJECT_FACT_CACHE: OnceLock<Mutex<HashMap<String, scanner::ProjectEntry>>> =
     OnceLock::new();
 static PROJECT_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static PROJECT_CACHE_RESTORED: AtomicBool = AtomicBool::new(false);
 static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
 static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
     OnceLock::new();
@@ -318,6 +320,7 @@ fn store_openrouter_credential(target: &str, secret: &str) -> Result<(), String>
 
 const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const SETTINGS_FILE: &str = "settings.json";
+const PROJECT_INVENTORY_FILE: &str = "project-inventory.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -665,6 +668,23 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map_err(|error| format!("Could not locate app settings folder: {error}"))?;
     Ok(folder.join(SETTINGS_FILE))
+}
+
+fn project_inventory_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let folder = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("Could not locate project inventory folder: {error}"))?;
+    Ok(folder.join(PROJECT_INVENTORY_FILE))
+}
+
+#[tauri::command]
+fn get_project_inventory(app: AppHandle) -> Result<Vec<scanner::ProjectEntry>, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    Ok(inventory::load(
+        &project_inventory_path(&app)?,
+        &settings.project_root,
+    ))
 }
 
 #[tauri::command]
@@ -1324,12 +1344,30 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
         return Err("The scan identifier is invalid.".into());
     }
     let settings = load_settings(&settings_path(&app)?)?;
+    let inventory_path = project_inventory_path(&app)?;
+    let prior_inventory = inventory::load(&inventory_path, &settings.project_root);
     if force_refresh {
+        PROJECT_CACHE_RESTORED.store(true, Ordering::Release);
         PROJECT_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed);
         project_fact_cache()
             .lock()
             .map_err(|_| "Could not access cached project facts.".to_string())?
             .clear();
+    } else if !PROJECT_CACHE_RESTORED.swap(true, Ordering::AcqRel) {
+        if !prior_inventory.is_empty() {
+            let mut cache = project_fact_cache()
+                .lock()
+                .map_err(|_| "Could not access cached project facts.".to_string())?;
+            if cache.is_empty() {
+                cache.extend(
+                    prior_inventory
+                        .iter()
+                        .cloned()
+                        .into_iter()
+                        .map(|project| (project.id.clone(), project)),
+                );
+            }
+        }
     }
     let cancellation = Arc::new(AtomicBool::new(false));
     {
@@ -1348,12 +1386,13 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
             include_hidden: settings.preferences.include_hidden,
             exclusions: settings.exclusions,
         };
+        let prior_inventory = prior_inventory;
         let cache_epoch = PROJECT_CACHE_EPOCH.load(Ordering::Relaxed);
         let cached_projects = project_fact_cache()
             .lock()
             .map(|cache| cache.clone())
             .unwrap_or_default();
-        let result = scanner::scan(
+        let mut result = scanner::scan(
             &scan_id,
             Path::new(&settings.project_root),
             &options,
@@ -1368,9 +1407,26 @@ fn start_project_scan(app: AppHandle, scan_id: String, force_refresh: bool) -> R
                 if PROJECT_CACHE_EPOCH.load(Ordering::Relaxed) == cache_epoch {
                     if result.errors.is_empty() {
                         cache.clear();
+                    } else {
+                        for project in prior_inventory {
+                            cache.entry(project.id.clone()).or_insert(project);
+                        }
                     }
                     for project in &result.projects {
                         cache.insert(project.id.clone(), project.clone());
+                    }
+                    if !result.errors.is_empty() {
+                        result.projects = cache.values().cloned().collect();
+                        result.projects.sort_by_key(|project| {
+                            (project.name.to_lowercase(), project.path.to_lowercase())
+                        });
+                    }
+                    if let Err(error) =
+                        inventory::save(&inventory_path, &settings.project_root, &result.projects)
+                    {
+                        if result.errors.len() < 501 {
+                            result.errors.push(error);
+                        }
                     }
                 }
             }
@@ -1574,6 +1630,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            get_project_inventory,
             discover_workflow_skills,
             save_settings,
             inspect_providers,

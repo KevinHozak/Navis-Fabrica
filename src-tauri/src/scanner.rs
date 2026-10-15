@@ -981,7 +981,7 @@ fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
     } else {
         return None;
     };
-    if !domain.eq_ignore_ascii_case("github.com") {
+    if !is_github_authority(domain) {
         return None;
     }
     let path = path
@@ -1009,6 +1009,24 @@ fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
         repository: repository.to_owned(),
         canonical_url: format!("https://github.com/{owner}/{repository}"),
     })
+}
+
+fn is_github_authority(authority: &str) -> bool {
+    let Some(host_port) = authority.rsplit('@').next() else {
+        return false;
+    };
+    let host = if let Some((host, port)) = host_port.rsplit_once(':') {
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return false;
+        }
+        host
+    } else {
+        host_port
+    };
+    host.eq_ignore_ascii_case("github.com")
 }
 
 fn push_error(errors: &mut Vec<String>, message: String) {
@@ -1142,6 +1160,8 @@ mod tests {
             "https://github.com/Owner/Repo.git",
             "ssh://git@github.com/Owner/Repo.git",
             "git@github.com:Owner/Repo.git",
+            "https://github.com:443/Owner/Repo.git",
+            "ssh://git@github.com:22/Owner/Repo.git",
         ] {
             let repository = parse_github_remote(input).unwrap();
             assert_eq!(repository.owner, "Owner");
@@ -1152,6 +1172,9 @@ mod tests {
             "https://github.com.evil.test/Owner/Repo.git",
             "https://evilgithub.com/Owner/Repo.git",
             "https://www.github.com/Owner/Repo.git",
+            "https://github.com:invalid/Owner/Repo.git",
+            "https://github.com:65536/Owner/Repo.git",
+            "ssh://git@github.com:22.evil.test/Owner/Repo.git",
         ] {
             assert!(parse_github_remote(input).is_none(), "{input}");
         }
@@ -1510,9 +1533,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn duplicate_aliases_are_deduplicated() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let project = root.path().join("project");
         fs::create_dir_all(&project).unwrap();
+        init_github_repo(&project, "https://github.com/owner/repo.git");
         fs::write(project.join("package.json"), "{}").unwrap();
         std::os::unix::fs::symlink(&project, root.path().join("alias")).unwrap();
         let result = scan_fixture(root.path(), 2);

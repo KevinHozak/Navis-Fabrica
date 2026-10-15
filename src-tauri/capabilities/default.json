@@ -32,6 +32,7 @@
     "allow-respond-codex-user-input",
     "allow-list-usage-signals",
     "allow-record-manual-usage-estimate",
+    "allow-evaluate-routing",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

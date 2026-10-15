@@ -234,6 +234,12 @@ pub struct ModelProfile {
     pub id: String,
     pub name: String,
     pub reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+    #[serde(default)]
+    pub quality_rating: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1151,6 +1157,20 @@ pub fn validate_profiles(
                     "Reasoning effort options must be valid and limited to eight per model.".into(),
                 );
             }
+            if model
+                .quality_rating
+                .is_some_and(|rating| !(1..=5).contains(&rating))
+            {
+                return Err("Model quality ratings must be from 1 to 5.".into());
+            }
+            if model
+                .context_window_tokens
+                .is_some_and(|tokens| tokens == 0 || tokens > 10_000_000)
+            {
+                return Err(
+                    "Model context windows must be between 1 and 10,000,000 tokens.".into(),
+                );
+            }
         }
     }
     if let Some(provider_id) = &selection.provider_id {
@@ -1212,8 +1232,24 @@ mod tests {
                 id: "model-a".into(),
                 name: "Model A".into(),
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                context_window_tokens: None,
+                supports_tools: None,
+                quality_rating: None,
             }],
         }
+    }
+
+    #[test]
+    fn old_model_settings_default_to_unknown_routing_metadata() {
+        let model: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "legacy-model",
+            "name": "Legacy model",
+            "reasoningEfforts": ["high"]
+        }))
+        .unwrap();
+        assert_eq!(model.context_window_tokens, None);
+        assert_eq!(model.supports_tools, None);
+        assert_eq!(model.quality_rating, None);
     }
 
     #[test]
@@ -1583,6 +1619,9 @@ mod tests {
                 id: format!("model-{index}"),
                 name: format!("Model {index}"),
                 reasoning_efforts: Vec::new(),
+                context_window_tokens: None,
+                supports_tools: None,
+                quality_rating: None,
             })
             .collect();
         let mut provider = profile();
@@ -1596,6 +1635,9 @@ mod tests {
             id: "model-over-limit".into(),
             name: "Model over limit".into(),
             reasoning_efforts: Vec::new(),
+            context_window_tokens: None,
+            supports_tools: None,
+            quality_rating: None,
         });
         assert!(validate_profiles(&[provider], &ProviderSelection::default()).is_err());
     }

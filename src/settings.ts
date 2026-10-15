@@ -22,7 +22,7 @@ export type GitHubAccount = { id: string; login: string; credentialRef: string |
 export type SettingsInput = Omit<Settings, "schemaVersion">;
 
 export type ProviderKind = "codex" | "antigravity" | "ollama" | "openRouter" | "custom";
-export type ModelProfile = { id: string; name: string; reasoningEfforts: string[] };
+export type ModelProfile = { id: string; name: string; reasoningEfforts: string[]; contextWindowTokens?: number | null; supportsTools?: boolean | null; qualityRating?: number | null };
 export type ProviderProfile = {
   id: string;
   kind: ProviderKind;
@@ -55,6 +55,18 @@ export type UsageSignal = {
   confidence: string;
   status: "available" | "estimated" | "unknown" | "stale" | "unavailable" | "rateLimited";
   note: string | null;
+};
+export type RoutingComplexity = "simple" | "standard" | "complex";
+export type RoutingPace = "fast" | "balanced" | "thorough" | "economy";
+export type RoutingCandidate = {
+  providerId: string; telemetryProviderId: string; providerName: string; modelId: string; modelName: string; isLocal: boolean;
+  contextTokens: number | null; supportsTools: boolean | null; reasoningEfforts: string[];
+  qualityRating: number | null; latencyMs: number | null; latencyCollectedAtMs: number | null;
+};
+export type RoutingDecision = {
+  selectedProviderId: string | null; selectedModelId: string | null; requiredContextTokens: number;
+  desiredCompletionNote: string;
+  candidates: { providerId: string; providerName: string; modelId: string; modelName: string; eligible: boolean; selected: boolean; reasons: string[] }[];
 };
 export type ProviderAvailability = {
   providerId: string;
@@ -253,6 +265,11 @@ export const recordManualUsageEstimate = (estimate: {
   windowDurationSeconds: number | null;
   resetAtMs: number | null;
 }) => invoke<UsageSignal[]>("record_manual_usage_estimate", { estimate });
+export const evaluateRouting = (request: {
+  complexity: RoutingComplexity; pace: RoutingPace; requireTools: boolean; localOnly: boolean;
+  desiredCompletionMinutes: number | null; manualProviderId: string | null; manualModelId: string | null;
+  candidates: RoutingCandidate[]; usageSignals: UsageSignal[]; nowMs: number;
+}) => invoke<RoutingDecision>("evaluate_routing", { request });
 
 export const getCachedGitHubActivity = (owner: string, repository: string) =>
   invoke<GitHubActivity>("get_cached_github_activity", { owner, repository });

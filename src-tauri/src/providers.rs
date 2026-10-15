@@ -142,14 +142,17 @@ where
     };
     match request(key) {
         Ok(value) => {
-            let model_available = value
+            let catalog_is_valid = value
                 .get("models")
                 .and_then(Value::as_array)
-                .is_some_and(|models| models.iter().any(|item| item.get("name").and_then(Value::as_str) == Some(TYPESAFE_JEV_MODEL)));
-            if model_available {
-                result("healthy", "TypeSafe is reachable and the pinned Jev model is available.")
+                .is_some();
+            if catalog_is_valid {
+                result(
+                    "healthy",
+                    "TypeSafe is reachable. The configured Jev version is pinned; versioned IDs may not appear in this alias catalog.",
+                )
             } else {
-                result("unavailable", "TypeSafe did not report the pinned Jev model for this account.")
+                result("unavailable", "TypeSafe returned an invalid model catalog response.")
             }
         }
         Err(401 | 403) => result("authenticationFailed", "TypeSafe rejected the saved API key. Check its validity and access."),
@@ -1858,7 +1861,7 @@ mod tests {
             Some("ts_live_example"),
             |key| {
                 assert_eq!(key, "ts_live_example");
-                Ok(json!({"models":[{"name":"jev-1.14.0"}]}))
+                Ok(json!({"models":[{"name":"jev-latest"}]}))
             },
         );
         assert_eq!(healthy.state, "healthy");
@@ -1889,13 +1892,13 @@ mod tests {
         );
         assert_eq!(malformed.state, "unavailable");
         assert!(!malformed.note.contains("ts_live_example"));
-        let unavailable_model = typesafe_probe_with(
+        let malformed_catalog = typesafe_probe_with(
             true,
             profile_id,
             Some(reference),
             Some("ts_live_example"),
-            |_| Ok(json!({"models":[{"name":"jev-latest"}]})),
+            |_| Ok(json!({"error":"invalid catalog"})),
         );
-        assert_eq!(unavailable_model.state, "unavailable");
+        assert_eq!(malformed_catalog.state, "unavailable");
     }
 }

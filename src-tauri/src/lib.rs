@@ -989,7 +989,9 @@ fn start_openrouter_workflow_run(
     let handoff = request
         .handoff_source_run_id
         .as_deref()
-        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .map(|source_id| {
+            runs::saved_provider_handoff(&app, source_id, provider_id, model_id, false)
+        })
         .transpose()?;
     let root = Path::new(&settings.project_root)
         .canonicalize()
@@ -1098,7 +1100,9 @@ fn start_codex_workflow_run(
     let handoff = request
         .handoff_source_run_id
         .as_deref()
-        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .map(|source_id| {
+            runs::saved_provider_handoff(&app, source_id, provider_id, &model.id, false)
+        })
         .transpose()?;
     runs::start_codex_workflow_run(
         app,
@@ -1181,7 +1185,9 @@ fn start_antigravity_workflow_run(
     let handoff = request
         .handoff_source_run_id
         .as_deref()
-        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .map(|source_id| {
+            runs::saved_provider_handoff(&app, source_id, provider_id, &model.id, false)
+        })
         .transpose()?;
     runs::start_antigravity_workflow_run(
         app,
@@ -1264,7 +1270,9 @@ fn start_ollama_workflow_run(
     let handoff = request
         .handoff_source_run_id
         .as_deref()
-        .map(|source_id| runs::saved_provider_handoff(&app, source_id, provider_id))
+        .map(|source_id| {
+            runs::saved_provider_handoff(&app, source_id, provider_id, &model.id, true)
+        })
         .transpose()?;
     let root = Path::new(&settings.project_root)
         .canonicalize()
@@ -1563,7 +1571,9 @@ pub fn run() {
             runs::respond_codex_user_input,
             list_usage_signals,
             record_manual_usage_estimate,
-            evaluate_routing
+            evaluate_routing,
+            evaluate_provider_fallback,
+            calibrate_routing
         ])
         .run(tauri::generate_context!())
         .expect("error while running Navis-Fabrica");
@@ -1618,6 +1628,91 @@ fn evaluate_routing(mut request: routing::Request) -> Result<routing::Decision, 
     }
     request.now_ms = usage::now_ms();
     Ok(routing::decide(request))
+}
+
+#[tauri::command]
+fn evaluate_provider_fallback(
+    app: AppHandle,
+    mut request: routing::FallbackRequest,
+) -> Result<routing::FallbackDecision, String> {
+    if request.routing.candidates.is_empty()
+        || request.routing.candidates.len() > 200
+        || request.routing.usage_signals.len() > 500
+        || request
+            .routing
+            .desired_completion_minutes
+            .is_some_and(|minutes| !(1..=1_440).contains(&minutes))
+    {
+        return Err("Fallback routing requires between one and 200 candidates and no more than 500 usage signals.".into());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let mut candidate_keys = std::collections::HashSet::new();
+    for candidate in &mut request.routing.candidates {
+        let profile = settings
+            .providers
+            .iter()
+            .find(|profile| profile.id == candidate.provider_id)
+            .ok_or("Fallback candidates must be configured provider profiles.")?;
+        if !profile
+            .models
+            .iter()
+            .any(|model| model.id == candidate.model_id)
+            || profile.kind.telemetry_id() != candidate.telemetry_provider_id
+            || candidate.provider_id.len() > 80
+            || candidate.model_id.len() > 160
+            || candidate.provider_name.len() > 100
+            || candidate.model_name.len() > 160
+            || candidate
+                .quality_rating
+                .is_some_and(|rating| !(1..=5).contains(&rating))
+            || candidate.reasoning_efforts.len() > 8
+            || candidate
+                .reasoning_efforts
+                .iter()
+                .any(|effort| effort.len() > 40 || effort.chars().any(char::is_control))
+            || [
+                &candidate.provider_id,
+                &candidate.telemetry_provider_id,
+                &candidate.model_id,
+                &candidate.provider_name,
+                &candidate.model_name,
+            ]
+            .iter()
+            .any(|value| value.chars().any(char::is_control))
+            || !candidate_keys.insert((candidate.provider_id.as_str(), candidate.model_id.as_str()))
+        {
+            return Err(
+                "Fallback candidate identities must match configured provider models.".into(),
+            );
+        }
+        candidate.is_local = profile.kind == providers::ProviderKind::Ollama;
+    }
+    request.routing.usage_signals =
+        usage::list_signals(&runs::history_path(&app)?, usage::now_ms())?;
+    request.routing.now_ms = usage::now_ms();
+    runs::evaluate_provider_fallback(&app, request)
+}
+
+#[tauri::command]
+fn calibrate_routing(
+    samples: Vec<routing::CalibrationSample>,
+) -> Result<Vec<routing::CalibrationSummary>, String> {
+    if samples.len() > 2_000
+        || samples.iter().any(|sample| {
+            sample.provider_id.trim().is_empty()
+                || sample.provider_id.len() > 80
+                || sample.model_id.trim().is_empty()
+                || sample.model_id.len() > 160
+                || sample.provider_id.chars().any(char::is_control)
+                || sample.model_id.chars().any(char::is_control)
+                || sample
+                    .measured_usage
+                    .is_some_and(|value| !value.is_finite() || value < 0.0)
+        })
+    {
+        return Err("Calibration accepts up to 2,000 valid local run samples.".into());
+    }
+    Ok(routing::calibrate(samples))
 }
 
 #[derive(Debug, Deserialize)]

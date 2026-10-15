@@ -1,5 +1,6 @@
 use crate::usage::{UsageCategory, UsageSignal, UsageStatus};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 const SIMPLE_CONTEXT_TOKENS: u64 = 8_192;
 const STANDARD_CONTEXT_TOKENS: u64 = 16_384;
@@ -85,6 +86,308 @@ pub struct Decision {
     pub required_context_tokens: u64,
     pub desired_completion_note: String,
     pub candidates: Vec<CandidateDecision>,
+}
+
+pub const FALLBACK_POLICY_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FallbackTrigger {
+    ProviderFailure,
+    QuotaBoundary,
+    QuotaUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FallbackPolicy {
+    pub enabled: bool,
+    pub on_provider_failure: bool,
+    pub on_quota_boundary: bool,
+    pub local_only: bool,
+    pub max_handoffs: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FallbackRequest {
+    pub source_run_id: String,
+    pub policy: FallbackPolicy,
+    pub trigger: FallbackTrigger,
+    pub current_provider_id: String,
+    pub visited_provider_ids: Vec<String>,
+    pub handoff_count: u8,
+    pub source_run_terminal: bool,
+    pub safe_checkpoint_ref: Option<String>,
+    pub effects_reconciled: bool,
+    pub routing: Request,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackDecision {
+    pub policy_version: u32,
+    pub accepted: bool,
+    pub local_only: bool,
+    pub source_run_id: String,
+    pub trigger: FallbackTrigger,
+    pub source_provider_id: String,
+    pub target_provider_id: Option<String>,
+    pub target_model_id: Option<String>,
+    pub checkpoint_ref: Option<String>,
+    pub handoff_count: u8,
+    pub reason: String,
+    pub routing: Option<Decision>,
+}
+
+fn denied_fallback(request: &FallbackRequest, reason: impl Into<String>) -> FallbackDecision {
+    FallbackDecision {
+        policy_version: FALLBACK_POLICY_VERSION,
+        accepted: false,
+        local_only: request.policy.local_only,
+        source_run_id: request.source_run_id.clone(),
+        trigger: request.trigger,
+        source_provider_id: request.current_provider_id.clone(),
+        target_provider_id: None,
+        target_model_id: None,
+        checkpoint_ref: request.safe_checkpoint_ref.clone(),
+        handoff_count: request.handoff_count,
+        reason: reason.into(),
+        routing: None,
+    }
+}
+
+/// Propose one bounded provider fallback. This is a decision only: the caller
+/// must show it to the user and require an explicit start action.
+pub fn evaluate_fallback(mut request: FallbackRequest) -> FallbackDecision {
+    if !request.policy.enabled {
+        return denied_fallback(&request, "Provider fallback is disabled by policy.");
+    }
+    let trigger_enabled = match request.trigger {
+        FallbackTrigger::ProviderFailure => request.policy.on_provider_failure,
+        FallbackTrigger::QuotaBoundary => request.policy.on_quota_boundary,
+        FallbackTrigger::QuotaUnknown => false,
+    };
+    if !trigger_enabled {
+        return denied_fallback(
+            &request,
+            "This failure or quota state is not an enabled fallback boundary; unknown quota never triggers fallback.",
+        );
+    }
+    if request.policy.max_handoffs == 0 || request.policy.max_handoffs > 3 {
+        return denied_fallback(
+            &request,
+            "Fallback policy must allow between one and three handoffs.",
+        );
+    }
+    if request.handoff_count >= request.policy.max_handoffs {
+        return denied_fallback(
+            &request,
+            "The configured fallback handoff limit has been reached.",
+        );
+    }
+    let Some(checkpoint_ref) = request.safe_checkpoint_ref.as_deref() else {
+        return denied_fallback(&request, "No safe provider checkpoint is available.");
+    };
+    if !request.source_run_terminal
+        || checkpoint_ref.trim().is_empty()
+        || checkpoint_ref.len() > 256
+        || checkpoint_ref.chars().any(char::is_control)
+    {
+        return denied_fallback(
+            &request,
+            "Fallback requires a terminal run and a valid safe checkpoint.",
+        );
+    }
+    if !request.effects_reconciled {
+        return denied_fallback(&request, "Completed external effects have not been reconciled; fallback is paused to prevent duplicates.");
+    }
+    if request.source_run_id.trim().is_empty()
+        || request.source_run_id.len() > 100
+        || request.current_provider_id.trim().is_empty()
+        || request.current_provider_id.len() > 80
+        || request.visited_provider_ids.len() > 16
+    {
+        return denied_fallback(&request, "Fallback route history is invalid.");
+    }
+    if request.routing.manual_provider_id.is_some() != request.routing.manual_model_id.is_some() {
+        return denied_fallback(
+            &request,
+            "A manual fallback override must include both provider and model.",
+        );
+    }
+    let mut visited = request
+        .visited_provider_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    visited.insert(request.current_provider_id.clone());
+    request
+        .routing
+        .candidates
+        .retain(|candidate| !visited.contains(&candidate.provider_id));
+    request.routing.local_only |= request.policy.local_only;
+    let routing = decide(request.routing.clone());
+    if let (Some(provider), Some(model)) = (
+        request.routing.manual_provider_id.as_deref(),
+        request.routing.manual_model_id.as_deref(),
+    ) {
+        if !routing.candidates.iter().any(|candidate| {
+            candidate.provider_id == provider && candidate.model_id == model && candidate.eligible
+        }) {
+            return FallbackDecision {
+                routing: Some(routing),
+                ..denied_fallback(
+                    &request,
+                    "The manual fallback override is not eligible or has already appeared in route history.",
+                )
+            };
+        }
+    }
+    let Some(provider_id) = routing.selected_provider_id.clone() else {
+        return FallbackDecision {
+            routing: Some(routing),
+            ..denied_fallback(
+                &request,
+                "No eligible unvisited provider is available for this fallback.",
+            )
+        };
+    };
+    let model_id = routing.selected_model_id.clone();
+    FallbackDecision {
+        policy_version: FALLBACK_POLICY_VERSION,
+        accepted: true,
+        local_only: request.policy.local_only,
+        source_run_id: request.source_run_id,
+        trigger: request.trigger,
+        source_provider_id: request.current_provider_id,
+        target_provider_id: Some(provider_id),
+        target_model_id: model_id,
+        checkpoint_ref: Some(checkpoint_ref.to_owned()),
+        handoff_count: request.handoff_count.saturating_add(1),
+        reason: "Fallback is eligible at this configured terminal checkpoint. Review the target and confirm before starting the handoff.".into(),
+        routing: Some(routing),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CalibrationSample {
+    pub provider_id: String,
+    pub model_id: String,
+    pub succeeded: bool,
+    pub latency_ms: Option<u128>,
+    pub measured_usage: Option<f64>,
+    pub usage_unit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSummary {
+    pub provider_id: String,
+    pub model_id: String,
+    pub sample_count: usize,
+    pub success_rate: f64,
+    pub median_latency_ms: Option<u128>,
+    pub measured_usage_by_unit: Vec<CalibrationUsageSummary>,
+    pub unknown_usage_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationUsageSummary {
+    pub unit: String,
+    pub sample_count: usize,
+    pub median_value: f64,
+}
+
+pub fn has_confirmed_quota_boundary(request: &Request, provider_id: &str) -> bool {
+    request.usage_signals.iter().any(|signal| {
+        signal.category == UsageCategory::SubscriptionWindow
+            && signal.status == UsageStatus::Available
+            && signal.confidence == "measured"
+            && signal
+                .provider_id
+                .as_deref()
+                .is_some_and(|id| id == provider_id)
+            && signal.unit == "% used"
+            && signal
+                .value
+                .is_some_and(|value| value.is_finite() && value >= 100.0)
+            && signal.collected_at_ms <= request.now_ms
+            && request.now_ms.saturating_sub(signal.collected_at_ms)
+                <= max_age_ms(UsageCategory::SubscriptionWindow)
+            && signal
+                .reset_at_ms
+                .is_none_or(|reset_at| reset_at > request.now_ms)
+    })
+}
+
+pub fn calibrate(samples: Vec<CalibrationSample>) -> Vec<CalibrationSummary> {
+    let mut groups = std::collections::BTreeMap::<(String, String), Vec<CalibrationSample>>::new();
+    for sample in samples.into_iter().filter(|sample| {
+        !sample.provider_id.trim().is_empty()
+            && !sample.model_id.trim().is_empty()
+            && sample.measured_usage.is_none_or(|value| {
+                value.is_finite()
+                    && value >= 0.0
+                    && sample.usage_unit.as_deref().is_some_and(|unit| {
+                        !unit.trim().is_empty()
+                            && unit.len() <= 40
+                            && !unit.chars().any(char::is_control)
+                    })
+            })
+    }) {
+        groups
+            .entry((sample.provider_id.clone(), sample.model_id.clone()))
+            .or_default()
+            .push(sample);
+    }
+    groups
+        .into_iter()
+        .map(|((provider_id, model_id), group)| {
+            let mut latencies = group
+                .iter()
+                .filter_map(|sample| sample.latency_ms)
+                .collect::<Vec<_>>();
+            latencies.sort_unstable();
+            let median_latency_ms =
+                (!latencies.is_empty()).then(|| latencies[(latencies.len() - 1) / 2]);
+            let mut usage_by_unit = std::collections::BTreeMap::<String, Vec<f64>>::new();
+            for sample in &group {
+                if let (Some(value), Some(unit)) =
+                    (sample.measured_usage, sample.usage_unit.as_ref())
+                {
+                    usage_by_unit.entry(unit.clone()).or_default().push(value);
+                }
+            }
+            let measured_usage_by_unit = usage_by_unit
+                .into_iter()
+                .map(|(unit, mut values)| {
+                    values.sort_by(f64::total_cmp);
+                    CalibrationUsageSummary {
+                        unit,
+                        sample_count: values.len(),
+                        median_value: values[(values.len() - 1) / 2],
+                    }
+                })
+                .collect();
+            let sample_count = group.len();
+            let succeeded = group.iter().filter(|sample| sample.succeeded).count();
+            CalibrationSummary {
+                provider_id,
+                model_id,
+                sample_count,
+                success_rate: succeeded as f64 / sample_count as f64,
+                median_latency_ms,
+                measured_usage_by_unit,
+                unknown_usage_count: group
+                    .iter()
+                    .filter(|sample| sample.measured_usage.is_none())
+                    .count(),
+            }
+        })
+        .collect()
 }
 
 fn measured_signals<'a>(
@@ -668,5 +971,223 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("does not predict")));
+    }
+
+    fn fallback_request(candidates: Vec<Candidate>) -> FallbackRequest {
+        FallbackRequest {
+            source_run_id: "run-1".into(),
+            policy: FallbackPolicy {
+                enabled: true,
+                on_provider_failure: true,
+                on_quota_boundary: true,
+                local_only: false,
+                max_handoffs: 1,
+            },
+            trigger: FallbackTrigger::ProviderFailure,
+            current_provider_id: "primary".into(),
+            visited_provider_ids: vec![],
+            handoff_count: 0,
+            source_run_terminal: true,
+            safe_checkpoint_ref: Some("checkpoint-1".into()),
+            effects_reconciled: true,
+            routing: request(candidates),
+        }
+    }
+
+    #[test]
+    fn fallback_requires_a_configured_terminal_checkpoint_and_reconciled_effects() {
+        let candidate = candidate(
+            "backup",
+            false,
+            Some(32_000),
+            Some(true),
+            Some(4),
+            Some(100),
+        );
+        let mut input = fallback_request(vec![candidate.clone()]);
+        input.safe_checkpoint_ref = None;
+        assert!(!evaluate_fallback(input).accepted);
+
+        let mut input = fallback_request(vec![candidate.clone()]);
+        input.source_run_terminal = false;
+        assert!(!evaluate_fallback(input).accepted);
+
+        let mut input = fallback_request(vec![candidate.clone()]);
+        input.effects_reconciled = false;
+        assert!(!evaluate_fallback(input).accepted);
+
+        let mut input = fallback_request(vec![candidate]);
+        input.trigger = FallbackTrigger::QuotaUnknown;
+        let decision = evaluate_fallback(input);
+        assert!(!decision.accepted);
+        assert!(decision.reason.contains("unknown quota"));
+    }
+
+    #[test]
+    fn fallback_preserves_local_only_and_eligible_manual_override() {
+        let mut remote = candidate("remote", false, Some(32_000), Some(true), Some(5), Some(1));
+        remote.model_id = "remote-model".into();
+        let mut local = candidate("local", true, Some(32_000), Some(true), Some(3), Some(100));
+        local.model_id = "local-model".into();
+        let mut input = fallback_request(vec![remote, local]);
+        input.policy.local_only = true;
+        input.routing.manual_provider_id = Some("local".into());
+        input.routing.manual_model_id = Some("local-model".into());
+        let decision = evaluate_fallback(input);
+        assert!(decision.accepted);
+        assert_eq!(decision.target_provider_id.as_deref(), Some("local"));
+        assert_eq!(decision.target_model_id.as_deref(), Some("local-model"));
+        assert_eq!(decision.policy_version, FALLBACK_POLICY_VERSION);
+        assert_eq!(decision.handoff_count, 1);
+
+        let mut input = fallback_request(vec![candidate(
+            "backup",
+            false,
+            None,
+            Some(true),
+            Some(4),
+            Some(100),
+        )]);
+        input.routing.manual_provider_id = Some("backup".into());
+        input.routing.manual_model_id = Some("model".into());
+        let decision = evaluate_fallback(input);
+        assert!(!decision.accepted);
+        assert!(decision
+            .reason
+            .contains("manual fallback override is not eligible"));
+    }
+
+    #[test]
+    fn fallback_excludes_visited_providers_and_stops_when_candidates_are_exhausted() {
+        let mut input = fallback_request(vec![
+            candidate("primary", false, Some(32_000), Some(true), Some(5), Some(1)),
+            candidate("visited", false, Some(32_000), Some(true), Some(5), Some(1)),
+        ]);
+        input.visited_provider_ids = vec!["visited".into()];
+        let decision = evaluate_fallback(input);
+        assert!(!decision.accepted);
+        assert!(decision.reason.contains("No eligible unvisited provider"));
+
+        let mut input = fallback_request(vec![candidate(
+            "backup",
+            false,
+            Some(32_000),
+            Some(true),
+            Some(5),
+            Some(1),
+        )]);
+        input.handoff_count = 1;
+        assert!(!evaluate_fallback(input).accepted);
+    }
+
+    #[test]
+    fn quota_fallback_requires_fresh_measured_exhaustion_for_the_source_provider() {
+        let mut input = fallback_request(vec![
+            candidate(
+                "backup",
+                false,
+                Some(32_000),
+                Some(true),
+                Some(4),
+                Some(100),
+            ),
+            candidate(
+                "primary",
+                false,
+                Some(32_000),
+                Some(true),
+                Some(3),
+                Some(200),
+            ),
+        ]);
+        input.trigger = FallbackTrigger::QuotaBoundary;
+        input.policy.on_provider_failure = false;
+        let mut signal = UsageSignal {
+            id: "source-limit".into(),
+            provider_id: Some("primary".into()),
+            model_id: None,
+            category: UsageCategory::SubscriptionWindow,
+            metric: "usagePercent".into(),
+            label: "Primary window".into(),
+            value: Some(100.0),
+            unit: "% used".into(),
+            window_duration_seconds: Some(3600),
+            reset_at_ms: Some(50_000),
+            collected_at_ms: 10_000,
+            source: "fixture".into(),
+            confidence: "measured".into(),
+            status: UsageStatus::Available,
+            note: None,
+        };
+        input.routing.usage_signals = vec![signal.clone()];
+        assert!(evaluate_fallback(input.clone()).accepted);
+        signal.collected_at_ms = 1;
+        input.routing.usage_signals = vec![signal];
+        input.routing.now_ms = 2_000_000;
+        assert!(!has_confirmed_quota_boundary(&input.routing, "primary"));
+    }
+
+    #[test]
+    fn unknown_usage_stays_unknown_in_fallback_ranking() {
+        let mut input = fallback_request(vec![
+            candidate(
+                "measured",
+                false,
+                Some(32_000),
+                Some(true),
+                Some(3),
+                Some(200),
+            ),
+            candidate("unknown", false, Some(32_000), Some(true), Some(3), None),
+        ]);
+        input.routing.pace = Pace::Economy;
+        let decision = evaluate_fallback(input);
+        assert!(decision.accepted);
+        let routing = decision.routing.unwrap();
+        assert!(routing.candidates.iter().any(|row| {
+            row.provider_id == "unknown"
+                && row
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("No fresh comparable USD API spend"))
+        }));
+    }
+
+    #[test]
+    fn calibration_summarizes_representative_outcomes_latency_and_measured_usage() {
+        let summary = calibrate(vec![
+            CalibrationSample {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                succeeded: true,
+                latency_ms: Some(100),
+                measured_usage: Some(10.0),
+                usage_unit: Some("tokens".into()),
+            },
+            CalibrationSample {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                succeeded: false,
+                latency_ms: Some(300),
+                measured_usage: None,
+                usage_unit: None,
+            },
+            CalibrationSample {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                succeeded: true,
+                latency_ms: None,
+                measured_usage: Some(30.0),
+                usage_unit: Some("tokens".into()),
+            },
+        ]);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].sample_count, 3);
+        assert!((summary[0].success_rate - (2.0 / 3.0)).abs() < f64::EPSILON);
+        assert_eq!(summary[0].median_latency_ms, Some(100));
+        assert_eq!(summary[0].measured_usage_by_unit[0].unit, "tokens");
+        assert_eq!(summary[0].measured_usage_by_unit[0].sample_count, 2);
+        assert_eq!(summary[0].measured_usage_by_unit[0].median_value, 10.0);
+        assert_eq!(summary[0].unknown_usage_count, 1);
     }
 }

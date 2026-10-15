@@ -36,6 +36,16 @@ impl ProviderKind {
             Self::Custom => "",
         }
     }
+
+    pub fn telemetry_id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::Ollama => "ollama",
+            Self::OpenRouter => "openrouter",
+            Self::Custom => "custom",
+        }
+    }
 }
 
 pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";

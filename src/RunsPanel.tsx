@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import type { GitHubIssue, ProjectEntry, ProviderHandoff, WorkflowRunMetadata } from "./settings";
+import type { FallbackTrigger, GitHubIssue, ProjectEntry, ProviderHandoff, WorkflowRunMetadata } from "./settings";
 import {
-  cancelWorkflowRun, createProviderHandoff, discoverWorkflowSkills, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
+  cancelWorkflowRun, createProviderHandoff, discoverWorkflowSkills, evaluateProviderFallback, listUsageSignals, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
   loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startOpenRouterWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
 } from "./settings";
 
@@ -34,6 +34,9 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [handoffDiff, setHandoffDiff] = useState("");
   const [handoffChecks, setHandoffChecks] = useState("");
   const [handoffPending, setHandoffPending] = useState("");
+  const [evaluateFallback, setEvaluateFallback] = useState(false);
+  const [fallbackTrigger, setFallbackTrigger] = useState<Exclude<FallbackTrigger, "quotaUnknown">>("providerFailure");
+  const [fallbackLocalOnly, setFallbackLocalOnly] = useState(false);
   const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push" | "dev-build">("dev-work");
   const [buildProfile, setBuildProfile] = useState<"release" | "debug">("release");
   const [workflowIntent, setWorkflowIntent] = useState("");
@@ -77,6 +80,10 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       const settings = await loadSettings();
       const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId);
       const sourceId = handoffSourceRunId;
+      const auditedFallback = sourceId && runs.find((item) => item.id === sourceId)?.handoff?.fallbackDecisions?.filter((decision) => decision.accepted).at(-1);
+      if (auditedFallback && (auditedFallback.targetProviderId !== provider?.id || auditedFallback.targetModelId !== settings.providerSelection.modelId)) {
+        throw new Error("The selected provider/model differs from the approved fallback audit. Re-evaluate fallback after changing the target.");
+      }
       const run = provider?.kind === "ollama"
         ? await startOllamaWorkflowRun({ cwd: defaultCwd, prompt: codexPrompt, testCommand: ollamaTestCommand.trim() || null, handoffSourceRunId: sourceId })
         : provider?.kind === "openRouter"
@@ -94,18 +101,60 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
 
   async function createHandoff(event: FormEvent) {
     event.preventDefault();
-    if (!selected) { setError("Choose a completed source run before preparing the handoff."); return; }
+    if (!selected) { setError("Choose a terminal source run before preparing the handoff."); return; }
     setBusy(true); setError("");
     try {
       const currentSettings = await loadSettings();
       const targetProviderId = currentSettings.providerSelection.providerId;
       if (!targetProviderId) throw new Error("Choose a target provider in Providers before preparing the handoff.");
+      if (evaluateFallback && !["failed", "timedOut", "interrupted"].includes(selected.state)) {
+        throw new Error("Fallback evaluation is available only for failed, timed-out, or interrupted runs.");
+      }
+      const sourceProfile = currentSettings.providers.find((profile) => {
+        const telemetryId = profile.kind === "openRouter" ? "openrouter" : profile.kind;
+        return telemetryId === selected.provider && profile.models.some((model) => model.id === selected.modelId);
+      });
+      const targetModelId = currentSettings.providerSelection.modelId;
+      if (evaluateFallback && (!sourceProfile || !selected.modelId || sourceProfile.id === targetProviderId || !targetModelId)) {
+        throw new Error("Choose a different configured provider and model as the fallback target.");
+      }
       setSelectedProviderId(targetProviderId);
       const packet = await createProviderHandoff({ sourceRunId: selected.id, targetProviderId, goal: handoffGoal, scope: handoffScope, diff: handoffDiff, checks: handoffChecks, pendingWork: handoffPending });
       setHandoffSourceRunId(packet.sourceRunId);
       setCodexPrompt("Continue this work from the explicit handoff packet. Verify the saved state, continue only with pending work, and do not repeat recorded remote effects.");
       setRuns((items) => items.map((run) => run.id === selected.id ? { ...run, handoff: packet } : run));
-      setError("Handoff saved. Review the target provider and press Start to switch manually.");
+      if (evaluateFallback && sourceProfile && targetModelId) {
+        const latestRuns = await listWorkflowRuns();
+        const candidates = currentSettings.providers.flatMap((profile) => profile.models.map((model) => {
+          const telemetryProviderId = profile.kind === "openRouter" ? "openrouter" : profile.kind;
+          const latest = latestRuns.filter((run) => run.state === "completed" && run.provider === telemetryProviderId && run.modelId === model.id && run.latencyMs !== null && run.finishedAtMs !== null)
+            .sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0))[0];
+          return {
+            providerId: profile.id, telemetryProviderId, providerName: profile.name, modelId: model.id, modelName: model.name,
+            isLocal: profile.kind === "ollama", contextTokens: model.contextWindowTokens ?? null, supportsTools: model.supportsTools ?? null,
+            reasoningEfforts: model.reasoningEfforts, qualityRating: model.qualityRating ?? null,
+            latencyMs: latest?.latencyMs ?? null, latencyCollectedAtMs: latest?.finishedAtMs ?? null,
+          };
+        }));
+        const fallback = await evaluateProviderFallback({
+          sourceRunId: selected.id,
+          policy: { enabled: true, onProviderFailure: fallbackTrigger === "providerFailure", onQuotaBoundary: fallbackTrigger === "quotaBoundary", localOnly: fallbackLocalOnly, maxHandoffs: 1 },
+          trigger: fallbackTrigger, currentProviderId: sourceProfile.id, visitedProviderIds: [], handoffCount: 0,
+          sourceRunTerminal: true, safeCheckpointRef: packet.workingTreeFingerprint, effectsReconciled: true,
+          routing: {
+            complexity: "standard", pace: "balanced", requireTools: true, localOnly: fallbackLocalOnly,
+            desiredCompletionMinutes: null, manualProviderId: targetProviderId, manualModelId: targetModelId,
+            candidates, usageSignals: [], nowMs: Date.now(),
+          },
+        });
+        setRuns(await listWorkflowRuns());
+        const sameTarget = fallback.targetProviderId === targetProviderId && fallback.targetModelId === targetModelId;
+        setError(fallback.accepted && sameTarget
+          ? `Fallback recorded under policy v${fallback.policyVersion}. ${fallback.reason} Review the saved target, then press Start.`
+          : `Handoff saved, but fallback was not approved: ${fallback.reason}${fallback.accepted ? " Change the selected target to the recorded provider and model before continuing." : ""}`);
+      } else {
+        setError("Handoff saved. Review the target provider and press Start to switch manually.");
+      }
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
   }
@@ -316,13 +365,21 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           {selected.workflow?.action === "dev-build" && selected.state === "interrupted" && selected.processId !== null && <p className="registry-context-note">The previous build process (PID {selected.processId}) is still running. Retry will appear after it exits.</p>}
           {selected.workflow?.action === "dev-build" && selected.processId === null && ["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state) && <button className="button button-secondary" type="button" disabled={busy || selectedProviderKind !== "codex"} onClick={() => { void retryBuild(); }}>Retry build safely</button>}
           {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
-          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}<div className="run-launch-options"><button className="button button-secondary" type="button" disabled={busy || selectedProviderId !== selected.handoff.targetProviderId} onClick={() => loadSavedHandoff(selected.handoff!)}>Load saved handoff into launch form</button>{selectedProviderId !== selected.handoff.targetProviderId && <small>Select the saved target provider in Providers to continue this handoff.</small>}</div></div>}
+          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.fallbackDecisions?.map((decision, index) => <p key={`${decision.policyVersion}-${index}`}><strong>Fallback policy v{decision.policyVersion} · {decision.accepted ? "approved" : "not approved"}</strong> · {decision.trigger}{decision.localOnly ? " · local-only" : ""}: {decision.reason}{decision.targetProviderId && ` Target ${decision.targetProviderId}/${decision.targetModelId}.`}</p>)}{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}<div className="run-launch-options"><button className="button button-secondary" type="button" disabled={busy || selectedProviderId !== selected.handoff.targetProviderId} onClick={() => loadSavedHandoff(selected.handoff!)}>Load saved handoff into launch form</button>{selectedProviderId !== selected.handoff.targetProviderId && <small>Select the saved target provider in Providers to continue this handoff.</small>}</div></div>}
           {selected.finishedAtMs !== null && !activeStates.has(selected.state) && <details className="work-context"><summary>Prepare a manual provider handoff</summary><p>Creates a saved checkpoint for the currently selected target provider. The next run starts only when you press Start.</p><form className="run-launch-form" onSubmit={(event) => { void createHandoff(event); }}>
             <label>Goal<input required maxLength={8000} value={handoffGoal} onChange={(event) => setHandoffGoal(event.target.value)} /></label>
             <label>Scope<textarea required rows={2} maxLength={8000} value={handoffScope} onChange={(event) => setHandoffScope(event.target.value)} /></label>
             <label>Current diff<textarea required rows={3} maxLength={8000} value={handoffDiff} onChange={(event) => setHandoffDiff(event.target.value)} /></label>
             <label>Checks and results<textarea required rows={2} maxLength={8000} value={handoffChecks} onChange={(event) => setHandoffChecks(event.target.value)} /></label>
             <label>Pending work<textarea required rows={2} maxLength={8000} value={handoffPending} onChange={(event) => setHandoffPending(event.target.value)} /></label>
+            {["failed", "timedOut", "interrupted"].includes(selected.state) && <>
+              <label className="run-checkbox"><input type="checkbox" checked={evaluateFallback} onChange={(event) => setEvaluateFallback(event.target.checked)} /> Evaluate a configured checkpoint fallback</label>
+              {evaluateFallback && <>
+                <label>Fallback boundary<select value={fallbackTrigger} onChange={(event) => setFallbackTrigger(event.target.value as Exclude<FallbackTrigger, "quotaUnknown">)}><option value="providerFailure">Provider failure</option><option value="quotaBoundary">Confirmed quota exhaustion</option></select></label>
+                <label className="run-checkbox"><input type="checkbox" checked={fallbackLocalOnly} onChange={(event) => setFallbackLocalOnly(event.target.checked)} /> Preserve local-only privacy for fallback</label>
+                <p className="registry-context-note">Fallback requires an unchanged saved worktree checkpoint and reconciled side effects. Unknown quota never triggers fallback. The selected target is a manual override; no provider switch starts until you review the decision and press Start.</p>
+              </>}
+            </>}
             <button className="button button-secondary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save handoff checkpoint"}</button>
           </form></details>}
           {selected.state === "needsInput" && selected.events.filter((item) => item.kind === "approvalRequest" || item.kind === "userInputRequest").map((item) => <CodexRequestCard key={`${item.sequence}-${item.kind}`} runId={selected.id} event={item} onResolved={(requestId) => setRespondedRequests((prior) => new Set(prior).add(requestId))} isResolved={(requestId) => respondedRequests.has(requestId)} />)}

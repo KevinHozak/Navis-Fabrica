@@ -226,7 +226,7 @@ pub struct WorkflowSideEffects {
     pub verification_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderHandoff {
     pub version: u32,
@@ -244,6 +244,8 @@ pub struct ProviderHandoff {
     pub checks: String,
     pub pending_work: String,
     pub completed_side_effects: Option<WorkflowSideEffects>,
+    #[serde(default)]
+    pub fallback_decisions: Vec<crate::routing::FallbackDecision>,
     pub created_at_ms: u128,
 }
 
@@ -2401,6 +2403,11 @@ pub fn create_provider_handoff(
             .workflow
             .as_ref()
             .and_then(|workflow| workflow.side_effects.clone()),
+        fallback_decisions: source
+            .handoff
+            .as_ref()
+            .map(|handoff| handoff.fallback_decisions.clone())
+            .unwrap_or_default(),
         created_at_ms: now_ms(),
     };
     source.handoff = Some(packet.clone());
@@ -2408,10 +2415,109 @@ pub fn create_provider_handoff(
     Ok(packet)
 }
 
+pub fn evaluate_provider_fallback(
+    app: &AppHandle,
+    mut request: crate::routing::FallbackRequest,
+) -> Result<crate::routing::FallbackDecision, String> {
+    let path = history_path(app)?;
+    let mut state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.records.is_empty() {
+        state.records = load_records(&path)?;
+    }
+    let source_index = state
+        .records
+        .iter()
+        .position(|record| record.id == request.source_run_id)
+        .ok_or("The source run is no longer in saved workflow history.")?;
+    let source = state.records[source_index].clone();
+    let Some(mut handoff) = source.handoff.clone() else {
+        return Err(
+            "Prepare a worktree-verified handoff checkpoint before evaluating fallback.".into(),
+        );
+    };
+    if !matches!(source.state.as_str(), "failed" | "timedOut" | "interrupted") {
+        return Err("Fallback can be evaluated only after a failed, timed-out, or interrupted run reaches a terminal state.".into());
+    }
+    let current_candidate = request
+        .routing
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == request.current_provider_id)
+        .ok_or("The source provider must be included in the routing candidates.")?;
+    if source.provider.as_deref() != Some(current_candidate.telemetry_provider_id.as_str())
+        || source.model_id.as_deref() != Some(current_candidate.model_id.as_str())
+    {
+        return Err("The source provider and model must match the saved run.".into());
+    }
+    if matches!(
+        request.trigger,
+        crate::routing::FallbackTrigger::QuotaBoundary
+    ) && !crate::routing::has_confirmed_quota_boundary(
+        &request.routing,
+        &current_candidate.telemetry_provider_id,
+    ) {
+        request.trigger = crate::routing::FallbackTrigger::QuotaUnknown;
+    }
+
+    request.source_run_terminal = true;
+    request.safe_checkpoint_ref = None;
+    if let (Some(expected), Ok(Some(snapshot))) = (
+        handoff.working_tree_fingerprint.as_deref(),
+        git_worktree_snapshot(Path::new(&source.cwd)),
+    ) {
+        if snapshot.fingerprint == expected {
+            request.safe_checkpoint_ref = Some(expected.to_owned());
+        }
+    }
+    request.effects_reconciled = source
+        .workflow
+        .as_ref()
+        .and_then(|workflow| workflow.side_effects.as_ref())
+        .is_none_or(|effects| effects.verified)
+        && handoff
+            .completed_side_effects
+            .as_ref()
+            .is_none_or(|effects| effects.verified);
+    let visited = handoff
+        .fallback_decisions
+        .iter()
+        .filter(|decision| decision.accepted)
+        .flat_map(|decision| {
+            decision
+                .target_provider_id
+                .iter()
+                .chain(std::iter::once(&decision.source_provider_id))
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    request.visited_provider_ids = visited.into_iter().collect();
+    request.handoff_count = handoff
+        .fallback_decisions
+        .iter()
+        .filter(|decision| decision.accepted)
+        .count()
+        .min(u8::MAX as usize) as u8;
+    let decision = crate::routing::evaluate_fallback(request);
+    handoff.fallback_decisions.push(decision.clone());
+    if handoff.fallback_decisions.len() > 16 {
+        handoff.fallback_decisions.remove(0);
+    }
+    state.records[source_index].handoff = Some(handoff);
+    persist_records(&path, &state.records)?;
+    let snapshot = state.records[source_index].clone();
+    drop(state);
+    let _ = app.emit("workflow-run-updated", snapshot);
+    Ok(decision)
+}
+
 pub fn saved_provider_handoff(
     app: &AppHandle,
     source_run_id: &str,
     target_provider_id: &str,
+    target_model_id: &str,
+    target_is_local: bool,
 ) -> Result<ProviderHandoff, String> {
     let path = history_path(app)?;
     let mut state = store()
@@ -2428,8 +2534,30 @@ pub fn saved_provider_handoff(
         .filter(|packet| {
             packet.target_provider_id == target_provider_id && packet.source_run_id == source_run_id
         })
+        .filter(|packet| {
+            approved_fallback_matches(packet, target_provider_id, target_model_id, target_is_local)
+        })
         .ok_or_else(|| {
-            "Create a manual handoff for this source run and selected target provider first.".into()
+            "Create a manual handoff for this source run and selected target provider first, and keep any approved fallback on its recorded provider and model.".into()
+        })
+}
+
+fn approved_fallback_matches(
+    packet: &ProviderHandoff,
+    target_provider_id: &str,
+    target_model_id: &str,
+    target_is_local: bool,
+) -> bool {
+    packet
+        .fallback_decisions
+        .iter()
+        .rev()
+        .next()
+        .is_none_or(|decision| {
+            (!decision.local_only || target_is_local)
+                && (!decision.accepted
+                    || (decision.target_provider_id.as_deref() == Some(target_provider_id)
+                        && decision.target_model_id.as_deref() == Some(target_model_id)))
         })
 }
 
@@ -3266,6 +3394,7 @@ mod tests {
             checks: "none".into(),
             pending_work: "finish".into(),
             completed_side_effects: None,
+            fallback_decisions: vec![],
             created_at_ms: 1,
         };
         assert!(ensure_handoff_worktree(directory.path(), &handoff).is_ok());
@@ -3363,6 +3492,20 @@ mod tests {
                     verified: true,
                     verification_message: None,
                 }),
+                fallback_decisions: vec![crate::routing::FallbackDecision {
+                    policy_version: crate::routing::FALLBACK_POLICY_VERSION,
+                    accepted: true,
+                    local_only: false,
+                    source_run_id: "fixture".into(),
+                    trigger: crate::routing::FallbackTrigger::ProviderFailure,
+                    source_provider_id: "codex-profile".into(),
+                    target_provider_id: Some("ollama-local".into()),
+                    target_model_id: Some("model".into()),
+                    checkpoint_ref: Some("fixture-checkpoint".into()),
+                    handoff_count: 1,
+                    reason: "fixture decision".into(),
+                    routing: None,
+                }],
                 created_at_ms: 2,
             }),
         };
@@ -3371,6 +3514,37 @@ mod tests {
         let restored = load_records(&path).unwrap();
         assert_eq!(restored[0].state, record.state);
         assert_eq!(restored[0].handoff, record.handoff);
+        assert_eq!(
+            restored[0].handoff.as_ref().unwrap().fallback_decisions[0].policy_version,
+            crate::routing::FALLBACK_POLICY_VERSION
+        );
+        let checkpoint = restored[0].handoff.as_ref().unwrap();
+        assert!(approved_fallback_matches(
+            checkpoint,
+            "ollama-local",
+            "model",
+            true
+        ));
+        assert!(!approved_fallback_matches(
+            checkpoint,
+            "ollama-local",
+            "different-model",
+            true
+        ));
+        let mut privacy_checkpoint = checkpoint.clone();
+        privacy_checkpoint.fallback_decisions[0].local_only = true;
+        assert!(!approved_fallback_matches(
+            &privacy_checkpoint,
+            "openrouter-profile",
+            "model",
+            false
+        ));
+        assert!(approved_fallback_matches(
+            &privacy_checkpoint,
+            "ollama-local",
+            "model",
+            true
+        ));
         assert_eq!(restored[0].process_id, Some(std::process::id()));
         assert!(interrupted_process_owns_scope(
             &restored,

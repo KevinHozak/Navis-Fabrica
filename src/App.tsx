@@ -499,6 +499,8 @@ function gitStatusLabel(status: string): string {
   }
 }
 
+const PROJECTS_PER_PAGE = 60;
+
 function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
   projects: ProjectEntry[];
   selectedProjectId: string | null;
@@ -507,6 +509,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
 }) {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
+  const [renderLimit, setRenderLimit] = useState(PROJECTS_PER_PAGE);
   const stacks = useMemo(() => [...new Set(projects.flatMap((project) => project.detectedStacks))].sort(), [projects]);
   const visible = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -515,7 +518,9 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
       (!normalized || `${project.name} ${project.path} ${project.detectedStacks.join(" ")}`.toLocaleLowerCase().includes(normalized)),
     );
   }, [projects, query, stackFilter]);
+  useEffect(() => setRenderLimit(PROJECTS_PER_PAGE), [query, stackFilter, projects]);
   const selected = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const rendered = visible.slice(0, renderLimit);
 
   return <div className="project-browser">
     <div className="project-browser-controls">
@@ -525,7 +530,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
     </div>
     <div className="project-browser-results">
       {visible.length ? <div className="project-card-grid" aria-label="Projects" role="list">
-        {visible.map((project) => <article className={`project-card${selectedProjectId === project.id ? " selected" : ""}`} role="listitem" key={project.id}>
+        {rendered.map((project) => <article className={`project-card${selectedProjectId === project.id ? " selected" : ""}`} role="listitem" key={project.id}>
           <button className="project-card-select" type="button" aria-pressed={selectedProjectId === project.id} onClick={() => onSelect(project.id)}>
             <span className="project-card-heading">
               <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
@@ -544,6 +549,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
           </button>
         </article>)}
       </div> : <div className="project-filter-empty">No projects match these filters.</div>}
+      {renderLimit < visible.length && <div className="project-load-more"><span>Showing {rendered.length} of {visible.length} projects</span><button type="button" onClick={() => setRenderLimit((limit) => Math.min(limit + PROJECTS_PER_PAGE, visible.length))}>Show more projects</button></div>}
       <ProjectDetails project={selected} onWork={(issue) => { if (selected) onWork(issue, selected.id); }} />
     </div>
   </div>;

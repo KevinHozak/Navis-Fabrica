@@ -197,6 +197,10 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .project-filter select { min-height: 38px; max-width: 160px; padding: 0 28px 0 10px; border: 1px solid #303b49; border-radius: 8px; background: #10151d; color: #c8d3e0; font-size: 10px; }
 .project-browser-results { border-top: 1px solid var(--line-soft); }
 .project-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 13px; padding: 18px 22px 22px; }
+.project-load-more { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 0 22px 20px; color: #929eae; font-size: 10px; }
+.project-load-more button { min-height: 34px; padding: 0 13px; border: 1px solid #35475a; border-radius: 7px; background: #182331; color: #c6d9eb; cursor: pointer; }
+.project-load-more button:hover { border-color: #5c8ab3; background: #1c2b3a; }
+.project-load-more button:focus-visible { outline: 2px solid #8cc5fa; outline-offset: 2px; }
 .project-card { min-width: 0; overflow: hidden; border: 1px solid #2a3543; border-radius: 10px; background: linear-gradient(145deg, #171e28, #121821); transition: border-color .16s ease, background-color .16s ease; }
 .project-card:hover { border-color: #4a6781; }
 .project-card.selected { border-color: #5c8ab3; background: linear-gradient(145deg, #1a2a39, #141d27); box-shadow: inset 0 1px #8cc5fa16; }
@@ -269,6 +273,7 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
   .project-filter { flex: 1; }
   .project-filter select { width: 100%; max-width: none; }
   .project-card-grid { grid-template-columns: minmax(0, 1fr); padding: 14px 16px 18px; }
+  .project-load-more { flex-wrap: wrap; padding: 0 16px 18px; }
   .project-detail { padding: 17px 16px 20px; }
   .scan-progress { padding-right: 16px; padding-left: 16px; }
   .error-notice { margin-right: 16px; margin-left: 16px; }

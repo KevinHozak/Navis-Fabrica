@@ -325,7 +325,8 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     }
     setBusy(true);
     try {
-      const run = await startWorkflowRun({ executable, arguments: args, cwd, timeoutSeconds: timeout, mutating });
+      const executionCwd = cwd === displayDirectoryPath(defaultCwd) ? defaultCwd : cwd;
+      const run = await startWorkflowRun({ executable, arguments: args, cwd: executionCwd, timeoutSeconds: timeout, mutating });
       setRuns((items) => {
         const latest = items.find((item) => item.id === run.id);
         const chosen = latest && (latest.nextSequence > run.nextSequence || latest.state !== "queued") ? latest : run;
@@ -392,7 +393,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       <div className="panel-heading"><div><h2 id="codex-run-title">Start {selectedProviderKind === "antigravity" ? "Antigravity" : selectedProviderKind === "ollama" ? "local Ollama" : selectedProviderKind === "openRouter" ? "OpenRouter via Aider" : "Codex"} in this project</h2><p>Uses the selected provider and model, plus settings supported by that runtime.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgent(event); }}>
-        <label>Project scope<input value={defaultCwd} readOnly aria-readonly="true" /></label>
+        <label>Project scope<input value={displayDirectoryPath(defaultCwd)} readOnly aria-readonly="true" /></label>
         <p className="registry-context-note" role="status">Route confirmation: {routeConfirmation} This selection is saved in Providers; execution starts only after you press Start.</p>
         {selectedProviderKind === "codex" && <label>Codex skill (optional)<select value={codexSkill} onChange={(event) => setCodexSkill(event.target.value)}>
           <option value="">No skill</option>{skills.filter((skill) => skill.status === "available" && skill.compatibleAgents.includes("Codex")).map((skill) => <option key={skill.id} value={skill.id}>{skill.id}</option>)}
@@ -414,7 +415,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void start(event); }}>
         <label>Executable path or command<input required value={executable} onChange={(event) => setExecutable(event.target.value)} placeholder="C:\\Tools\\codex.exe or npm" /></label>
-        <label>Working directory<input required value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="C:\\Projects\\my-project" /></label>
+        <label>Working directory<input required value={displayDirectoryPath(cwd)} onChange={(event) => setCwd(event.target.value)} placeholder="C:\\Projects\\my-project" /></label>
         <label>Arguments (JSON string array)<textarea rows={3} value={argumentsText} onChange={(event) => setArgumentsText(event.target.value)} spellCheck={false} /></label>
         <div className="run-launch-options">
           <label>Timeout (seconds)<input type="number" min={1} max={86400} value={timeout} onChange={(event) => setTimeout(Number(event.target.value))} /></label>
@@ -432,11 +433,11 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
         {historyMessage && <p className="run-history-feedback" role="status" aria-live="polite">{historyMessage}</p>}
         <div className="panel-rule" />
         {runs.length ? runs.map((run) => <button key={run.id} type="button" className={`run-list-item${selected?.id === run.id ? " selected" : ""}`} onClick={() => setSelectedId(run.id)}>
-          <strong>{run.workflow?.action ?? run.executable.split(/[\\/]/).pop()}</strong><span>{run.state}{run.mutating ? " · mutating" : " · read only"}</span><small>{run.cwd}</small>
+          <strong>{run.workflow?.action ?? run.executable.split(/[\\/]/).pop()}</strong><span>{run.state}{run.mutating ? " · mutating" : " · read only"}</span><small>{displayDirectoryPath(run.cwd)}</small>
         </button>) : <p className="registry-context-note">No runs yet.</p>}
       </section>
       <section className="panel run-detail-panel" aria-labelledby="run-detail-title">
-        <div className="panel-heading"><div><h2 id="run-detail-title">{selected?.workflow?.action ?? (selected ? selected.executable : "Run output")}</h2><p>{selected ? `${selected.state} · ${selected.cwd}` : "Select a run or start a configured executable."}</p></div>
+        <div className="panel-heading"><div><h2 id="run-detail-title">{selected?.workflow?.action ?? (selected ? selected.executable : "Run output")}</h2><p>{selected ? `${selected.state} · ${displayDirectoryPath(selected.cwd)}` : "Select a run or start a configured executable."}</p></div>
           {selected && activeStates.has(selected.state) && <button className="button button-secondary" type="button" onClick={() => { void cancel(selected.id); }}>Cancel run</button>}
         </div><div className="panel-rule" />
         {selected ? <>

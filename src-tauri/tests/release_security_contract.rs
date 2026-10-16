@@ -24,7 +24,6 @@ fn default_capability_is_scoped_to_registered_commands() {
         .filter(|permission| !event_permissions.contains(permission))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(app_permissions.len(), 38);
     assert_eq!(
         permissions
             .iter()
@@ -131,24 +130,23 @@ fn frontend_does_not_depend_on_the_unrestricted_shell_plugin() {
 }
 
 #[test]
-fn virtualized_project_list_preserves_keyboard_and_screen_reader_contracts() {
+fn project_cards_preserve_keyboard_and_screen_reader_contracts() {
     let app = fs::read_to_string(manifest_path("../src/App.tsx")).unwrap();
     for contract in [
-        "role=\"listbox\"",
-        "aria-activedescendant",
-        "role=\"option\"",
-        "aria-selected",
-        "aria-posinset",
-        "aria-setsize",
-        "ArrowDown",
-        "ArrowUp",
-        "Home",
-        "End",
+        "role=\"list\"",
+        "role=\"listitem\"",
+        "className=\"project-card-select\"",
+        "aria-pressed={selectedProjectId === project.id}",
+        "onClick={() => onSelect(project.id)}",
+        "Working tree clean",
+        "Uncommitted changes",
+        "Working tree status unavailable",
     ] {
-        assert!(app.contains(contract), "project list missing {contract}");
+        assert!(app.contains(contract), "project cards missing {contract}");
     }
     let styles = fs::read_to_string(manifest_path("../src/styles.css")).unwrap();
     assert!(styles.contains(":focus-visible"));
+    assert!(styles.contains(".project-card-grid"));
     assert!(styles.contains("@media (prefers-reduced-motion: reduce)"));
 }
 

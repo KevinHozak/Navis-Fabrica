@@ -365,15 +365,41 @@ fn store_typesafe_credential(target: &str, secret: &str) -> Result<(), String> {
     }
 }
 
-const SETTINGS_SCHEMA_VERSION: u32 = 4;
+const SETTINGS_SCHEMA_VERSION: u32 = 5;
 const SETTINGS_FILE: &str = "settings.json";
 const PROJECT_INVENTORY_FILE: &str = "project-inventory.json";
+const MAX_PROJECT_DISPLAY_IDS: usize = 10_000;
+const MAX_PROJECT_ID_LENGTH: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectDisplayView {
+    All,
+    Favorites,
+    Hidden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDisplayPreferences {
+    pub favorite_project_ids: Vec<String>,
+    pub hidden_project_ids: Vec<String>,
+    pub view: ProjectDisplayView,
+}
+
+impl Default for ProjectDisplayView {
+    fn default() -> Self {
+        Self::All
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
     pub include_hidden: bool,
     pub scan_depth: u8,
+    #[serde(default)]
+    pub project_display: ProjectDisplayPreferences,
 }
 
 impl Default for Preferences {
@@ -381,6 +407,7 @@ impl Default for Preferences {
         Self {
             include_hidden: false,
             scan_depth: 3,
+            project_display: ProjectDisplayPreferences::default(),
         }
     }
 }
@@ -451,6 +478,83 @@ struct SettingsInput {
 struct PreferencesInput {
     include_hidden: bool,
     scan_depth: u8,
+    #[serde(default)]
+    project_display: Option<ProjectDisplayPreferencesInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectDisplayPreferencesInput {
+    favorite_project_ids: Vec<String>,
+    hidden_project_ids: Vec<String>,
+    view: ProjectDisplayView,
+}
+
+fn validate_project_ids(ids: Vec<String>) -> Result<Vec<String>, String> {
+    if ids.len() > MAX_PROJECT_DISPLAY_IDS {
+        return Err(
+            "Project display preferences exceed the supported number of project IDs.".into(),
+        );
+    }
+    let mut unique = std::collections::HashSet::new();
+    let mut normalized = Vec::with_capacity(ids.len());
+    for id in ids {
+        if id.is_empty() || id.len() > MAX_PROJECT_ID_LENGTH || id.chars().any(char::is_control) {
+            return Err("Project display preferences contain an invalid project ID.".into());
+        }
+        if unique.insert(id.clone()) {
+            normalized.push(id);
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_project_display_preferences(
+    preferences: ProjectDisplayPreferencesInput,
+) -> Result<ProjectDisplayPreferences, String> {
+    Ok(ProjectDisplayPreferences {
+        favorite_project_ids: validate_project_ids(preferences.favorite_project_ids)?,
+        hidden_project_ids: validate_project_ids(preferences.hidden_project_ids)?,
+        view: preferences.view,
+    })
+}
+
+fn recover_project_ids(value: Option<&Value>) -> Vec<String> {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    let mut unique = std::collections::HashSet::new();
+    for id in values
+        .iter()
+        .take(MAX_PROJECT_DISPLAY_IDS)
+        .filter_map(Value::as_str)
+    {
+        if !id.is_empty()
+            && id.len() <= MAX_PROJECT_ID_LENGTH
+            && !id.chars().any(char::is_control)
+            && unique.insert(id.to_owned())
+        {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
+}
+
+fn recover_project_display_preferences(value: Option<&Value>) -> ProjectDisplayPreferences {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return ProjectDisplayPreferences::default();
+    };
+    let view = match object.get("view").and_then(Value::as_str) {
+        Some("favorites") => ProjectDisplayView::Favorites,
+        Some("hidden") => ProjectDisplayView::Hidden,
+        _ => ProjectDisplayView::All,
+    };
+    ProjectDisplayPreferences {
+        favorite_project_ids: recover_project_ids(object.get("favoriteProjectIds")),
+        hidden_project_ids: recover_project_ids(object.get("hiddenProjectIds")),
+        view,
+    }
 }
 
 fn validate_project_root(value: &str) -> Result<String, String> {
@@ -617,6 +721,9 @@ fn recover_settings(value: Value) -> Settings {
         preferences: Preferences {
             include_hidden,
             scan_depth,
+            project_display: recover_project_display_preferences(
+                preference_value.and_then(|preferences| preferences.get("projectDisplay")),
+            ),
         },
         providers,
         provider_selection,
@@ -879,6 +986,13 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         preferences: Preferences {
             include_hidden: settings.preferences.include_hidden,
             scan_depth: settings.preferences.scan_depth,
+            project_display: match settings.preferences.project_display {
+                Some(project_display) => validate_project_display_preferences(project_display)?,
+                None => prior
+                    .as_ref()
+                    .map(|settings| settings.preferences.project_display.clone())
+                    .unwrap_or_default(),
+            },
         },
         providers: settings.providers,
         provider_selection: settings.provider_selection,
@@ -907,6 +1021,19 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<Settings, St
         let _ = app.emit("project-discovery-settings-changed", ());
     }
     Ok(settings)
+}
+
+#[tauri::command]
+fn save_project_display_preferences(
+    app: AppHandle,
+    preferences: ProjectDisplayPreferencesInput,
+) -> Result<ProjectDisplayPreferences, String> {
+    let preferences = validate_project_display_preferences(preferences)?;
+    let path = settings_path(&app)?;
+    let mut settings = load_settings(&path)?;
+    settings.preferences.project_display = preferences.clone();
+    write_settings_atomic(&path, &settings)?;
+    Ok(preferences)
 }
 
 fn validate_typesafe_profile(profile: Option<&providers::TypeSafeProfile>) -> Result<(), String> {
@@ -1929,6 +2056,7 @@ pub fn run() {
             start_affected_project_refresh,
             discover_workflow_skills,
             save_settings,
+            save_project_display_preferences,
             inspect_providers,
             probe_antigravity_cli,
             probe_ollama,
@@ -2464,9 +2592,13 @@ mod tests {
     #[test]
     fn defaults_are_schema_versioned_and_windows_friendly() {
         let settings = Settings::default();
-        assert_eq!(settings.schema_version, 4);
+        assert_eq!(settings.schema_version, 5);
         assert_eq!(settings.project_root, r"C:\Projects");
         assert_eq!(settings.preferences.scan_depth, 3);
+        assert_eq!(
+            settings.preferences.project_display.view,
+            ProjectDisplayView::All
+        );
     }
 
     #[test]
@@ -2481,13 +2613,34 @@ mod tests {
             "schemaVersion": 1,
             "projectRoot": r"D:\Workspaces",
             "exclusions": [".git", { "invalid": true }, "..\\outside"],
-            "preferences": { "includeHidden": true, "scanDepth": 99 }
+            "preferences": {
+                "includeHidden": true,
+                "scanDepth": 99,
+                "projectDisplay": {
+                    "favoriteProjectIds": ["repo-a", 4, "repo-a", "", "bad\nproject"],
+                    "hiddenProjectIds": "invalid",
+                    "view": "unknown"
+                }
+            }
         });
         let settings = recover_settings(value);
         assert_eq!(settings.project_root, r"D:\Workspaces");
         assert_eq!(settings.exclusions, vec![".git"]);
         assert!(settings.preferences.include_hidden);
         assert_eq!(settings.preferences.scan_depth, 3);
+        assert_eq!(
+            settings.preferences.project_display.favorite_project_ids,
+            vec!["repo-a"]
+        );
+        assert!(settings
+            .preferences
+            .project_display
+            .hidden_project_ids
+            .is_empty());
+        assert_eq!(
+            settings.preferences.project_display.view,
+            ProjectDisplayView::All
+        );
     }
 
     #[test]
@@ -2530,7 +2683,7 @@ mod tests {
             }
         }));
         assert_eq!(valid.typesafe_profile.as_ref().unwrap().id, "jev-main");
-        assert_eq!(valid.schema_version, 4);
+        assert_eq!(valid.schema_version, 5);
 
         let invalid = recover_settings(serde_json::json!({
             "schemaVersion": 4,
@@ -2573,11 +2726,43 @@ mod tests {
     fn leaves_settings_from_a_newer_schema_untouched() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = folder.path().join(SETTINGS_FILE);
-        fs::write(&path, r#"{"schemaVersion":5,"projectRoot":"C:\\Projects"}"#).unwrap();
+        fs::write(&path, r#"{"schemaVersion":6,"projectRoot":"C:\\Projects"}"#).unwrap();
         assert!(load_settings(&path).unwrap_err().contains("newer version"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            r#"{"schemaVersion":5,"projectRoot":"C:\\Projects"}"#
+            r#"{"schemaVersion":6,"projectRoot":"C:\\Projects"}"#
+        );
+    }
+
+    #[test]
+    fn project_display_preferences_validate_and_round_trip() {
+        let preferences = validate_project_display_preferences(ProjectDisplayPreferencesInput {
+            favorite_project_ids: vec!["repo-a".into(), "repo-a".into(), "repo-b".into()],
+            hidden_project_ids: vec!["repo-b".into()],
+            view: ProjectDisplayView::Hidden,
+        })
+        .unwrap();
+        assert_eq!(preferences.favorite_project_ids, vec!["repo-a", "repo-b"]);
+        assert_eq!(preferences.hidden_project_ids, vec!["repo-b"]);
+        assert!(
+            validate_project_display_preferences(ProjectDisplayPreferencesInput {
+                favorite_project_ids: vec!["bad\nid".into()],
+                hidden_project_ids: vec![],
+                view: ProjectDisplayView::All,
+            })
+            .is_err()
+        );
+
+        let mut settings = Settings::default();
+        settings.preferences.project_display = preferences;
+        let recovered = recover_settings(serde_json::to_value(settings).unwrap());
+        assert_eq!(
+            recovered.preferences.project_display.view,
+            ProjectDisplayView::Hidden
+        );
+        assert_eq!(
+            recovered.preferences.project_display.favorite_project_ids,
+            vec!["repo-a", "repo-b"]
         );
     }
 

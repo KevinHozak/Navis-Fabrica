@@ -7,6 +7,7 @@
     "allow-get-settings",
     "allow-discover-workflow-skills",
     "allow-save-settings",
+    "allow-save-project-display-preferences",
     "allow-start-project-scan",
     "allow-start-affected-project-refresh",
     "allow-cancel-project-scan",

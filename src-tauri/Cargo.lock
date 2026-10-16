@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "navis-fabrica"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "notify",
  "reqwest",

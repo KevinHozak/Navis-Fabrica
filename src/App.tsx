@@ -4,6 +4,7 @@ import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import { GitHubIssuePicker } from "./GitHubIssuePicker";
 import { RunsPanel } from "./RunsPanel";
+import { displayDirectoryPath } from "./pathDisplay";
 import { actionDisabledReason, workflowActions, WorkflowEffect, WorkflowSkillStatus } from "./actions";
 import {
   cancelProjectScan,
@@ -400,7 +401,7 @@ function App() {
           ) : (
             <section className="panel project-panel" aria-labelledby="project-list-title">
               <div className="panel-heading panel-heading-row">
-                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? `Workspace: ${projectRoot}` : "This workspace section is part of the foundation shell."}</p></div>
+                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? `Workspace: ${displayDirectoryPath(projectRoot)}` : "This workspace section is part of the foundation shell."}</p></div>
                 <span className="project-count" aria-live="polite">{section === "projects" ? projects.length : ""}</span>
               </div>
               <div className="panel-rule" />
@@ -429,7 +430,7 @@ function App() {
                 <div className="empty-state">
                   <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="orbit orbit-three" /><span className="empty-spark spark-one">✦</span><span className="empty-spark spark-two">·</span><span className="folder-shape"><span /></span></div>
                   <h3>{scanStatus === "complete" ? scanResult?.errors.length ? "Scan partly complete" : "No projects found" : scanStatus === "cancelled" ? "Scan cancelled" : "Ready when you are"}</h3>
-                  <p>{scanStatus === "complete" ? scanResult?.errors.length ? `Some folders under ${projectRoot} could not be inspected.` : `No coding projects were found under ${projectRoot}.` : scanStatus === "cancelled" ? `The scan stopped after checking ${scanResult?.directoriesScanned ?? 0} folders.` : "Scan your configured workspace to find coding projects and repositories."}</p>
+                  <p>{scanStatus === "complete" ? scanResult?.errors.length ? `Some folders under ${displayDirectoryPath(projectRoot)} could not be inspected.` : `No coding projects were found under ${displayDirectoryPath(projectRoot)}.` : scanStatus === "cancelled" ? `The scan stopped after checking ${scanResult?.directoriesScanned ?? 0} folders.` : "Scan your configured workspace to find coding projects and repositories."}</p>
                   {scanResult?.errors.length ? <details className="scan-notice"><summary>Show scan issues ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul></details> : null}
                   {scanStatus === "idle" && <button className="button button-secondary" type="button" onClick={() => { void beginScan(); }}>↻ Scan workspace</button>}
                 </div>
@@ -587,7 +588,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
               const index = start + offset;
               return <div id={`project-option-${cssSafeId(project.id)}`} key={project.id} className={`project-option${selectedProjectId === project.id ? " selected" : ""}`} role="option" aria-selected={selectedProjectId === project.id} aria-posinset={index + 1} aria-setsize={visible.length} onClick={() => onSelect(project.id)}>
                 <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
-                <span className="project-option-copy"><strong>{project.name}</strong><span>{project.path}</span></span>
+                <span className="project-option-copy"><strong>{project.name}</strong><span>{displayDirectoryPath(project.path)}</span></span>
                 <span className="project-option-tags">{project.detectedStacks.slice(0, 2).map((stack) => <span className="project-tag" key={stack}>{stack}</span>)}</span>
               </div>;
             })}
@@ -642,7 +643,7 @@ function ProjectDetails({ project, onWork }: { project: ProjectEntry | null; onW
   if (!project) return <aside className="project-detail empty-detail"><h3>Select a project</h3><p>Choose a project to see its local details.</p></aside>;
   const git = project.git;
   return <aside className="project-detail" aria-labelledby="project-detail-title">
-    <p className="eyebrow">PROJECT DETAILS</p><h3 id="project-detail-title">{project.name}</h3><p className="detail-path">{project.path}</p>
+    <p className="eyebrow">PROJECT DETAILS</p><h3 id="project-detail-title">{project.name}</h3><p className="detail-path">{displayDirectoryPath(project.path)}</p>
     <div className="detail-group"><strong>Repository</strong><span>{project.isGitRepository ? git.status === "available" ? git.branch ? `Branch ${git.branch}` : "Branch unavailable" : gitStatusLabel(git.status) : "Not a Git repository"}</span>
       {project.isGitRepository && git.dirty !== null && <span>{git.dirty ? "Uncommitted changes" : "Working tree clean"}</span>}
       {git.latestCommit && <span>{git.latestCommit.shortHash} · {git.latestCommit.subject}</span>}

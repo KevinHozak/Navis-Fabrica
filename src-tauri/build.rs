@@ -4,6 +4,7 @@ fn main() {
             "get_settings",
             "get_project_inventory",
             "save_settings",
+            "save_project_display_preferences",
             "start_project_scan",
             "cancel_project_scan",
             "inspect_providers",

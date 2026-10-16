@@ -4,6 +4,20 @@ import { listen } from "@tauri-apps/api/event";
 export type Preferences = {
   includeHidden: boolean;
   scanDepth: number;
+  projectDisplay: ProjectDisplayPreferences;
+};
+
+export type ProjectDisplayView = "all" | "favorites" | "hidden";
+export type ProjectDisplayPreferences = {
+  favoriteProjectIds: string[];
+  hiddenProjectIds: string[];
+  view: ProjectDisplayView;
+};
+
+export const defaultProjectDisplayPreferences: ProjectDisplayPreferences = {
+  favoriteProjectIds: [],
+  hiddenProjectIds: [],
+  view: "all",
 };
 
 export type Settings = {
@@ -249,10 +263,10 @@ export type ProjectScanFinished = {
 };
 
 export const defaultSettings: Settings = {
-  schemaVersion: 4,
+  schemaVersion: 5,
   projectRoot: "C:\\Projects",
   exclusions: [".git", ".worktrees", "node_modules", "target"],
-  preferences: { includeHidden: false, scanDepth: 3 },
+  preferences: { includeHidden: false, scanDepth: 3, projectDisplay: defaultProjectDisplayPreferences },
   providers: [],
   providerSelection: { providerId: null, modelId: null, reasoningEffort: null, runtimeId: null },
   githubAccounts: [],
@@ -403,7 +417,7 @@ export async function loadSettings(): Promise<Settings> {
     if (!parsed || typeof parsed !== "object") return defaultSettings;
     const candidate = parsed as Partial<Settings>;
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       projectRoot: typeof candidate.projectRoot === "string" ? candidate.projectRoot : defaultSettings.projectRoot,
       exclusions: Array.isArray(candidate.exclusions) && candidate.exclusions.every((item) => typeof item === "string")
         ? candidate.exclusions
@@ -413,6 +427,7 @@ export async function loadSettings(): Promise<Settings> {
         scanDepth: typeof candidate.preferences?.scanDepth === "number" && candidate.preferences.scanDepth >= 1 && candidate.preferences.scanDepth <= 8
           ? candidate.preferences.scanDepth
           : defaultSettings.preferences.scanDepth,
+        projectDisplay: recoverProjectDisplayPreferences(candidate.preferences?.projectDisplay),
       },
       providers: Array.isArray(candidate.providers) ? candidate.providers : defaultSettings.providers,
       providerSelection: candidate.providerSelection && typeof candidate.providerSelection === "object"
@@ -445,7 +460,29 @@ export async function saveSettings(settings: SettingsInput): Promise<Settings> {
       throw new Error("Use an opaque credential-store: or provider-managed: reference; tokens are not accepted.");
     }
   }
-  const saved = { schemaVersion: 4, ...settings };
+  const saved = { schemaVersion: 5, ...settings };
   localStorage.setItem(previewStorageKey, JSON.stringify(saved));
   return saved;
+}
+
+function recoverProjectDisplayPreferences(value: unknown): ProjectDisplayPreferences {
+  if (!value || typeof value !== "object") return defaultProjectDisplayPreferences;
+  const candidate = value as Partial<ProjectDisplayPreferences>;
+  const projectIds = (ids: unknown) => Array.isArray(ids)
+    ? [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(id)))].slice(0, 10_000)
+    : [];
+  return {
+    favoriteProjectIds: projectIds(candidate.favoriteProjectIds),
+    hiddenProjectIds: projectIds(candidate.hiddenProjectIds),
+    view: candidate.view === "favorites" || candidate.view === "hidden" ? candidate.view : "all",
+  };
+}
+
+export async function saveProjectDisplayPreferences(preferences: ProjectDisplayPreferences): Promise<ProjectDisplayPreferences> {
+  if (isDesktopApp()) {
+    return invoke<ProjectDisplayPreferences>("save_project_display_preferences", { preferences });
+  }
+  const settings = await loadSettings();
+  const saved = await saveSettings({ ...settings, preferences: { ...settings.preferences, projectDisplay: preferences } });
+  return saved.preferences.projectDisplay;
 }

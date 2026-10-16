@@ -19,6 +19,10 @@ import {
   onProjectScanProgress,
   onProjectWatchError,
   ProjectEntry,
+  ProjectDisplayPreferences,
+  ProjectDisplayView,
+  defaultProjectDisplayPreferences,
+  saveProjectDisplayPreferences,
   GitHubIssue,
   ProjectScanFinished,
   ProjectScanProgress,
@@ -510,27 +514,103 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
   const [renderLimit, setRenderLimit] = useState(PROJECTS_PER_PAGE);
-  const stacks = useMemo(() => [...new Set(projects.flatMap((project) => project.detectedStacks))].sort(), [projects]);
+  const [projectDisplay, setProjectDisplay] = useState<ProjectDisplayPreferences>(defaultProjectDisplayPreferences);
+  const [preferencesReady, setPreferencesReady] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
+  const projectDisplayRef = useRef(projectDisplay);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const uniqueProjects = useMemo(() => [...new Map(projects.map((project) => [project.id, project])).values()], [projects]);
+  useEffect(() => {
+    let active = true;
+    loadSettings().then((settings) => {
+      if (!active) return;
+      projectDisplayRef.current = settings.preferences.projectDisplay;
+      setProjectDisplay(settings.preferences.projectDisplay);
+      setPreferencesReady(true);
+    }).catch((error: unknown) => {
+      if (!active) return;
+      setSaveMessage(`Saved project filters could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+      setPreferencesReady(true);
+    });
+    return () => { active = false; };
+  }, []);
+
+  function updateProjectDisplay(next: ProjectDisplayPreferences) {
+    projectDisplayRef.current = next;
+    setProjectDisplay(next);
+    setSaveMessage("Saving project preferences…");
+    const pending = saveQueue.current.catch(() => undefined).then(async () => {
+      const saved = await saveProjectDisplayPreferences(next);
+      if (JSON.stringify(projectDisplayRef.current) === JSON.stringify(next)) {
+        projectDisplayRef.current = saved;
+        setProjectDisplay(saved);
+        setSaveMessage("Project preferences saved.");
+      }
+    });
+    saveQueue.current = pending.catch((error: unknown) => {
+      if (JSON.stringify(projectDisplayRef.current) === JSON.stringify(next)) {
+        setSaveMessage(`Project preferences could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+  }
+
+  function setView(view: ProjectDisplayView) {
+    const current = projectDisplayRef.current;
+    if (view !== current.view) updateProjectDisplay({ ...current, view });
+  }
+
+  function focusViewControl(view = projectDisplayRef.current.view) {
+    document.querySelector<HTMLButtonElement>(`[data-project-view="${view}"]`)?.focus();
+  }
+
+  function toggleProjectId(key: "favoriteProjectIds" | "hiddenProjectIds", id: string) {
+    const latest = projectDisplayRef.current;
+    const current = new Set(latest[key]);
+    if (current.has(id)) current.delete(id);
+    else current.add(id);
+    updateProjectDisplay({ ...latest, [key]: [...current] });
+  }
+
+  const favoriteIds = useMemo(() => new Set(projectDisplay.favoriteProjectIds), [projectDisplay.favoriteProjectIds]);
+  const hiddenIds = useMemo(() => new Set(projectDisplay.hiddenProjectIds), [projectDisplay.hiddenProjectIds]);
+  const stacks = useMemo(() => [...new Set(uniqueProjects.flatMap((project) => project.detectedStacks))].sort(), [uniqueProjects]);
+  const inView = useMemo(() => uniqueProjects.filter((project) => {
+    const isHidden = hiddenIds.has(project.id);
+    if (projectDisplay.view === "hidden") return isHidden;
+    if (isHidden) return false;
+    return projectDisplay.view !== "favorites" || favoriteIds.has(project.id);
+  }), [uniqueProjects, hiddenIds, favoriteIds, projectDisplay.view]);
+  const allProjectsHidden = uniqueProjects.length > 0 && uniqueProjects.every((project) => hiddenIds.has(project.id));
+  const hasHiddenFavorite = uniqueProjects.some((project) => hiddenIds.has(project.id) && favoriteIds.has(project.id));
   const visible = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    return projects.filter((project) =>
+    return inView.filter((project) =>
       (stackFilter === "all" || project.detectedStacks.includes(stackFilter)) &&
       (!normalized || `${project.name} ${project.path} ${project.detectedStacks.join(" ")}`.toLocaleLowerCase().includes(normalized)),
     );
-  }, [projects, query, stackFilter]);
-  useEffect(() => setRenderLimit(PROJECTS_PER_PAGE), [query, stackFilter, projects]);
-  const selected = projects.find((project) => project.id === selectedProjectId) ?? null;
+  }, [inView, query, stackFilter]);
+  useEffect(() => setRenderLimit(PROJECTS_PER_PAGE), [query, stackFilter, projectDisplay.view, projectDisplay.favoriteProjectIds, projectDisplay.hiddenProjectIds, projects]);
+  const selected = uniqueProjects.find((project) => project.id === selectedProjectId) ?? null;
   const rendered = visible.slice(0, renderLimit);
 
   return <div className="project-browser">
     <div className="project-browser-controls">
       <label className="project-search"><span className="sr-only">Search projects</span><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search projects" /></label>
       <label className="project-filter"><span className="sr-only">Filter by stack</span><select value={stackFilter} onChange={(event) => setStackFilter(event.target.value)}><option value="all">All stacks</option>{stacks.map((stack) => <option key={stack} value={stack}>{stack}</option>)}</select></label>
-      <span className="project-count" aria-live="polite">{visible.length} of {projects.length}</span>
+      <div className="project-view-filter" role="group" aria-label="Project visibility">
+        {(["all", "favorites", "hidden"] as const).map((view) => <button key={view} data-project-view={view} className="project-view-button" type="button" disabled={!preferencesReady} aria-pressed={projectDisplay.view === view} onClick={() => setView(view)}>{view === "all" ? "All" : view === "favorites" ? "Favorites" : "Hidden"}</button>)}
+      </div>
+      <span className="project-count" aria-live="polite">{visible.length} of {inView.length}</span>
     </div>
+    {!preferencesReady && <p className="project-preference-status" role="status">Loading saved project preferences…</p>}
+    {saveMessage && <p className="project-preference-status" role="status" aria-live="polite">{saveMessage}</p>}
     <div className="project-browser-results">
-      {visible.length ? <div className="project-card-grid" aria-label="Projects" role="list">
+      {!preferencesReady ? null : visible.length ? <div className="project-card-grid" aria-label="Projects" role="list">
         {rendered.map((project) => <article className={`project-card${selectedProjectId === project.id ? " selected" : ""}`} role="listitem" key={project.id}>
+          <div className="project-card-actions">
+            <button className="project-card-action favorite-action" type="button" aria-pressed={favoriteIds.has(project.id)} aria-label={favoriteIds.has(project.id) ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`} onClick={() => { if (favoriteIds.has(project.id) && projectDisplay.view === "favorites") focusViewControl(); toggleProjectId("favoriteProjectIds", project.id); }}>{favoriteIds.has(project.id) ? "★ Favorited" : "☆ Favorite"}</button>
+            <button className="project-card-action" type="button" aria-label={hiddenIds.has(project.id) ? `Restore ${project.name}` : `Hide ${project.name}`} onClick={() => { focusViewControl(); toggleProjectId("hiddenProjectIds", project.id); }}>{hiddenIds.has(project.id) ? "Restore project" : "Hide project"}</button>
+          </div>
           <button className="project-card-select" type="button" aria-pressed={selectedProjectId === project.id} onClick={() => onSelect(project.id)}>
             <span className="project-card-heading">
               <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
@@ -548,7 +628,11 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
             </span>
           </button>
         </article>)}
-      </div> : <div className="project-filter-empty">No projects match these filters.</div>}
+      </div> : <div className="project-filter-empty">
+        <strong>{inView.length ? "No projects match these filters." : projectDisplay.view === "favorites" ? hasHiddenFavorite ? "Your favorites are hidden." : "No favorite projects yet." : projectDisplay.view === "hidden" ? "No hidden projects." : allProjectsHidden ? "All projects are hidden." : "No projects match these filters."}</strong>
+        <span>{!inView.length && projectDisplay.view === "favorites" ? hasHiddenFavorite ? "Restore a favorite from Hidden to see it here." : "Mark a project as a favorite to find it here." : !inView.length && projectDisplay.view === "hidden" ? "Projects you hide will appear here, where you can restore them." : allProjectsHidden && projectDisplay.view === "all" ? "Your hidden projects are still saved and can be restored." : "Try another search or stack filter."}</span>
+        {projectDisplay.view !== "all" ? <button type="button" className="text-button" onClick={() => { focusViewControl("all"); setView("all"); }}>Show all projects</button> : allProjectsHidden ? <button type="button" className="text-button" onClick={() => { focusViewControl("hidden"); setView("hidden"); }}>Review hidden projects</button> : <button type="button" className="text-button" onClick={() => { setQuery(""); setStackFilter("all"); }}>Clear search and stack filters</button>}
+      </div>}
       {renderLimit < visible.length && <div className="project-load-more"><span>Showing {rendered.length} of {visible.length} projects</span><button type="button" onClick={() => setRenderLimit((limit) => Math.min(limit + PROJECTS_PER_PAGE, visible.length))}>Show more projects</button></div>}
       <ProjectDetails project={selected} onWork={(issue) => { if (selected) onWork(issue, selected.id); }} />
     </div>

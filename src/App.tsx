@@ -1,5 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import { GitHubIssuePicker } from "./GitHubIssuePicker";
@@ -500,8 +499,7 @@ function gitStatusLabel(status: string): string {
   }
 }
 
-const PROJECT_ROW_HEIGHT = 68;
-const PROJECT_OVERSCAN = 5;
+const PROJECTS_PER_PAGE = 60;
 
 function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
   projects: ProjectEntry[];
@@ -511,9 +509,7 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
 }) {
   const [query, setQuery] = useState("");
   const [stackFilter, setStackFilter] = useState("all");
-  const [scrollTop, setScrollTop] = useState(0);
-  const viewportRef = useRef<HTMLDivElement>(null);
-  const lastViewRef = useRef({ projects, query, stackFilter, selectedProjectId });
+  const [renderLimit, setRenderLimit] = useState(PROJECTS_PER_PAGE);
   const stacks = useMemo(() => [...new Set(projects.flatMap((project) => project.detectedStacks))].sort(), [projects]);
   const visible = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -522,84 +518,42 @@ function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
       (!normalized || `${project.name} ${project.path} ${project.detectedStacks.join(" ")}`.toLocaleLowerCase().includes(normalized)),
     );
   }, [projects, query, stackFilter]);
+  useEffect(() => setRenderLimit(PROJECTS_PER_PAGE), [query, stackFilter, projects]);
   const selected = projects.find((project) => project.id === selectedProjectId) ?? null;
-  const selectedIndex = visible.findIndex((project) => project.id === selectedProjectId);
-  const start = Math.max(0, Math.floor(scrollTop / PROJECT_ROW_HEIGHT) - PROJECT_OVERSCAN);
-  const end = Math.min(visible.length, Math.ceil((scrollTop + 360) / PROJECT_ROW_HEIGHT) + PROJECT_OVERSCAN);
-
-  useLayoutEffect(() => {
-    const previous = lastViewRef.current;
-    lastViewRef.current = { projects, query, stackFilter, selectedProjectId };
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-
-    if (previous.query !== query || previous.stackFilter !== stackFilter) {
-      viewport.scrollTop = 0;
-      setScrollTop(0);
-      return;
-    }
-    if (previous.projects === projects && previous.selectedProjectId === selectedProjectId) return;
-
-    const index = visible.findIndex((project) => project.id === selectedProjectId);
-    if (index < 0) return;
-    const rowTop = index * PROJECT_ROW_HEIGHT;
-    const rowBottom = rowTop + PROJECT_ROW_HEIGHT;
-    let nextScrollTop = viewport.scrollTop;
-    if (rowTop < nextScrollTop) nextScrollTop = rowTop;
-    else if (rowBottom > nextScrollTop + viewport.clientHeight) nextScrollTop = rowBottom - viewport.clientHeight;
-    if (nextScrollTop !== viewport.scrollTop) {
-      viewport.scrollTop = nextScrollTop;
-      setScrollTop(nextScrollTop);
-    }
-  }, [projects, query, stackFilter, selectedProjectId, visible]);
-
-  function choose(index: number) {
-    const bounded = Math.max(0, Math.min(visible.length - 1, index));
-    const project = visible[bounded];
-    if (!project) return;
-    onSelect(project.id);
-    const node = viewportRef.current;
-    if (node) {
-      const top = bounded * PROJECT_ROW_HEIGHT;
-      if (top < node.scrollTop) node.scrollTop = top;
-      else if (top + PROJECT_ROW_HEIGHT > node.scrollTop + node.clientHeight) node.scrollTop = top + PROJECT_ROW_HEIGHT - node.clientHeight;
-    }
-  }
-
-  function handleListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-      event.preventDefault();
-      const current = visible.findIndex((project) => project.id === selectedProjectId);
-      choose(event.key === "Home" ? 0 : event.key === "End" ? visible.length - 1 : current + (event.key === "ArrowDown" ? 1 : -1));
-    }
-  }
+  const rendered = visible.slice(0, renderLimit);
 
   return <div className="project-browser">
     <div className="project-browser-controls">
       <label className="project-search"><span className="sr-only">Search projects</span><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search projects" /></label>
       <label className="project-filter"><span className="sr-only">Filter by stack</span><select value={stackFilter} onChange={(event) => setStackFilter(event.target.value)}><option value="all">All stacks</option>{stacks.map((stack) => <option key={stack} value={stack}>{stack}</option>)}</select></label>
-      <span className="project-count">{visible.length} of {projects.length}</span>
+      <span className="project-count" aria-live="polite">{visible.length} of {projects.length}</span>
     </div>
-    <div className="project-browser-layout">
-      <div ref={viewportRef} className="project-viewport" role="listbox" aria-label="Projects" aria-activedescendant={selected && selectedIndex >= start && selectedIndex < end ? `project-option-${cssSafeId(selected.id)}` : undefined} tabIndex={0} onKeyDown={handleListKeyDown} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
-        {visible.length ? <div className="project-virtual-space" style={{ height: visible.length * PROJECT_ROW_HEIGHT }}>
-          <div className="project-virtual-window" style={{ transform: `translateY(${start * PROJECT_ROW_HEIGHT}px)` }}>
-            {visible.slice(start, end).map((project, offset) => {
-              const index = start + offset;
-              return <div id={`project-option-${cssSafeId(project.id)}`} key={project.id} className={`project-option${selectedProjectId === project.id ? " selected" : ""}`} role="option" aria-selected={selectedProjectId === project.id} aria-posinset={index + 1} aria-setsize={visible.length} onClick={() => onSelect(project.id)}>
-                <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
-                <span className="project-option-copy"><strong>{project.name}</strong><span>{displayDirectoryPath(project.path)}</span></span>
-                <span className="project-option-tags">{project.detectedStacks.slice(0, 2).map((stack) => <span className="project-tag" key={stack}>{stack}</span>)}</span>
-              </div>;
-            })}
-          </div>
-        </div> : <div className="project-filter-empty">No projects match these filters.</div>}
-      </div>
+    <div className="project-browser-results">
+      {visible.length ? <div className="project-card-grid" aria-label="Projects" role="list">
+        {rendered.map((project) => <article className={`project-card${selectedProjectId === project.id ? " selected" : ""}`} role="listitem" key={project.id}>
+          <button className="project-card-select" type="button" aria-pressed={selectedProjectId === project.id} onClick={() => onSelect(project.id)}>
+            <span className="project-card-heading">
+              <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
+              <span className="project-card-title"><strong>{project.name}</strong><span className="project-card-path">{displayDirectoryPath(project.path)}</span></span>
+              <span className="project-card-selection" aria-hidden="true">{selectedProjectId === project.id ? "Selected" : "Select"}</span>
+            </span>
+            <span className="project-card-facts">
+              <span className="project-card-fact"><span>Branch</span><strong>{project.isGitRepository ? project.git.status === "available" ? project.git.branch || "Unavailable" : gitStatusLabel(project.git.status) : "Not a Git repository"}</strong></span>
+              <span className={`project-card-tree${project.git.dirty === false ? " clean" : project.git.dirty === true ? " dirty" : " unknown"}`}>
+                <span className="project-card-status-dot" aria-hidden="true" />
+                {project.isGitRepository ? project.git.dirty === false ? "Working tree clean" : project.git.dirty === true ? "Uncommitted changes" : "Working tree status unavailable" : "Not a Git repository"}
+              </span>
+              <span className="project-card-fact"><span>Latest commit</span><strong>{project.git.latestCommit ? <><code>{project.git.latestCommit.shortHash}</code> · {project.git.latestCommit.subject}</> : "Unavailable"}</strong></span>
+              <span className="project-card-stacks"><span className="project-card-fact-label">Detected stacks</span>{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span className="project-card-unavailable">None detected</span>}</span>
+            </span>
+          </button>
+        </article>)}
+      </div> : <div className="project-filter-empty">No projects match these filters.</div>}
+      {renderLimit < visible.length && <div className="project-load-more"><span>Showing {rendered.length} of {visible.length} projects</span><button type="button" onClick={() => setRenderLimit((limit) => Math.min(limit + PROJECTS_PER_PAGE, visible.length))}>Show more projects</button></div>}
       <ProjectDetails project={selected} onWork={(issue) => { if (selected) onWork(issue, selected.id); }} />
     </div>
   </div>;
 }
-
 function ProjectDetails({ project, onWork }: { project: ProjectEntry | null; onWork: (issue: GitHubIssue) => void }) {
   const [activity, setActivity] = useState<GitHubActivity | null>(null);
   const [activityLoading, setActivityLoading] = useState(false);
@@ -674,5 +628,3 @@ function ProjectDetails({ project, onWork }: { project: ProjectEntry | null; onW
     {project.workflowPrerequisites.length > 0 && <div className="detail-group"><strong>Workflow prerequisites</strong>{project.workflowPrerequisites.map((tool) => <span key={tool.name}>{tool.name} · {tool.available ? "available" : "missing"}</span>)}</div>}
   </aside>;
 }
-
-function cssSafeId(value: string): string { return encodeURIComponent(value); }

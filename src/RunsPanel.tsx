@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { FallbackTrigger, GitHubIssue, ProjectEntry, ProviderHandoff, WorkflowRunMetadata } from "./settings";
+import { displayDirectoryPath } from "./pathDisplay";
 import {
   cancelWorkflowRun, createProviderHandoff, deleteFinishedWorkflowRuns, discoverWorkflowSkills, evaluateProviderFallback, exportWorkflowDiagnostics, listUsageSignals, listWorkflowRuns, markWorkflowRunNeedsInput, onWorkflowRunEvent, onWorkflowRunUpdated,
   loadSettings, respondCodexApproval, respondCodexUserInput, startAntigravityWorkflowRun, startCodexWorkflowRun, startOllamaWorkflowRun, startOpenRouterWorkflowRun, startWorkflowRun, WorkflowRun, WorkflowSkillStatus, writeWorkflowRunInput,
@@ -377,7 +378,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgentWorkflow(event); }}>
         <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push" | "dev-build")}><option value="dev-work">Work on selected issue</option><option value="dev-push">Review and push selected changes</option><option value="dev-build">Build project</option></select></label>
-        <label>Project<input value={`${project.name} · ${project.path}`} readOnly aria-readonly="true" /></label>
+        <label>Project<input value={`${project.name} · ${displayDirectoryPath(project.path)}`} readOnly aria-readonly="true" /></label>
         {workflowAction === "dev-work" && <label>Issue context<input value={issue ? `#${issue.number} · ${issue.title}${issue.blocked ? " · blocked" : ""}` : "No issue selected"} readOnly aria-readonly="true" /></label>}
         {workflowAction === "dev-push" && <label>Changed file paths, one per line<textarea rows={3} required value={scopePathsText} onChange={(event) => setScopePathsText(event.target.value)} placeholder="src/file.ts" /></label>}
         {workflowAction === "dev-build" && <label>Build profile<select value={buildProfile} onChange={(event) => setBuildProfile(event.target.value as "release" | "debug")}><option value="release">Release (default)</option><option value="debug">Debug (development only)</option></select></label>}

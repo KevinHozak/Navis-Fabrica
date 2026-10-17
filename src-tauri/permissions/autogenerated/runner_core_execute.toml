@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runner-core-execute"
+description = "Enables the runner_core_execute command without any pre-configured scope."
+commands.allow = ["runner_core_execute"]
+
+[[permission]]
+identifier = "deny-runner-core-execute"
+description = "Denies the runner_core_execute command without any pre-configured scope."
+commands.deny = ["runner_core_execute"]

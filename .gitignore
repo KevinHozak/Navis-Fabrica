@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/resources/fabrica-worker.exe
 src-tauri/gen/schemas/
 /.worktrees/
 .env
@@ -10,3 +11,4 @@ src-tauri/gen/schemas/
 .DS_Store
 Thumbs.db
 planning/github-state.json
+/runner-core/target*/

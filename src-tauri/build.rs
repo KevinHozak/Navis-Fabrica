@@ -1,6 +1,8 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "runner_core_execute",
+            "get_runner_context",
             "get_settings",
             "get_project_inventory",
             "save_settings",

@@ -1,6 +1,9 @@
+use navis_fabrica_runner_core::settings::{
+    GitHubAccount, Preferences, ProjectDisplayPreferences, ProjectDisplayView, Settings,
+    SETTINGS_SCHEMA_VERSION,
+};
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -15,6 +18,7 @@ use tempfile::NamedTempFile;
 
 mod github;
 mod inventory;
+pub use navis_fabrica_runner_core as runner_core;
 pub mod jev;
 mod process;
 pub mod providers;
@@ -31,6 +35,144 @@ static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
 static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
     OnceLock::new();
 static APP_STARTUP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Execute the same versioned, headless protocol used by `fabrica-runner`.
+#[tauri::command]
+async fn runner_core_execute(
+    app: AppHandle,
+    mut request: runner_core::CoreRequest,
+) -> runner_core::CoreResponse {
+    if matches!(
+        request.operation,
+        runner_core::Operation::BatchPreview
+            | runner_core::Operation::Submit
+            | runner_core::Operation::RunBatch
+            | runner_core::Operation::Resume
+    ) {
+        let trusted = match resolve_worker_executable(&app) {
+            Ok(path) => path,
+            Err(message) => {
+                return runner_core::CoreResponse {
+                    protocol_version: runner_core::PROTOCOL_VERSION,
+                    ok: false,
+                    exit_code: 6,
+                    result: None,
+                    error: Some(runner_core::ProtocolError {
+                        code: "WORKER_UNAVAILABLE".into(),
+                        message,
+                    }),
+                }
+            }
+        };
+        if request
+            .worker_executable
+            .as_ref()
+            .is_some_and(|provided| provided.canonicalize().ok().as_ref() != Some(&trusted))
+        {
+            return runner_core::CoreResponse {
+                protocol_version: runner_core::PROTOCOL_VERSION,
+                ok: false,
+                exit_code: 2,
+                result: None,
+                error: Some(runner_core::ProtocolError {
+                    code: "INVALID_ARGUMENT".into(),
+                    message: "The desktop app chooses its bundled worker executable.".into(),
+                }),
+            };
+        }
+        request.worker_executable = Some(trusted);
+    }
+    if request.data_root.is_none() && is_runner_supervisor_operation(request.operation) {
+        match default_runner_data_root(&app) {
+            Ok(path) => request.data_root = Some(path),
+            Err(message) => {
+                return runner_core::CoreResponse {
+                    protocol_version: runner_core::PROTOCOL_VERSION,
+                    ok: false,
+                    exit_code: 6,
+                    result: None,
+                    error: Some(runner_core::ProtocolError {
+                        code: "DATA_ROOT_UNAVAILABLE".into(),
+                        message,
+                    }),
+                }
+            }
+        }
+    }
+    match tauri::async_runtime::spawn_blocking(move || runner_core::execute(request)).await {
+        Ok(response) => response,
+        Err(_) => runner_core::CoreResponse {
+            protocol_version: runner_core::PROTOCOL_VERSION,
+            ok: false,
+            exit_code: 6,
+            result: None,
+            error: Some(runner_core::ProtocolError {
+                code: "CORE_EXECUTION_FAILED".into(),
+                message: "The shared runner operation could not be completed.".into(),
+            }),
+        },
+    }
+}
+
+#[tauri::command]
+fn get_runner_context(app: AppHandle) -> Result<serde_json::Value, String> {
+    let root = default_runner_data_root(&app)?;
+    Ok(
+        serde_json::json!({"dataRoot": root, "workerAvailable": resolve_worker_executable(&app).is_ok()}),
+    )
+}
+
+fn is_runner_supervisor_operation(operation: runner_core::Operation) -> bool {
+    matches!(
+        operation,
+        runner_core::Operation::BatchPreview
+            | runner_core::Operation::Submit
+            | runner_core::Operation::RunBatch
+            | runner_core::Operation::RefreshProviderObservations
+            | runner_core::Operation::Status
+            | runner_core::Operation::Events
+            | runner_core::Operation::Pause
+            | runner_core::Operation::Resume
+            | runner_core::Operation::Stop
+            | runner_core::Operation::Cancel
+            | runner_core::Operation::Reconcile
+            | runner_core::Operation::Recover
+    )
+}
+
+fn default_runner_data_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("runner"))
+        .map_err(|error| format!("Could not resolve the app data directory: {error}"))
+}
+
+fn resolve_worker_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    let filename = if cfg!(windows) {
+        "fabrica-worker.exe"
+    } else {
+        "fabrica-worker"
+    };
+    let resource = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|root| root.join(filename));
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|root| root.join(filename)));
+    for candidate in resource.into_iter().chain(sibling) {
+        if candidate.is_file() {
+            return candidate
+                .canonicalize()
+                .map_err(|error| format!("Could not resolve worker executable: {error}"));
+        }
+    }
+    Err(
+        "The bundled fabrica-worker executable is missing beside the app or in its resources."
+            .into(),
+    )
+}
 
 pub fn startup_measurement_ms() -> Option<u64> {
     match APP_STARTUP_MS.load(Ordering::Acquire) {
@@ -224,51 +366,7 @@ async fn get_github_issue(
 }
 
 fn resolve_github_credential(reference: &str) -> Option<String> {
-    let key = reference.strip_prefix("credential-store:")?;
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || ".:/_-".contains(character))
-    {
-        return None;
-    }
-    #[cfg(windows)]
-    {
-        use std::slice;
-        use windows_sys::Win32::Security::Credentials::{
-            CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
-        };
-        let target: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
-        let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
-        if read == 0 || credential.is_null() {
-            return None;
-        }
-        let entry = unsafe { &*credential };
-        let token = if entry.CredentialBlob.is_null()
-            || entry.CredentialBlobSize == 0
-            || entry.CredentialBlobSize > 4096
-        {
-            None
-        } else {
-            let bytes = unsafe {
-                slice::from_raw_parts(entry.CredentialBlob, entry.CredentialBlobSize as usize)
-            };
-            std::str::from_utf8(bytes)
-                .ok()
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
-                .map(str::to_owned)
-        };
-        unsafe {
-            CredFree(credential.cast());
-        }
-        token
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
+    runner_core::credentials::resolve(reference)
 }
 
 fn resolve_openrouter_credential(provider_id: &str, reference: Option<&str>) -> Option<String> {
@@ -283,39 +381,7 @@ fn store_openrouter_credential(target: &str, secret: &str) -> Result<(), String>
     if !providers::valid_openrouter_key(secret) {
         return Err("Enter a valid OpenRouter API key.".into());
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Security::Credentials::{
-            CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
-        };
-        let target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut bytes = secret.trim().as_bytes().to_vec();
-        let credential = CREDENTIALW {
-            Flags: 0,
-            Type: CRED_TYPE_GENERIC,
-            TargetName: target_wide.as_ptr() as *mut u16,
-            Comment: std::ptr::null_mut(),
-            LastWritten: unsafe { std::mem::zeroed() },
-            CredentialBlobSize: bytes.len() as u32,
-            CredentialBlob: bytes.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            AttributeCount: 0,
-            Attributes: std::ptr::null_mut(),
-            TargetAlias: std::ptr::null_mut(),
-            UserName: std::ptr::null_mut(),
-        };
-        let written = unsafe { CredWriteW(&credential, 0) };
-        bytes.fill(0);
-        if written == 0 {
-            return Err("Windows Credential Manager could not save the OpenRouter key.".into());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        Err("OpenRouter credential storage is available only in the Windows desktop app.".into())
-    }
+    runner_core::credentials::store(target, secret)
 }
 
 fn resolve_typesafe_credential(profile_id: &str, reference: Option<&str>) -> Option<String> {
@@ -330,130 +396,13 @@ fn store_typesafe_credential(target: &str, secret: &str) -> Result<(), String> {
     if !providers::valid_typesafe_key(secret) {
         return Err("Enter a valid TypeSafe API key.".into());
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Security::Credentials::{
-            CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
-        };
-        let target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut bytes = secret.trim().as_bytes().to_vec();
-        let credential = CREDENTIALW {
-            Flags: 0,
-            Type: CRED_TYPE_GENERIC,
-            TargetName: target_wide.as_ptr() as *mut u16,
-            Comment: std::ptr::null_mut(),
-            LastWritten: unsafe { std::mem::zeroed() },
-            CredentialBlobSize: bytes.len() as u32,
-            CredentialBlob: bytes.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            AttributeCount: 0,
-            Attributes: std::ptr::null_mut(),
-            TargetAlias: std::ptr::null_mut(),
-            UserName: std::ptr::null_mut(),
-        };
-        let written = unsafe { CredWriteW(&credential, 0) };
-        bytes.fill(0);
-        if written == 0 {
-            return Err("Windows Credential Manager could not save the TypeSafe key.".into());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        Err("TypeSafe credential storage is available only in the Windows desktop app.".into())
-    }
+    runner_core::credentials::store(target, secret)
 }
 
-const SETTINGS_SCHEMA_VERSION: u32 = 5;
 const SETTINGS_FILE: &str = "settings.json";
 const PROJECT_INVENTORY_FILE: &str = "project-inventory.json";
 const MAX_PROJECT_DISPLAY_IDS: usize = 10_000;
 const MAX_PROJECT_ID_LENGTH: usize = 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ProjectDisplayView {
-    All,
-    Favorites,
-    Hidden,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectDisplayPreferences {
-    pub favorite_project_ids: Vec<String>,
-    pub hidden_project_ids: Vec<String>,
-    pub view: ProjectDisplayView,
-}
-
-impl Default for ProjectDisplayView {
-    fn default() -> Self {
-        Self::All
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Preferences {
-    pub include_hidden: bool,
-    pub scan_depth: u8,
-    #[serde(default)]
-    pub project_display: ProjectDisplayPreferences,
-}
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            include_hidden: false,
-            scan_depth: 3,
-            project_display: ProjectDisplayPreferences::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Settings {
-    pub schema_version: u32,
-    pub project_root: String,
-    pub exclusions: Vec<String>,
-    pub preferences: Preferences,
-    pub providers: Vec<providers::ProviderProfile>,
-    pub provider_selection: providers::ProviderSelection,
-    pub github_accounts: Vec<GitHubAccount>,
-    pub selected_github_account_id: Option<String>,
-    pub typesafe_profile: Option<providers::TypeSafeProfile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitHubAccount {
-    pub id: String,
-    pub login: String,
-    pub credential_ref: Option<String>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            schema_version: SETTINGS_SCHEMA_VERSION,
-            project_root: String::from(r"C:\Projects"),
-            exclusions: vec![
-                String::from(".git"),
-                String::from(".worktrees"),
-                String::from("node_modules"),
-                String::from("target"),
-            ],
-            preferences: Preferences::default(),
-            providers: Vec::new(),
-            provider_selection: providers::ProviderSelection::default(),
-            github_accounts: Vec::new(),
-            selected_github_account_id: None,
-            typesafe_profile: None,
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -517,44 +466,6 @@ fn validate_project_display_preferences(
         hidden_project_ids: validate_project_ids(preferences.hidden_project_ids)?,
         view: preferences.view,
     })
-}
-
-fn recover_project_ids(value: Option<&Value>) -> Vec<String> {
-    let Some(values) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut ids = Vec::new();
-    let mut unique = std::collections::HashSet::new();
-    for id in values
-        .iter()
-        .take(MAX_PROJECT_DISPLAY_IDS)
-        .filter_map(Value::as_str)
-    {
-        if !id.is_empty()
-            && id.len() <= MAX_PROJECT_ID_LENGTH
-            && !id.chars().any(char::is_control)
-            && unique.insert(id.to_owned())
-        {
-            ids.push(id.to_owned());
-        }
-    }
-    ids
-}
-
-fn recover_project_display_preferences(value: Option<&Value>) -> ProjectDisplayPreferences {
-    let Some(object) = value.and_then(Value::as_object) else {
-        return ProjectDisplayPreferences::default();
-    };
-    let view = match object.get("view").and_then(Value::as_str) {
-        Some("favorites") => ProjectDisplayView::Favorites,
-        Some("hidden") => ProjectDisplayView::Hidden,
-        _ => ProjectDisplayView::All,
-    };
-    ProjectDisplayPreferences {
-        favorite_project_ids: recover_project_ids(object.get("favoriteProjectIds")),
-        hidden_project_ids: recover_project_ids(object.get("hiddenProjectIds")),
-        view,
-    }
 }
 
 fn validate_project_root(value: &str) -> Result<String, String> {
@@ -626,133 +537,13 @@ fn validate_exclusions(values: Vec<String>) -> Result<Vec<String>, String> {
     Ok(exclusions)
 }
 
-fn recover_settings(value: Value) -> Settings {
-    let defaults = Settings::default();
-    let Some(object) = value.as_object() else {
-        return defaults;
-    };
-
-    let project_root = object
-        .get("projectRoot")
-        .and_then(Value::as_str)
-        .and_then(|candidate| validate_project_root(candidate).ok())
-        .unwrap_or(defaults.project_root);
-
-    let exclusions = match object.get("exclusions").and_then(Value::as_array) {
-        Some(entries) => {
-            let mut valid_entries = Vec::with_capacity(entries.len().min(200));
-            for entry in entries.iter().take(200).filter_map(Value::as_str) {
-                if let Ok(mut validated) = validate_exclusions(vec![entry.to_owned()]) {
-                    if let Some(entry) = validated.pop() {
-                        valid_entries.push(entry);
-                    }
-                }
-            }
-            validate_exclusions(valid_entries).unwrap_or(defaults.exclusions)
-        }
-        None => defaults.exclusions,
-    };
-
-    let preference_value = object.get("preferences").and_then(Value::as_object);
-    let include_hidden = preference_value
-        .and_then(|preferences| preferences.get("includeHidden"))
-        .and_then(Value::as_bool)
-        .unwrap_or(defaults.preferences.include_hidden);
-    let scan_depth = preference_value
-        .and_then(|preferences| preferences.get("scanDepth"))
-        .and_then(Value::as_u64)
-        .filter(|depth| (1..=8).contains(depth))
-        .map(|depth| depth as u8)
-        .unwrap_or(defaults.preferences.scan_depth);
-
-    let provider_profiles = object
-        .get("providers")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<Vec<providers::ProviderProfile>>(value).ok())
-        .unwrap_or_default();
-    let provider_selection = object
-        .get("providerSelection")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<providers::ProviderSelection>(value).ok())
-        .unwrap_or_default();
-    // Profile validity is independent of the remembered selection. Preserve
-    // usable profiles when a stale provider/model selection needs to recover.
-    let profiles_valid =
-        providers::validate_profiles(&provider_profiles, &providers::ProviderSelection::default())
-            .is_ok();
-    let (providers, provider_selection) = if profiles_valid {
-        let selection =
-            if providers::validate_profiles(&provider_profiles, &provider_selection).is_ok() {
-                provider_selection
-            } else {
-                defaults.provider_selection
-            };
-        (provider_profiles, selection)
-    } else {
-        (defaults.providers, defaults.provider_selection)
-    };
-
-    let github_accounts = object
-        .get("githubAccounts")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<Vec<GitHubAccount>>(value).ok())
-        .filter(|accounts| validate_github_accounts(accounts, None).is_ok())
-        .unwrap_or_default();
-    let selected_github_account_id = object
-        .get("selectedGithubAccountId")
-        .and_then(Value::as_str)
-        .filter(|id| github_accounts.iter().any(|account| &account.id == *id))
-        .map(str::to_owned);
-    let typesafe_profile = object
-        .get("typesafeProfile")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<providers::TypeSafeProfile>(value).ok())
-        .filter(|profile| {
-            providers::typesafe_credential_target(&profile.id).is_ok()
-                && profile.credential_ref.as_ref().is_none_or(|reference| {
-                    providers::typesafe_credential_reference_matches(&profile.id, reference)
-                })
-        });
-
-    Settings {
-        schema_version: SETTINGS_SCHEMA_VERSION,
-        project_root,
-        exclusions,
-        preferences: Preferences {
-            include_hidden,
-            scan_depth,
-            project_display: recover_project_display_preferences(
-                preference_value.and_then(|preferences| preferences.get("projectDisplay")),
-            ),
-        },
-        providers,
-        provider_selection,
-        github_accounts,
-        selected_github_account_id,
-        typesafe_profile,
-    }
+#[cfg(test)]
+fn recover_settings(value: serde_json::Value) -> Settings {
+    runner_core::settings::recover_settings(value)
 }
 
 fn load_settings(path: &Path) -> Result<Settings, String> {
-    match fs::read(path) {
-        Ok(contents) => match serde_json::from_slice::<Value>(&contents) {
-            Ok(value) => {
-                let stored_version = value
-                    .get("schemaVersion")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if stored_version > u64::from(SETTINGS_SCHEMA_VERSION) {
-                    return Err(
-                        "These settings were saved by a newer version of Navis-Fabrica.".into(),
-                    );
-                }
-                Ok(recover_settings(value))
-            }
-            Err(_) => Ok(Settings::default()),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(error) => Err(format!("Could not read settings: {error}")),
-    }
+    runner_core::settings::load_settings(path)
 }
 
 fn write_settings_atomic(path: &Path, settings: &Settings) -> Result<(), String> {
@@ -1052,42 +843,7 @@ fn validate_github_accounts(
     accounts: &[GitHubAccount],
     selected: Option<&str>,
 ) -> Result<(), String> {
-    if accounts.len() > 20 {
-        return Err("Configure 20 or fewer GitHub accounts.".into());
-    }
-    let mut ids = Vec::new();
-    for account in accounts {
-        if account.id.trim().is_empty()
-            || account.id.len() > 80
-            || account.login.trim().is_empty()
-            || account.login.len() > 100
-            || account.id.chars().any(char::is_control)
-            || account.login.chars().any(char::is_control)
-            || ids.iter().any(|id: &String| id == &account.id)
-        {
-            return Err("GitHub account IDs and logins must be valid and unique.".into());
-        }
-        ids.push(account.id.clone());
-        if account.credential_ref.as_ref().is_some_and(|value| {
-            let key = value
-                .strip_prefix("credential-store:")
-                .or_else(|| value.strip_prefix("provider-managed:"));
-            value.len() > 260
-                || value.chars().any(char::is_control)
-                || key.is_none_or(|key| {
-                    key.is_empty()
-                        || !key
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || ".:/_-".contains(c))
-                })
-        }) {
-            return Err("Use an opaque credential-store: or provider-managed: reference; tokens are not accepted.".into());
-        }
-    }
-    if selected.is_some_and(|id| !accounts.iter().any(|account| account.id == id)) {
-        return Err("Select a configured GitHub account.".into());
-    }
-    Ok(())
+    runner_core::settings::validate_github_accounts(accounts, selected)
 }
 
 #[tauri::command]
@@ -1226,83 +982,10 @@ fn probe_typesafe(app: AppHandle) -> Result<providers::TypeSafeProbe, String> {
 
 #[tauri::command]
 fn start_openrouter_workflow_run(
-    app: AppHandle,
-    request: runs::OpenRouterStartRequest,
+    _app: AppHandle,
+    _request: runs::OpenRouterStartRequest,
 ) -> Result<runs::RunRecord, String> {
-    let settings = load_settings(&settings_path(&app)?)?;
-    providers::validate_profiles(&settings.providers, &settings.provider_selection)?;
-    let selection = &settings.provider_selection;
-    let provider_id = selection
-        .provider_id
-        .as_deref()
-        .ok_or("Choose an OpenRouter provider in Providers first.")?;
-    let profile = settings
-        .providers
-        .iter()
-        .find(|profile| profile.id == provider_id)
-        .ok_or("The selected provider is no longer configured.")?;
-    if profile.kind != providers::ProviderKind::OpenRouter {
-        return Err("The selected provider is not OpenRouter.".into());
-    }
-    if selection.reasoning_effort.is_some() {
-        return Err(
-            "The Aider OpenRouter adapter does not expose verified reasoning-effort options."
-                .into(),
-        );
-    }
-    if selection
-        .runtime_id
-        .as_deref()
-        .is_some_and(|runtime| !runtime.is_empty() && runtime != "aider-openrouter")
-    {
-        return Err("This phase supports the Aider OpenRouter runtime only.".into());
-    }
-    let model_id = selection
-        .model_id
-        .as_deref()
-        .ok_or("Discover OpenRouter models and select a model first.")?;
-    let probe = probe_openrouter(app.clone(), provider_id.to_owned())?;
-    if probe.state != "ready" {
-        return Err(probe.note);
-    }
-    let model = probe.models.iter().find(|model| model.id == model_id).ok_or("The selected model is no longer available from OpenRouter. Refresh the catalog and choose a model explicitly.")?;
-    let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref()).ok_or("The OpenRouter credential reference is missing, mismatched, or unavailable. Save the key again in Providers.")?;
-    let path = std::env::var_os("PATH");
-    let executable = providers::find_executable(&profile.executable, path.as_deref())
-        .ok_or("The configured Aider executable is not available on PATH or at its saved path.")?;
-    let handoff = request
-        .handoff_source_run_id
-        .as_deref()
-        .map(|source_id| {
-            runs::saved_provider_handoff(&app, source_id, provider_id, model_id, false)
-        })
-        .transpose()?;
-    let root = Path::new(&settings.project_root)
-        .canonicalize()
-        .map_err(|_| "The configured project root could not be resolved.".to_string())?;
-    let cwd = Path::new(&request.cwd)
-        .canonicalize()
-        .map_err(|_| "The selected project folder could not be resolved.".to_string())?;
-    if !cwd.is_dir() || !cwd.starts_with(&root) {
-        return Err(
-            "OpenRouter can only run in a project folder inside the configured project root."
-                .into(),
-        );
-    }
-    runs::start_openrouter_workflow_run(
-        app,
-        runs::OpenRouterRunConfig {
-            executable,
-            cwd,
-            model_id: model.id.clone(),
-            provider_profile_id: profile.id.clone(),
-            api_key: key,
-            prompt: request.prompt,
-            test_command: request.test_command,
-            timeout_seconds: request.timeout_seconds,
-        },
-        handoff,
-    )
+    Err("Paid OpenRouter runs are paused until the capped shared runtime is available.".into())
 }
 
 #[tauri::command]
@@ -2019,6 +1702,7 @@ fn cancel_project_scan(scan_id: String) -> Result<bool, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    runner_core::initialize_crypto_provider();
     let startup_started = Instant::now();
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
@@ -2051,6 +1735,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            runner_core_execute,
+            get_runner_context,
             get_settings,
             get_project_inventory,
             start_affected_project_refresh,

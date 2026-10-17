@@ -1,0 +1,34 @@
+[package]
+name = "navis-fabrica-runner-core"
+version = "0.26.0"
+edition = "2021"
+description = "Headless shared local issue and runner protocol core for Navis-Fabrica"
+
+[lib]
+name = "navis_fabrica_runner_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fabrica-runner"
+path = "src/bin/fabrica-runner.rs"
+
+[[bin]]
+name = "fabrica-worker"
+path = "src/bin/fabrica-worker.rs"
+
+[dependencies]
+bytes = "1.12.1"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+getrandom = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tempfile = "3"
+tokio = { version = "1.53.3", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemInformation", "Win32_System_Threading"] }

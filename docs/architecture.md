@@ -1,6 +1,8 @@
-﻿# Proposed architecture
+﻿# Architecture and design context
 
-Status: design only. The scaffold includes no commands, repositories, provider connections, or process runner.
+Current implementation: the desktop app owns project discovery, settings and its native IPC bridge. The Tauri-independent `runner-core` crate owns local issue persistence, provider adapters, routing, budgets, jobs, isolation, verification and batch supervision; `fabrica-runner` and `fabrica-worker` use that same core. The frontend renders typed bounded results and cannot read raw provider credentials. Integrated runner acceptance remains in progress; [runner readiness](runner-readiness.md) records current evidence and gaps.
+
+The diagrams and proposed contracts below retain the original design context. They are not evidence that every proposal has shipped.
 
 ```mermaid
 flowchart LR

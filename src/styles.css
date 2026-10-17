@@ -364,3 +364,32 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .run-input-form { align-items: end; display: flex; gap: 9px; }
 .run-input-form > label { flex: 1; }
 @media (max-width: 720px) { .runs-layout { grid-template-columns: 1fr; } }
+
+/* Local Markdown issue browser: shared runner protocol, native keyboard controls. */
+.local-issues label { display: grid; gap: .4rem; font-size: .9rem; }
+.local-issues input, .local-issues select, .local-issues textarea { width: 100%; min-width: 0; padding: .65rem; color: inherit; background: var(--panel-raised); border: 1px solid var(--line); border-radius: .4rem; font: inherit; }
+.local-issues-paths, .local-issues-filters { display: flex; flex-wrap: wrap; gap: .8rem; align-items: end; margin: 1rem 0; }
+.local-issues-paths label { flex: 1 1 18rem; }
+.local-issues-filters label { flex: 1 1 10rem; }
+.local-issues-columns { display: grid; grid-template-columns: minmax(15rem, 1fr) minmax(20rem, 2fr); gap: 1.5rem; }
+.local-issues-list { max-height: 70vh; overflow: auto; display: flex; flex-direction: column; gap: .4rem; }
+.local-issue-item { text-align: left; padding: .85rem; display: grid; gap: .4rem; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: .4rem; cursor: pointer; }
+.local-issue-item[aria-pressed="true"] { border-color: currentColor; background: #ffffff0c; }
+.local-issue-editor { display: grid; gap: .8rem; }
+.local-issue-editor textarea { resize: vertical; font-family: ui-monospace, monospace; }
+.local-issues-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
+@media (max-width: 900px) { .local-issues-columns { grid-template-columns: 1fr; } .local-issues-list { max-height: 35vh; } }
+
+.runner-batches label { display: grid; gap: .4rem; }
+.runner-batches input, .runner-batches select, .runner-batches textarea { width: 100%; min-width: 0; padding: .65rem; color: var(--text); background: var(--panel-raised); border: 1px solid var(--line); border-radius: .4rem; font: inherit; }
+.runner-batches details { padding: .8rem 0; border-bottom: 1px solid var(--line); }
+.runner-batches summary { cursor: pointer; padding: .4rem 0; }
+.runner-task { padding: .75rem; margin: .75rem 0; border: 1px solid var(--line); border-radius: .4rem; }
+.runner-batches pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22rem; overflow: auto; }
+.runner-batches table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+.runner-batches th, .runner-batches td { text-align: left; padding: .65rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.runner-events { max-height: 35rem; overflow: auto; }
+
+.runner-batches textarea { resize: vertical; min-height: 7rem; }
+.runner-batches .runner-recovery-confirm { display: flex; align-items: center; gap: .65rem; margin: .75rem 0; }
+.runner-batches input[type="checkbox"] { width: 1.1rem; height: 1.1rem; flex: 0 0 auto; }

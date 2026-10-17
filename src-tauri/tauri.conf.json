@@ -1,16 +1,25 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Navis-Fabrica",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "identifier": "com.navis.fabrica",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run build:worker && npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && npm run build:worker:release",
     "frontendDist": "../dist"
   },
   "app": {
-      "windows": [{ "label": "main", "title": "Navis-Fabrica · v0.25.0", "width": 1280, "height": 840, "minWidth": 800, "minHeight": 600 }],
+    "windows": [
+      {
+        "label": "main",
+        "title": "Navis-Fabrica · v0.26.0",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
     "security": {
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost",
       "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"
@@ -18,11 +27,24 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "resources/fabrica-worker.exe": "fabrica-worker.exe"
+    },
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
     "windows": {
-      "nsis": { "installMode": "currentUser" },
-      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true }
+      "nsis": {
+        "installMode": "currentUser"
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
     }
   }
 }

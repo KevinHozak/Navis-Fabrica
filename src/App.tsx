@@ -3,6 +3,8 @@ import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import { GitHubIssuePicker } from "./GitHubIssuePicker";
 import { RunsPanel } from "./RunsPanel";
+import { LocalIssuesPanel } from "./LocalIssuesPanel";
+import { BatchRunnerPanel } from "./BatchRunnerPanel";
 import { displayDirectoryPath } from "./pathDisplay";
 import { actionDisabledReason, workflowActions, WorkflowEffect, WorkflowSkillStatus } from "./actions";
 import {
@@ -31,12 +33,14 @@ import {
   startAffectedProjectRefresh,
 } from "./settings";
 
-type Section = "projects" | "runs" | "providers" | "settings";
+type Section = "projects" | "local-issues" | "batches" | "runs" | "providers" | "settings";
 type ScanStatus = "idle" | "scanning" | "cancelling" | "complete" | "cancelled" | "error";
 type InventoryFreshness = "loading" | "saved" | "partial" | "refreshing" | "current" | "stale";
 
 const sections: { id: Section; label: string; icon: string }[] = [
   { id: "projects", label: "Projects", icon: "◫" },
+  { id: "local-issues", label: "Local issues", icon: "☷" },
+  { id: "batches", label: "Runner batches", icon: "▷" },
   { id: "runs", label: "Runs", icon: "↗" },
   { id: "providers", label: "Providers", icon: "◇" },
   { id: "settings", label: "Settings", icon: "⚙" },
@@ -379,14 +383,16 @@ function App() {
             <div>
               <p className="eyebrow">YOUR WORKSPACE</p>
               <h1>{section === "projects" ? "Projects" : current.label}</h1>
-              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : `${current.label} will live here as the foundation grows.`}</p>
+              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : `${current.label} will live here as the foundation grows.`}</p>
             </div>
             {section === "projects" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
               <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Refresh projects" : "Scan projects"}
             </button>}
           </div>
 
-          {section === "settings" ? (
+          <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
+          <div hidden={section !== "batches"}><BatchRunnerPanel /></div>
+          {section === "local-issues" || section === "batches" ? null : section === "settings" ? (
             <SettingsPanel />
           ) : section === "providers" ? (
             <ProvidersPanel />

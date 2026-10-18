@@ -3,6 +3,17 @@ use std::fs;
 use std::path::Path;
 
 const MAX_ICON_BYTES: u64 = 512 * 1024;
+const APP_ROOTS: &[&str] = &[
+    "",
+    "frontend",
+    "web",
+    "client",
+    "app",
+    "packages/web",
+    "apps/web",
+    "packages/frontend",
+    "apps/frontend",
+];
 const ICON_CANDIDATES: &[&str] = &[
     "assets/logo.png",
     "assets/logo.webp",
@@ -19,6 +30,10 @@ const ICON_CANDIDATES: &[&str] = &[
     "public/favicon.png",
     "public/favicon.ico",
     "public/icon.png",
+    "public/icon-512.png",
+    "public/icon-192.png",
+    "src/app/icon.png",
+    "app/icon.png",
     "assets/icon.png",
     "assets/favicon.png",
     "icon.png",
@@ -34,8 +49,33 @@ pub fn data_url(project_path: &Path) -> Option<String> {
         return None;
     }
 
-    for relative in ICON_CANDIDATES {
-        let path = root.join(relative);
+    let project_name = root.file_name()?.to_str()?.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for app_root in APP_ROOTS {
+        let app_root = root.join(app_root);
+        if !app_root.is_dir() {
+            continue;
+        }
+        candidates.extend(
+            ICON_CANDIDATES
+                .iter()
+                .map(|relative| app_root.join(relative)),
+        );
+        // Some applications use a project-named brand mark rather than logo.png.
+        // Probe exact conventional names instead of recursively scanning artwork.
+        for folder in ["assets", "public"] {
+            for label in ["logo", "icon", "mark", "light-mark"] {
+                for extension in ["png", "svg", "webp", "jpg", "ico"] {
+                    candidates.push(
+                        app_root
+                            .join(folder)
+                            .join(format!("{project_name}-{label}.{extension}")),
+                    );
+                }
+            }
+        }
+    }
+    for path in candidates {
         let canonical = match path.canonicalize() {
             Ok(path) if path.starts_with(&root) => path,
             _ => continue,
@@ -154,6 +194,53 @@ mod tests {
             vec![0; MAX_ICON_BYTES as usize + 1],
         )
         .unwrap();
+        assert_eq!(data_url(project.path()), None);
+    }
+
+    #[test]
+    fn finds_nested_frontend_icons_and_project_named_monorepo_marks() {
+        let directory = tempdir().unwrap();
+        let navis = directory.path().join("Navis-Protocol");
+        fs::create_dir_all(navis.join("frontend/public")).unwrap();
+        fs::write(
+            navis.join("frontend/public/icon-512.png"),
+            b"\x89PNG\r\n\x1a\nnavis-icon",
+        )
+        .unwrap();
+        assert!(data_url(&navis)
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        let mimir = directory.path().join("Mimir");
+        fs::create_dir_all(mimir.join("packages/web/public")).unwrap();
+        fs::write(
+            mimir.join("packages/web/public/mimir-light-mark.svg"),
+            b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0'/></svg>",
+        )
+        .unwrap();
+        assert!(data_url(&mimir)
+            .unwrap()
+            .starts_with("data:image/svg+xml;base64,"));
+
+        fs::create_dir_all(mimir.join("assets")).unwrap();
+        fs::write(mimir.join("assets/logo.png"), b"\x89PNG\r\n\x1a\npreferred").unwrap();
+        assert!(data_url(&mimir)
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_icon_symlinks_cannot_escape_the_project() {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(
+            outside.path().join("icon.png"),
+            b"\x89PNG\r\n\x1a\nexternal",
+        )
+        .unwrap();
+        fs::create_dir_all(project.path().join("frontend")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("frontend/public")).unwrap();
         assert_eq!(data_url(project.path()), None);
     }
 

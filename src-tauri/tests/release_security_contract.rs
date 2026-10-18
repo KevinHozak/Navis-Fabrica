@@ -141,7 +141,10 @@ fn project_cards_preserve_keyboard_and_screen_reader_contracts() {
         "Working tree clean",
         "Changed files unavailable",
     ] {
-        assert!(collection.contains(contract), "project cards missing {contract}");
+        assert!(
+            collection.contains(contract),
+            "project cards missing {contract}"
+        );
     }
     let styles = fs::read_to_string(manifest_path("../src/styles.css")).unwrap();
     assert!(styles.contains(":focus-visible"));

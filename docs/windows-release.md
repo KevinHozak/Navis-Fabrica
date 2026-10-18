@@ -10,6 +10,8 @@ This workflow creates local, unsigned artifacts. No Authenticode certificate, up
 
 Use Windows x64 with the MSVC C++ build tools, Node.js `24.14.0`, npm `11.11.1`, and Rust `1.96.0` with `x86_64-pc-windows-msvc`. The repository pins these versions in `.node-version`, `package.json`, and `rust-toolchain.toml`. `npm ci` installs only the dependency graph in `package-lock.json`; Cargo commands use `Cargo.lock` in locked mode.
 
+Before each new release, use the maintained `dev-version` workflow to bump the application SemVer and synchronize Tauri, Cargo, npm lockfile metadata, and versioned native window titles. Commit and sync that version change before final release checks and packaging. `dev-build` and `npm run desktop:build` package the version already declared by the repository; they never increment it. Do not build a new release before the version bump is complete.
+
 Run the source/configuration checks on any platform:
 
 ```powershell
@@ -26,6 +28,7 @@ The Windows command performs `npm ci`, release-contract verification, Rust forma
 
 ## Release checklist
 
+- [ ] Bump the application version for this release and verify all managed version fields agree before building.
 - [ ] Confirm the five application version declarations agree and `npm run release:verify` passes.
 - [ ] Run `npm run release:windows` on the pinned Windows toolchain.
 - [ ] Confirm executable and installer file/product versions and product names match the declared application version.

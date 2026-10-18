@@ -302,6 +302,7 @@ function validatePreviewSecretReferences(providers: ProviderProfile[]): void {
 export const isDesktopApp = () => isTauri();
 
 export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
+export const getProjectIcon = (projectId: string) => invoke<string | null>("get_project_icon", { projectId });
 
 export const startProjectScan = (scanId: string, forceRefresh: boolean, maxDirectories?: number) =>
   invoke<void>("start_project_scan", { scanId, forceRefresh, maxDirectories: maxDirectories ?? null });

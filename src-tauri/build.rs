@@ -5,6 +5,7 @@ fn main() {
             "get_runner_context",
             "get_settings",
             "get_project_inventory",
+            "get_project_icon",
             "save_settings",
             "save_project_display_preferences",
             "start_project_scan",

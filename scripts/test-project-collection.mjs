@@ -11,7 +11,7 @@ async function load(entry) {
   new Function('require','module','exports',result.outputFiles[0].text)(require,mod,mod.exports);
   return mod.exports;
 }
-const { ProjectCard, ProjectCollection } = await load('src/ProjectCollection.tsx');
+const { ProjectCard, ProjectCardHeading, ProjectCollection } = await load('src/ProjectCollection.tsx');
 const { activityLabel, sameProjectPath } = await load('src/Activity.tsx');
 const settings = await load('src/settings.ts');
 globalThis.window = {};
@@ -33,6 +33,9 @@ assert.match(card({...project,git:{...project.git,changedFiles:['one.txt','two.t
 assert.match(card({...project,git:{...project.git,changedFiles:null}}),/Changed files<\/dt><dd>Unavailable<\/dd>/);
 assert.match(card(project),/Local issues<\/dt><dd>Loading/);
 assert.doesNotMatch(card(project),/GitHub|Latest commit|Detected stacks/);
+const heading = icon => renderToStaticMarkup(React.createElement(ProjectCardHeading,{name:'Owned project',icon}));
+assert.match(heading('data:image/png;base64,AA=='),/<img class="my-project-icon" src="data:image\/png;base64,AA==" alt=""\/>/);
+assert.doesNotMatch(heading(null),/<img/);
 const empty = renderToStaticMarkup(React.createElement(ProjectCollection,{projects:[project],onSelect:()=>{}}));
 assert.doesNotMatch(empty,/Owned project/); // Discovery alone cannot include a card.
 console.log('UX regressions passed: collection persistence, unknown/count states, activity states and explicit collection boundary.');

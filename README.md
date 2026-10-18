@@ -1,6 +1,10 @@
 ﻿# Navis-Fabrica
 
+![Navis-Fabrica logo](assets/logo.png)
+
 A private Windows desktop workshop for local projects, repository activity, coding workflows and configurable AI providers.
+
+Use `assets/logo.png` for the repository's README-ready logo. Project cards look there for a logo, then for common app icon and logo files in project asset folders.
 
 The Tauri 2 / React / TypeScript application includes project scanning, provider configuration and workflow history. This checkout also implements local Markdown issues and the shared durable runner. The local backlog and managed-batch controls have scoped acceptance evidence; read [runner readiness](docs/runner-readiness.md) before a live batch. This 0.26.0 source integration does not claim a newly packaged desktop release or completed real-issue pilot.
 

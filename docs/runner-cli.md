@@ -73,7 +73,7 @@ Choose `run-batch` explicitly to keep workers under a long-lived CLI host:
 
 This command remains active until durable terminal or control state. Keep its process/session alive. Closing the host can interrupt workers and require reconciliation. It never silently falls back to detached execution. Status, events and controls can be read from another CLI or Fabrica using the same state folder. Reconnecting with the identical admitted request preserves attempts, budgets and the absolute deadline; jobs needing input or ambiguous recovery require explicit resolution first. Terminal batches cannot restart through this command.
 
-Detached execution still requires an OS host that permits breakaway. The synthetic hosted acceptance receipt is `C:\Projects\Agents\backups\local-issue-pilot\unattended fixture 9wfu38b0\evidence.json`; it proves hosted completion, not detached lifetime under every Windows host.
+Detached execution still requires an OS host that permits breakaway. The synthetic hosted acceptance receipt is `C:\Projects\Temp\Agents\local-issue-pilot\unattended fixture 9wfu38b0\evidence.json`; it proves hosted completion, not detached lifetime under every Windows host.
 
 ## Controls and recovery
 

@@ -54,17 +54,7 @@ pub fn load(path: &Path, expected_root: &str) -> Vec<ProjectEntry> {
     {
         return Vec::new();
     }
-    let projects = deduplicate(saved.projects)
-        .into_iter()
-        .filter(|project| {
-            project.is_git_repository
-                && project
-                    .git
-                    .remotes
-                    .iter()
-                    .any(|remote| remote.github.is_some())
-        })
-        .collect::<Vec<_>>();
+    let projects = deduplicate(saved.projects);
     if projects.iter().any(|project| !is_valid_project(project)) {
         return Vec::new();
     }
@@ -250,6 +240,7 @@ mod tests {
                 status: "available".into(),
                 branch: Some("main".into()),
                 dirty: Some(false),
+                changed_files: Some(Vec::new()),
                 latest_commit: None,
                 remotes: Vec::new(),
                 upstream: UpstreamDivergence {
@@ -316,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_inventory_excludes_projects_without_a_github_remote() {
+    fn restored_inventory_preserves_local_and_other_host_candidates() {
         let folder = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = folder.path().join("project-inventory.json");
         let mut github = project("github", "GitHub", r"C:\Projects\github");
@@ -345,7 +336,7 @@ mod tests {
         .unwrap();
 
         let restored = load(&path, r"C:\Projects");
-        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.len(), 3);
         assert_eq!(restored[0].id, "github");
     }
 

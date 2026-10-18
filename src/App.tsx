@@ -1,18 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ActivityEntry, ActivityOverview } from "./Activity";
+import { ProjectCollection } from "./ProjectCollection";
+import { useEffect, useRef, useState } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
-import { GitHubIssuePicker } from "./GitHubIssuePicker";
 import { RunsPanel } from "./RunsPanel";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
 import { BatchRunnerPanel } from "./BatchRunnerPanel";
-import { displayDirectoryPath } from "./pathDisplay";
-import { actionDisabledReason, workflowActions, WorkflowEffect, WorkflowSkillStatus } from "./actions";
 import {
   cancelProjectScan,
-  discoverWorkflowSkills,
-  getCachedGitHubActivity,
   getProjectInventory,
-  GitHubActivity,
   isDesktopApp,
   loadSettings,
   onProjectScanFinished,
@@ -21,14 +17,8 @@ import {
   onProjectScanProgress,
   onProjectWatchError,
   ProjectEntry,
-  ProjectDisplayPreferences,
-  ProjectDisplayView,
-  defaultProjectDisplayPreferences,
-  saveProjectDisplayPreferences,
-  GitHubIssue,
   ProjectScanFinished,
   ProjectScanProgress,
-  refreshGitHubActivity,
   startProjectScan,
   startAffectedProjectRefresh,
 } from "./settings";
@@ -38,10 +28,10 @@ type ScanStatus = "idle" | "scanning" | "cancelling" | "complete" | "cancelled" 
 type InventoryFreshness = "loading" | "saved" | "partial" | "refreshing" | "current" | "stale";
 
 const sections: { id: Section; label: string; icon: string }[] = [
-  { id: "projects", label: "Projects", icon: "◫" },
+  { id: "projects", label: "My Projects", icon: "◫" },
   { id: "local-issues", label: "Local issues", icon: "☷" },
   { id: "batches", label: "Runner batches", icon: "▷" },
-  { id: "runs", label: "Runs", icon: "↗" },
+  { id: "runs", label: "Activity", icon: "↗" },
   { id: "providers", label: "Providers", icon: "◇" },
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
@@ -66,8 +56,6 @@ function App() {
   const [watchError, setWatchError] = useState("");
   const [inventoryFreshness, setInventoryFreshness] = useState<InventoryFreshness>("loading");
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
-  const [workContext, setWorkContext] = useState<{ projectId: string; issue: GitHubIssue } | null>(null);
-  const [workflowSkills, setWorkflowSkills] = useState<WorkflowSkillStatus[]>([]);
   const activeScanId = useRef("");
   const scanStartedAt = useRef<number | null>(null);
   const firstProjectMsRef = useRef<number | null>(null);
@@ -86,17 +74,6 @@ function App() {
     window.addEventListener("hashchange", handleNavigation);
     return () => window.removeEventListener("hashchange", handleNavigation);
   }, []);
-
-  useEffect(() => {
-    if (!desktop) return;
-    let active = true;
-    discoverWorkflowSkills().then((skills) => {
-      if (active) setWorkflowSkills(skills);
-    }).catch(() => {
-      if (active) setWorkflowSkills(["dev-work", "dev-push", "dev-build"].map((id) => ({ id: id as WorkflowSkillStatus["id"], status: "unavailable", compatibleAgents: [] })));
-    });
-    return () => { active = false; };
-  }, [desktop]);
 
   useEffect(() => {
     document.title = `Navis-Fabrica · v${__APP_VERSION__}`;
@@ -177,12 +154,9 @@ function App() {
     });
 
     onProjectScanInvalidated((paths) => {
+      if (!active) return;
       if (activeScanId.current) {
-        if (partialScanIds.current.has(activeScanId.current)) {
-          refreshAfterScan.current.push(...paths.slice(0, 512));
-        } else {
-          fullRefreshAfterScan.current = true;
-        }
+        refreshAfterScan.current = [...new Set([...refreshAfterScan.current, ...paths])].slice(0, 512);
       } else beginAffectedRefreshRef.current(paths);
     }).then((stop) => {
       if (active) unlistenInvalidated = stop;
@@ -214,8 +188,8 @@ function App() {
   useEffect(() => {
     if (!desktop) return;
     const unlisten = onProjectDiscoverySettingsChanged(() => {
-      if (activeScanId.current) fullRefreshAfterScan.current = true;
-      else beginScanRef.current(true);
+      setInventoryFreshness("stale");
+      loadSettings().then(settings => { setProjectRoot(settings.projectRoot); return getProjectInventory(); }).then(setProjects).catch(error => setScanError(String(error)));
     });
     return () => { void unlisten.then((stop) => stop()); };
   }, [desktop]);
@@ -240,27 +214,32 @@ function App() {
     return () => { active = false; };
   }, [desktop, scanListenersReady]);
 
+  // Catalog discovery is explicit. On startup only re-inspect saved collection entries.
   useEffect(() => {
     if (!desktop || !scanListenersReady) return;
-    const startupRefresh = window.setTimeout(() => beginScanRef.current(false, 2_000), 1_500);
-    const fallbackRefresh = window.setInterval(() => beginScanRef.current(true, 20_000), 15 * 60 * 1_000);
-    return () => {
-      window.clearTimeout(startupRefresh);
-      window.clearInterval(fallbackRefresh);
-    };
+    let active = true;
+    Promise.all([loadSettings(), getProjectInventory()]).then(([settings, inventory]) => {
+      if (active) beginAffectedRefreshRef.current(inventory.filter(p => settings.preferences.projectDisplay.favoriteProjectIds.includes(p.id)).map(p => p.path));
+    }).catch(() => undefined);
+    return () => { active = false; };
   }, [desktop, scanListenersReady]);
 
   useEffect(() => {
-    setSelectedProjectId((selected) => projects.some((project) => project.id === selected) ? selected : projects[0]?.id ?? null);
-  }, [projects]);
+    const refreshCollection = () => {
+      if (!desktop) return;
+      Promise.all([loadSettings(), getProjectInventory()]).then(([settings, inventory]) => {
+        beginAffectedRefreshRef.current(inventory.filter(p => settings.preferences.projectDisplay.favoriteProjectIds.includes(p.id)).map(p => p.path));
+      }).catch(() => undefined);
+    };
+    window.addEventListener("fabrica-collection-saved", refreshCollection);
+    return () => window.removeEventListener("fabrica-collection-saved", refreshCollection);
+  }, [desktop]);
 
   const current = sections.find((item) => item.id === section) ?? sections[0];
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
-  const workIssue = workContext && selectedProject?.id === workContext.projectId ? workContext.issue : null;
-  const collectionTitle = section === "projects" ? "Your projects" : section === "runs" ? "Work context" : "Connected providers";
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
   const freshnessLabel = inventoryFreshness === "loading" ? "Loading saved projects…"
-    : inventoryFreshness === "saved" ? "Saved project list · background refresh is scheduled"
+    : inventoryFreshness === "saved" ? "Saved project collection"
       : inventoryFreshness === "partial" ? "Saved project list · changed repositories refreshed"
       : inventoryFreshness === "refreshing" ? "Refreshing project details in the background…"
         : inventoryFreshness === "stale" ? "Showing saved project details · refresh needed"
@@ -305,7 +284,7 @@ function App() {
   async function beginAffectedRefresh(paths: string[]) {
     if (!desktop || !paths.length) return;
     if (activeScanId.current) {
-      refreshAfterScan.current.push(...paths.slice(0, 512));
+      refreshAfterScan.current = [...new Set([...refreshAfterScan.current, ...paths])].slice(0, 512);
       return;
     }
     const id = crypto.randomUUID();
@@ -355,7 +334,7 @@ function App() {
 
         <div className="workspace-label">WORKSPACE</div>
         <nav className="primary-nav" aria-label="Main navigation">
-          {sections.map((item) => (
+          {sections.filter(item => ["projects", "runs", "settings"].includes(item.id)).map((item) => (
             <a key={item.id} className={`nav-link${section === item.id ? " active" : ""}`} href={`#${item.id}`} aria-current={section === item.id ? "page" : undefined}>
               <span className="nav-icon" aria-hidden="true">{item.icon}</span>{item.label}
               {section === item.id && <span className="nav-indicator" aria-hidden="true" />}
@@ -375,77 +354,38 @@ function App() {
       <div className="main-column">
         <header className="toolbar">
           <div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{current.label}</strong></div>
-          <div className="toolbar-actions"><span className="toolbar-divider" /><button className="avatar" type="button" aria-label="Local profile">K</button></div>
+          <div className="toolbar-actions"><ActivityEntry /><span className="toolbar-divider" /><button className="avatar" type="button" aria-label="Local profile">K</button></div>
         </header>
 
         <main id="main-content" className="content" tabIndex={-1}>
           <div className="page-heading">
             <div>
               <p className="eyebrow">YOUR WORKSPACE</p>
-              <h1>{section === "projects" ? "Projects" : current.label}</h1>
-              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : `${current.label} will live here as the foundation grows.`}</p>
+              <h1>{section === "projects" ? "My Projects" : current.label}</h1>
+              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : "Follow your work and open project actions."}</p>
             </div>
-            {section === "projects" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
-              <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Refresh projects" : "Scan projects"}
+            {section === "settings" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
+              <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Rediscover project folders" : "Discover project folders"}
             </button>}
+            {section === "settings" && <p role="status">{scanning ? "Discovering folders…" : scanError || freshnessLabel}</p>}{section === "settings" && Boolean(scanResult?.errors.length) && <details><summary>Some folders could not be inspected</summary><ul>{scanResult?.errors.map((error,index) => <li key={index}>{error}</li>)}</ul></details>}
           </div>
 
+          <div hidden={section !== "projects"}><p className="scan-measurement" role="status">{freshnessLabel}</p>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} /></div>
+          {section === "runs" && <ActivityOverview projects={projects} onSelect={setSelectedProjectId} />}
           <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
           <div hidden={section !== "batches"}><BatchRunnerPanel /></div>
           {section === "local-issues" || section === "batches" ? null : section === "settings" ? (
-            <SettingsPanel />
+            <><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} /><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
           ) : section === "providers" ? (
             <ProvidersPanel />
           ) : section === "runs" ? selectedProject ? isDesktopApp() ? (
-            <RunsPanel defaultCwd={selectedProject.path} project={selectedProject} issue={workIssue} />
+            <><div className="project-actions"><a href="#batches">Local issue batches</a><a href="#local-issues">Local issue workspace</a></div><RunsPanel defaultCwd={selectedProject.path} project={selectedProject} issue={null} /></>
           ) : (
             <div className="panel empty-state"><h3>Workflow execution needs the desktop app</h3><p>The browser preview can inspect project context, but it cannot launch local processes.</p></div>
           ) : (
-            <section className="panel project-panel" aria-labelledby="project-list-title">
-              <div className="panel-heading"><div><h2 id="project-list-title">Work context</h2><p>Issue details selected from a repository. Selection never edits GitHub.</p></div></div><div className="panel-rule" />
-              {workIssue ? <div className="work-context"><p className="eyebrow">READY FOR WORK</p><h3><a href={workIssue.url} target="_blank" rel="noreferrer">#{workIssue.number} · {workIssue.title} ↗</a></h3><p>{workIssue.body}</p>{workIssue.acceptanceCriteria.length > 0 && <div><strong>Acceptance criteria</strong><ul>{workIssue.acceptanceCriteria.map((criterion, index) => <li key={`${index}-${criterion}`}>{criterion}</li>)}</ul></div>}{workIssue.blockedBy.length > 0 && <div><strong>Blockers</strong>{workIssue.blockedBy.map((blocker) => <a key={blocker.number} href={blocker.url} target="_blank" rel="noreferrer">#{blocker.number} · {blocker.title} ({blocker.state})</a>)}</div>}{workIssue.parentEpic && <div><strong>Parent epic</strong><a href={workIssue.parentEpic.url} target="_blank" rel="noreferrer">#{workIssue.parentEpic.number} · {workIssue.parentEpic.title}</a></div>}{workIssue.pullRequestUrls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">PR context: {url}</a>)}<small>Bounded read-only context · {workIssue.acceptanceCriteria.length} acceptance criteria · {workIssue.blockedBy.length} blockers</small></div> : <div className="empty-state"><h3>No issue context yet</h3><p>Choose an issue in a project’s GitHub activity panel to prepare its work context.</p><a href="#projects">Browse projects</a></div>}
-              {!workIssue && workContext && <p className="registry-context-note">The selected issue belongs to another project. Choose an issue from the selected project to prepare work.</p>}
-              <WorkflowRegistry project={selectedProject} issue={workIssue} skills={workflowSkills} />
-            </section>
-          ) : (
-            <section className="panel project-panel" aria-labelledby="project-list-title">
-              <div className="panel-heading panel-heading-row">
-                <div><h2 id="project-list-title">{collectionTitle}</h2><p>{section === "projects" ? `Workspace: ${displayDirectoryPath(projectRoot)}` : "This workspace section is part of the foundation shell."}</p></div>
-                <span className="project-count" aria-live="polite">{section === "projects" ? projects.length : ""}</span>
-              </div>
-              <div className="panel-rule" />
+            <section className="panel empty-state"><h2>Activity</h2><p>Choose a project from My Projects to open its actions.</p><div className="project-actions"><a href="#projects">My Projects</a><a href="#batches">Local issue batches</a></div></section>
+          ) : null}
 
-              {section === "projects" && <p className="scan-measurement" role="status" aria-live="polite">{freshnessLabel}</p>}
-
-              {section === "projects" && scanResult && scanDurationMs !== null && <p className="scan-measurement" role="status" aria-live="polite">Last scan: {scanDurationMs} ms · {scanResult.directoriesScanned} folders · {scanResult.projects.length} projects{firstProjectMs === null ? "." : ` · first project in ${firstProjectMs} ms.`}</p>}
-
-              {watchError && section === "projects" && <div className="scan-notice">Automatic project refresh is unavailable: {watchError} <span>Use Refresh projects to update the list.</span></div>}
-
-              {section !== "projects" ? (
-                <div className="empty-state"><h3>A little room to grow</h3><p>This section is ready for a future phase.</p></div>
-              ) : projects.length > 0 ? (
-                <>
-                  {scanning && <div className="scan-progress" role="status"><span className="spinner" aria-hidden="true" /><span>{scanStatus === "cancelling" ? "Stopping the scan" : progress ? `Refreshing · scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Refreshing projects…"}</span></div>}
-                  {scanStatus === "error" && <div className="scan-notice error-notice" role="alert"><strong>Refresh could not complete.</strong> {scanError} Showing the last available results. <button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div>}
-                  {scanResult?.errors.length ? <details className="scan-notice"><summary>Some folders could not be inspected ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul><p>Showing available results.</p></details> : null}
-                  {scanStatus === "cancelled" && <div className="scan-notice" role="status">Scan cancelled. Showing available results.</div>}
-                  <ProjectsBrowser projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onWork={(issue, projectId) => { setWorkContext({ projectId, issue }); window.location.hash = "runs"; }} />
-                </>
-              ) : scanning ? (
-                <div className="state-box loading-state" role="status"><span className="spinner" aria-hidden="true" /><div><strong>{scanStatus === "cancelling" ? "Stopping the scan" : "Finding your projects"}</strong><p>{progress ? `Scanned ${progress.directoriesScanned} folders · found ${progress.projectsFound} projects` : "Preparing your workspace scan…"}</p></div></div>
-              ) : scanStatus === "error" ? (
-                <div className="state-box error-state" role="alert"><span className="state-symbol" aria-hidden="true">!</span><div><strong>We couldn’t scan this folder</strong><p>{scanError}</p><button className="text-button" type="button" onClick={() => { void beginScan(); }}>Try again</button></div></div>
-              ) : (
-                <div className="empty-state">
-                  <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="orbit orbit-three" /><span className="empty-spark spark-one">✦</span><span className="empty-spark spark-two">·</span><span className="folder-shape"><span /></span></div>
-                  <h3>{scanStatus === "complete" ? scanResult?.errors.length ? "Scan partly complete" : "No projects found" : scanStatus === "cancelled" ? "Scan cancelled" : "Ready when you are"}</h3>
-                  <p>{scanStatus === "complete" ? scanResult?.errors.length ? `Some folders under ${displayDirectoryPath(projectRoot)} could not be inspected.` : `No coding projects were found under ${displayDirectoryPath(projectRoot)}.` : scanStatus === "cancelled" ? `The scan stopped after checking ${scanResult?.directoriesScanned ?? 0} folders.` : "Scan your configured workspace to find coding projects and repositories."}</p>
-                  {scanResult?.errors.length ? <details className="scan-notice"><summary>Show scan issues ({scanResult.errors.length})</summary><ul>{scanResult.errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul></details> : null}
-                  {scanStatus === "idle" && <button className="button button-secondary" type="button" onClick={() => { void beginScan(); }}>↻ Scan workspace</button>}
-                </div>
-              )}
-            </section>
-          )}
 
           <footer className="content-footer"><span className="footer-orbit" aria-hidden="true">✳</span><span>Built for steady progress.</span><span className="footer-version">v{__APP_VERSION__}</span></footer>
         </main>
@@ -455,266 +395,3 @@ function App() {
 }
 
 export default App;
-
-function WorkflowRegistry({ project, issue, skills }: {
-  project: ProjectEntry | null;
-  issue: GitHubIssue | null;
-  skills: WorkflowSkillStatus[];
-}) {
-  return <section className="workflow-registry" aria-labelledby="workflow-registry-title">
-    <div className="workflow-registry-heading">
-      <div><p className="eyebrow">PROJECT ACTIONS</p><h3 id="workflow-registry-title">Workflow registry</h3></div>
-      <span className="registry-phase">Registry only</span>
-    </div>
-    <p className="workflow-registry-intro">Actions describe their inputs, checks, and outputs. Skill files are discovered by reference and never executed as Markdown.</p>
-    {!project && <p className="registry-context-note">Select a project in Projects to check stack and tool compatibility.</p>}
-    {workflowActions.map((action) => {
-      const disabledReason = actionDisabledReason(action, project, issue, skills);
-      const skill = skills.find((entry) => entry.id === action.id);
-      return <article className="workflow-action" key={action.id}>
-        <div className="workflow-action-top">
-          <div><h4>{action.title}</h4><p>{action.summary}</p></div>
-          <button className="button button-secondary workflow-run-button" type="button" disabled aria-describedby={`${action.id}-disabled`}>Prepare</button>
-        </div>
-        <p className="workflow-disabled-reason" id={`${action.id}-disabled`}>{disabledReason}</p>
-        <div className="workflow-meta-grid">
-          <div><strong>Registry entry</strong><span>v{action.version} · {action.skillReference} · {skill?.status ?? "checking"}{skill?.status === "available" && skill.compatibleAgents.length ? ` · ${skill.compatibleAgents.join(", ")}` : ""}</span></div>
-          <div><strong>Supported stacks</strong><span>{action.supportedStacks === "all" ? "Any detected stack" : action.supportedStacks.join(", ")}</span></div>
-          {action.defaultBuildProfile && <div><strong>Build default</strong><span>{action.defaultBuildProfile}</span></div>}
-        </div>
-        <details className="workflow-details"><summary>Inputs, checks, effects, and outputs</summary>
-          <div className="workflow-detail-columns">
-            <div><strong>Inputs</strong><ul>{action.inputs.map((input) => <li key={input.id}>{input.label}{input.required ? " · required" : " · optional"}{input.defaultValue ? ` · default ${input.defaultValue}` : ""}{input.options ? ` · ${input.options.join(" / ")}` : ""}</li>)}</ul></div>
-            <div><strong>Checks</strong><ul>{action.checks.map((check) => <li key={check}>{check}</li>)}</ul></div>
-            <div><strong>Effect scope</strong><ul>
-              {(["commit", "push", "createPullRequest"] as WorkflowEffect[]).map((effect) => <li key={effect}>{effect === "createPullRequest" ? "Create PR" : effect} · {action.effectScope.permitted.includes(effect) ? "requires explicit opt-in" : "not permitted"}</li>)}
-              <li>Requested by default · {action.effectScope.defaultRequested.length ? action.effectScope.defaultRequested.join(", ") : "none"}</li>
-            </ul></div>
-            <div><strong>Expected artifacts</strong><ul>{action.outputArtifacts.map((artifact) => <li key={artifact}>{artifact}</li>)}</ul></div>
-          </div>
-        </details>
-      </article>;
-    })}
-  </section>;
-}
-
-function gitStatusLabel(status: string): string {
-  switch (status) {
-    case "detached": return "Git · Detached HEAD";
-    case "unborn": return "Git · No commits yet";
-    case "unsafeOwnership": return "Git · Ownership needs attention";
-    case "gitUnavailable": return "Git · Git executable unavailable";
-    case "notRepository": return "Git · Repository metadata unavailable";
-    default: return "Git · Inspection unavailable";
-  }
-}
-
-const PROJECTS_PER_PAGE = 60;
-
-function ProjectsBrowser({ projects, selectedProjectId, onSelect, onWork }: {
-  projects: ProjectEntry[];
-  selectedProjectId: string | null;
-  onSelect: (id: string) => void;
-  onWork: (issue: GitHubIssue, projectId: string) => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [stackFilter, setStackFilter] = useState("all");
-  const [renderLimit, setRenderLimit] = useState(PROJECTS_PER_PAGE);
-  const [projectDisplay, setProjectDisplay] = useState<ProjectDisplayPreferences>(defaultProjectDisplayPreferences);
-  const [preferencesReady, setPreferencesReady] = useState(false);
-  const [saveMessage, setSaveMessage] = useState("");
-  const projectDisplayRef = useRef(projectDisplay);
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
-  const uniqueProjects = useMemo(() => [...new Map(projects.map((project) => [project.id, project])).values()], [projects]);
-  useEffect(() => {
-    let active = true;
-    loadSettings().then((settings) => {
-      if (!active) return;
-      projectDisplayRef.current = settings.preferences.projectDisplay;
-      setProjectDisplay(settings.preferences.projectDisplay);
-      setPreferencesReady(true);
-    }).catch((error: unknown) => {
-      if (!active) return;
-      setSaveMessage(`Saved project filters could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
-      setPreferencesReady(true);
-    });
-    return () => { active = false; };
-  }, []);
-
-  function updateProjectDisplay(next: ProjectDisplayPreferences) {
-    projectDisplayRef.current = next;
-    setProjectDisplay(next);
-    setSaveMessage("Saving project preferences…");
-    const pending = saveQueue.current.catch(() => undefined).then(async () => {
-      const saved = await saveProjectDisplayPreferences(next);
-      if (JSON.stringify(projectDisplayRef.current) === JSON.stringify(next)) {
-        projectDisplayRef.current = saved;
-        setProjectDisplay(saved);
-        setSaveMessage("Project preferences saved.");
-      }
-    });
-    saveQueue.current = pending.catch((error: unknown) => {
-      if (JSON.stringify(projectDisplayRef.current) === JSON.stringify(next)) {
-        setSaveMessage(`Project preferences could not be saved: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    });
-  }
-
-  function setView(view: ProjectDisplayView) {
-    const current = projectDisplayRef.current;
-    if (view !== current.view) updateProjectDisplay({ ...current, view });
-  }
-
-  function focusViewControl(view = projectDisplayRef.current.view) {
-    document.querySelector<HTMLButtonElement>(`[data-project-view="${view}"]`)?.focus();
-  }
-
-  function toggleProjectId(key: "favoriteProjectIds" | "hiddenProjectIds", id: string) {
-    const latest = projectDisplayRef.current;
-    const current = new Set(latest[key]);
-    if (current.has(id)) current.delete(id);
-    else current.add(id);
-    updateProjectDisplay({ ...latest, [key]: [...current] });
-  }
-
-  const favoriteIds = useMemo(() => new Set(projectDisplay.favoriteProjectIds), [projectDisplay.favoriteProjectIds]);
-  const hiddenIds = useMemo(() => new Set(projectDisplay.hiddenProjectIds), [projectDisplay.hiddenProjectIds]);
-  const stacks = useMemo(() => [...new Set(uniqueProjects.flatMap((project) => project.detectedStacks))].sort(), [uniqueProjects]);
-  const inView = useMemo(() => uniqueProjects.filter((project) => {
-    const isHidden = hiddenIds.has(project.id);
-    if (projectDisplay.view === "hidden") return isHidden;
-    if (isHidden) return false;
-    return projectDisplay.view !== "favorites" || favoriteIds.has(project.id);
-  }), [uniqueProjects, hiddenIds, favoriteIds, projectDisplay.view]);
-  const allProjectsHidden = uniqueProjects.length > 0 && uniqueProjects.every((project) => hiddenIds.has(project.id));
-  const hasHiddenFavorite = uniqueProjects.some((project) => hiddenIds.has(project.id) && favoriteIds.has(project.id));
-  const visible = useMemo(() => {
-    const normalized = query.trim().toLocaleLowerCase();
-    return inView.filter((project) =>
-      (stackFilter === "all" || project.detectedStacks.includes(stackFilter)) &&
-      (!normalized || `${project.name} ${project.path} ${project.detectedStacks.join(" ")}`.toLocaleLowerCase().includes(normalized)),
-    );
-  }, [inView, query, stackFilter]);
-  useEffect(() => setRenderLimit(PROJECTS_PER_PAGE), [query, stackFilter, projectDisplay.view, projectDisplay.favoriteProjectIds, projectDisplay.hiddenProjectIds, projects]);
-  const selected = uniqueProjects.find((project) => project.id === selectedProjectId) ?? null;
-  const rendered = visible.slice(0, renderLimit);
-
-  return <div className="project-browser">
-    <div className="project-browser-controls">
-      <label className="project-search"><span className="sr-only">Search projects</span><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search projects" /></label>
-      <label className="project-filter"><span className="sr-only">Filter by stack</span><select value={stackFilter} onChange={(event) => setStackFilter(event.target.value)}><option value="all">All stacks</option>{stacks.map((stack) => <option key={stack} value={stack}>{stack}</option>)}</select></label>
-      <div className="project-view-filter" role="group" aria-label="Project visibility">
-        {(["all", "favorites", "hidden"] as const).map((view) => <button key={view} data-project-view={view} className="project-view-button" type="button" disabled={!preferencesReady} aria-pressed={projectDisplay.view === view} onClick={() => setView(view)}>{view === "all" ? "All" : view === "favorites" ? "Favorites" : "Hidden"}</button>)}
-      </div>
-      <span className="project-count" aria-live="polite">{visible.length} of {inView.length}</span>
-    </div>
-    {!preferencesReady && <p className="project-preference-status" role="status">Loading saved project preferences…</p>}
-    {saveMessage && <p className="project-preference-status" role="status" aria-live="polite">{saveMessage}</p>}
-    <div className="project-browser-results">
-      {!preferencesReady ? null : visible.length ? <div className="project-card-grid" aria-label="Projects" role="list">
-        {rendered.map((project) => <article className={`project-card${selectedProjectId === project.id ? " selected" : ""}`} role="listitem" key={project.id}>
-          <div className="project-card-actions">
-            <button className="project-card-action favorite-action" type="button" aria-pressed={favoriteIds.has(project.id)} aria-label={favoriteIds.has(project.id) ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`} onClick={() => { if (favoriteIds.has(project.id) && projectDisplay.view === "favorites") focusViewControl(); toggleProjectId("favoriteProjectIds", project.id); }}>{favoriteIds.has(project.id) ? "★ Favorited" : "☆ Favorite"}</button>
-            <button className="project-card-action" type="button" aria-label={hiddenIds.has(project.id) ? `Restore ${project.name}` : `Hide ${project.name}`} onClick={() => { focusViewControl(); toggleProjectId("hiddenProjectIds", project.id); }}>{hiddenIds.has(project.id) ? "Restore project" : "Hide project"}</button>
-          </div>
-          <button className="project-card-select" type="button" aria-pressed={selectedProjectId === project.id} onClick={() => onSelect(project.id)}>
-            <span className="project-card-heading">
-              <span className="project-symbol" aria-hidden="true">{project.isGitRepository ? "⌘" : "▣"}</span>
-              <span className="project-card-title"><strong>{project.name}</strong><span className="project-card-path">{displayDirectoryPath(project.path)}</span></span>
-              <span className="project-card-selection" aria-hidden="true">{selectedProjectId === project.id ? "Selected" : "Select"}</span>
-            </span>
-            <span className="project-card-facts">
-              <span className="project-card-fact"><span>Branch</span><strong>{project.isGitRepository ? project.git.status === "available" ? project.git.branch || "Unavailable" : gitStatusLabel(project.git.status) : "Not a Git repository"}</strong></span>
-              <span className={`project-card-tree${project.git.dirty === false ? " clean" : project.git.dirty === true ? " dirty" : " unknown"}`}>
-                <span className="project-card-status-dot" aria-hidden="true" />
-                {project.isGitRepository ? project.git.dirty === false ? "Working tree clean" : project.git.dirty === true ? "Uncommitted changes" : "Working tree status unavailable" : "Not a Git repository"}
-              </span>
-              <span className="project-card-fact"><span>Latest commit</span><strong>{project.git.latestCommit ? <><code>{project.git.latestCommit.shortHash}</code> · {project.git.latestCommit.subject}</> : "Unavailable"}</strong></span>
-              <span className="project-card-stacks"><span className="project-card-fact-label">Detected stacks</span>{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span className="project-card-unavailable">None detected</span>}</span>
-            </span>
-          </button>
-        </article>)}
-      </div> : <div className="project-filter-empty">
-        <strong>{inView.length ? "No projects match these filters." : projectDisplay.view === "favorites" ? hasHiddenFavorite ? "Your favorites are hidden." : "No favorite projects yet." : projectDisplay.view === "hidden" ? "No hidden projects." : allProjectsHidden ? "All projects are hidden." : "No projects match these filters."}</strong>
-        <span>{!inView.length && projectDisplay.view === "favorites" ? hasHiddenFavorite ? "Restore a favorite from Hidden to see it here." : "Mark a project as a favorite to find it here." : !inView.length && projectDisplay.view === "hidden" ? "Projects you hide will appear here, where you can restore them." : allProjectsHidden && projectDisplay.view === "all" ? "Your hidden projects are still saved and can be restored." : "Try another search or stack filter."}</span>
-        {projectDisplay.view !== "all" ? <button type="button" className="text-button" onClick={() => { focusViewControl("all"); setView("all"); }}>Show all projects</button> : allProjectsHidden ? <button type="button" className="text-button" onClick={() => { focusViewControl("hidden"); setView("hidden"); }}>Review hidden projects</button> : <button type="button" className="text-button" onClick={() => { setQuery(""); setStackFilter("all"); }}>Clear search and stack filters</button>}
-      </div>}
-      {renderLimit < visible.length && <div className="project-load-more"><span>Showing {rendered.length} of {visible.length} projects</span><button type="button" onClick={() => setRenderLimit((limit) => Math.min(limit + PROJECTS_PER_PAGE, visible.length))}>Show more projects</button></div>}
-      <ProjectDetails project={selected} onWork={(issue) => { if (selected) onWork(issue, selected.id); }} />
-    </div>
-  </div>;
-}
-function ProjectDetails({ project, onWork }: { project: ProjectEntry | null; onWork: (issue: GitHubIssue) => void }) {
-  const [activity, setActivity] = useState<GitHubActivity | null>(null);
-  const [activityLoading, setActivityLoading] = useState(false);
-  const [activityError, setActivityError] = useState("");
-  const remote = project?.git.remotes.find((item) => item.github)?.github;
-  const selectedRepository = useRef<string | null>(null);
-  selectedRepository.current = project && remote
-    ? `${project.id}:${remote.owner.toLowerCase()}/${remote.repository.toLowerCase()}`
-    : null;
-  useEffect(() => {
-    let active = true;
-    setActivity(null);
-    setActivityError("");
-    if (remote && isDesktopApp()) {
-      getCachedGitHubActivity(remote.owner, remote.repository).then((value) => {
-        if (active) setActivity(value);
-      }).catch((error: unknown) => {
-        if (active) setActivityError(error instanceof Error ? error.message : String(error));
-      });
-    }
-    return () => { active = false; };
-  }, [project?.id, remote?.owner, remote?.repository]);
-
-  async function refreshActivity() {
-    if (!remote) return;
-    const requestRepository = selectedRepository.current;
-    setActivityLoading(true);
-    setActivityError("");
-    try {
-      const refreshedActivity = await refreshGitHubActivity(remote.owner, remote.repository);
-      if (selectedRepository.current === requestRepository) setActivity(refreshedActivity);
-    } catch (error) {
-      if (selectedRepository.current === requestRepository) {
-        setActivityError(error instanceof Error ? error.message : String(error));
-      }
-    } finally {
-      if (selectedRepository.current === requestRepository) setActivityLoading(false);
-    }
-  }
-
-  if (!project) return <aside className="project-detail empty-detail"><h3>Select a project</h3><p>Choose a project to see its local details.</p></aside>;
-  const git = project.git;
-  return <aside className="project-detail" aria-labelledby="project-detail-title">
-    <p className="eyebrow">PROJECT DETAILS</p><h3 id="project-detail-title">{project.name}</h3><p className="detail-path">{displayDirectoryPath(project.path)}</p>
-    <div className="detail-group"><strong>Repository</strong><span>{project.isGitRepository ? git.status === "available" ? git.branch ? `Branch ${git.branch}` : "Branch unavailable" : gitStatusLabel(git.status) : "Not a Git repository"}</span>
-      {project.isGitRepository && git.dirty !== null && <span>{git.dirty ? "Uncommitted changes" : "Working tree clean"}</span>}
-      {git.latestCommit && <span>{git.latestCommit.shortHash} · {git.latestCommit.subject}</span>}
-      {git.upstream.status === "tracking" && <span>Upstream · ↑{git.upstream.ahead ?? 0} ↓{git.upstream.behind ?? 0}</span>}
-      {git.upstream.status === "noUpstream" && <span>No upstream configured</span>}
-      {git.upstream.status === "unavailable" && git.status === "available" && <span>Upstream status unavailable</span>}
-    </div>
-    <div className="detail-group"><strong>Detected stacks</strong><div className="project-detail-tags">{project.detectedStacks.length ? project.detectedStacks.map((stack) => <span className="project-tag" key={stack}>{stack}</span>) : <span>None detected</span>}</div></div>
-    {git.remotes.length > 0 && <div className="detail-group"><strong>Remotes</strong>{git.remotes.map((remote) => <span className="detail-break" key={remote.name}>{remote.name}{remote.url ? ` · ${remote.url}` : " · URL unavailable"}</span>)}</div>}
-    {remote && <div className="detail-group github-activity">
-      <strong>GitHub activity</strong>
-      <a href={remote.canonicalUrl} target="_blank" rel="noreferrer">{remote.owner}/{remote.repository} ↗</a>
-      <span>Remote access · {activity?.authentication === "available" ? "authenticated" : activity?.authentication === "expired" ? "authentication expired" : "public GitHub API"}</span>
-      <div className="github-activity-counts">
-        <a href={activity?.issuesUrl ?? `${remote.canonicalUrl}/issues`} target="_blank" rel="noreferrer">{activity?.issueCount ?? "—"} open issues</a>
-        <a href={activity?.pullsUrl ?? `${remote.canonicalUrl}/pulls`} target="_blank" rel="noreferrer">{activity?.pullRequestCount ?? "—"} open pull requests</a>
-      </div>
-      <span className="github-freshness">Remote · {activity?.remoteStatus === "fresh" ? "updated" : activity?.remoteStatus === "rateLimited" ? "rate limited" : activity?.remoteStatus === "unauthorized" ? "access unavailable" : activity?.remoteStatus === "authExpired" ? "authentication expired" : activity?.remoteStatus === "unavailable" ? "unavailable" : "not refreshed"}{activity?.checkedAt ? ` · ${new Date(Number(activity.checkedAt) * 1000).toLocaleString()}` : ""}</span>
-      {activity?.authentication === "expired" && <span role="status">GitHub rejected authentication. Public repository links and local project details are still available.</span>}
-      {activity?.remoteStatus === "rateLimited" && <span role="status">GitHub rate limit reached. Try again later.</span>}
-      {activity?.remoteStatus === "unauthorized" && <span role="status">GitHub did not provide repository activity. Private data stays hidden.</span>}
-      {activity?.remoteStatus === "unavailable" && <span role="status">Remote activity is unavailable. Local project details are still available.</span>}
-      {activity?.recentCommits.map((commit) => <a className="github-commit" key={commit.hash} href={commit.url} target="_blank" rel="noreferrer"><code>{commit.hash}</code> · {commit.subject}</a>)}
-      {isDesktopApp() && <GitHubIssuePicker key={`${remote.owner.toLowerCase()}/${remote.repository.toLowerCase()}`} owner={remote.owner} repository={remote.repository} onWork={onWork} />}
-      {activityError && <span role="status">{activityError}</span>}
-      {isDesktopApp() && <button className="text-button" type="button" onClick={() => { void refreshActivity(); }} disabled={activityLoading}>{activityLoading ? "Refreshing GitHub…" : "Refresh GitHub activity"}</button>}
-    </div>}
-    {project.workflowPrerequisites.length > 0 && <div className="detail-group"><strong>Workflow prerequisites</strong>{project.workflowPrerequisites.map((tool) => <span key={tool.name}>{tool.name} · {tool.available ? "available" : "missing"}</span>)}</div>}
-  </aside>;
-}

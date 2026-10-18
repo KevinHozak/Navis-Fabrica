@@ -40,7 +40,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   const [evaluateFallback, setEvaluateFallback] = useState(false);
   const [fallbackTrigger, setFallbackTrigger] = useState<Exclude<FallbackTrigger, "quotaUnknown">>("providerFailure");
   const [fallbackLocalOnly, setFallbackLocalOnly] = useState(false);
-  const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push" | "dev-build">("dev-work");
+  const [workflowAction, setWorkflowAction] = useState<"dev-work" | "dev-push" | "dev-build">("dev-build");
   const [buildProfile, setBuildProfile] = useState<"release" | "debug">("release");
   const [workflowIntent, setWorkflowIntent] = useState("");
   const [scopePathsText, setScopePathsText] = useState("");
@@ -378,7 +378,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       <div className="panel-heading"><div><h2 id="agent-workflow-title">Agent-backed project actions</h2><p>Runs the installed workflow through the configured Codex provider and records its output.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgentWorkflow(event); }}>
-        <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push" | "dev-build")}><option value="dev-work">Work on selected issue</option><option value="dev-push">Review and push selected changes</option><option value="dev-build">Build project</option></select></label>
+        <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push" | "dev-build")}><option value="dev-push">Review and push selected changes</option><option value="dev-build">Build project</option></select></label>
         <label>Project<input value={`${project.name} · ${displayDirectoryPath(project.path)}`} readOnly aria-readonly="true" /></label>
         {workflowAction === "dev-work" && <label>Issue context<input value={issue ? `#${issue.number} · ${issue.title}${issue.blocked ? " · blocked" : ""}` : "No issue selected"} readOnly aria-readonly="true" /></label>}
         {workflowAction === "dev-push" && <label>Changed file paths, one per line<textarea rows={3} required value={scopePathsText} onChange={(event) => setScopePathsText(event.target.value)} placeholder="src/file.ts" /></label>}
@@ -410,7 +410,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
-    <section className="panel run-launch-panel" aria-labelledby="run-launch-title">
+    <details className="advanced-settings"><summary>Advanced: configured executable</summary><section className="panel run-launch-panel" aria-labelledby="run-launch-title">
       <div className="panel-heading"><div><h2 id="run-launch-title">Start a configured executable</h2><p>Arguments are passed as separate values to the native process runner.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void start(event); }}>
@@ -426,7 +426,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
-    <div className="runs-layout">
+    </details><div className="runs-layout">
       <section className="panel run-list-panel" aria-labelledby="run-history-title">
         <div className="panel-heading"><div><h2 id="run-history-title">Recent runs</h2><p>Local history · at most 100 runs, 2,000 events and 512 KiB output per run.</p></div></div>
         <div className="run-history-actions"><button className="button button-secondary" type="button" disabled={historyBusy} onClick={() => { void exportDiagnostics(); }}>{historyBusy ? "Working…" : "Export redacted diagnostics"}</button><button className="button button-secondary" type="button" disabled={historyBusy || runs.every((run) => activeStates.has(run.state))} onClick={() => { void deleteFinishedHistory(); }}>Delete completed history</button></div>

@@ -1,10 +1,11 @@
+import { publishBatchActivity } from "./Activity";
 import { useEffect, useRef, useState } from "react";
 import { isDesktopApp } from "./settings";
 import { RunnerCommandError, batchCommand, refreshProviderObservations, runnerContext, runnerProviders, type BatchEvent, type BatchPreview, type BatchRequest, type BatchStatus, type ProviderChoices, type RecoveryRequest } from "./batchClient";
 
 const connectionKey = "fabrica.runner.connection.v1";
-function savedConnection(): { dataRoot: string; batchId: string } {
-  try { const value = JSON.parse(localStorage.getItem(connectionKey) ?? "{}"); return { dataRoot: typeof value.dataRoot === "string" ? value.dataRoot : "", batchId: typeof value.batchId === "string" ? value.batchId : "" }; } catch { return { dataRoot: "", batchId: "" }; }
+function savedConnection(): { dataRoot: string; batchId: string; projectPath?: string } {
+  try { const value = JSON.parse(localStorage.getItem(connectionKey) ?? "{}"); return { projectPath: typeof value.projectPath === "string" ? value.projectPath : undefined, dataRoot: typeof value.dataRoot === "string" ? value.dataRoot : "", batchId: typeof value.batchId === "string" ? value.batchId : "" }; } catch { return { dataRoot: "", batchId: "" }; }
 }
 const money = (micros: number) => `$${(micros / 1000000).toFixed(4)}`;
 export function BatchRunnerPanel() {
@@ -61,6 +62,16 @@ export function BatchRunnerPanel() {
     const timer = window.setInterval(() => void refresh(), 3000);
     return () => { active = false; window.clearInterval(timer); };
   }, [desktop, connected, batchId, dataRoot]);
+  useEffect(() => {
+    if (!connected || !status) { publishBatchActivity(null); return; }
+    const projectPath = draft?.batchId === batchId ? draft.projectPath : saved.batchId === batchId ? saved.projectPath : undefined;
+    publishBatchActivity({ batchId, projectPath, state: pollError ? "unavailable" : status.snapshot.state,
+      needsAttention: Boolean(pollError) || status.jobs.some(job => ["needs_input", "needsInput", "failed", "blocked"].includes(job.state)) });
+    if (projectPath) {
+      try { localStorage.setItem(connectionKey, JSON.stringify({ dataRoot, batchId, projectPath })); } catch { /* Optional browser persistence. */ }
+    }
+  }, [connected, status, pollError, batchId, dataRoot, draft, saved]);
+
   function changeScope(nextRoot: string, nextId: string) {
     if (nextRoot !== dataRoot) setPreview(null);
     setDataRoot(nextRoot); setBatchId(nextId); setConnected(false); setStatus(null); setEvents([]); setLastRefreshed(null); setPollError(""); setRecovery(null); cursor.current = 0;

@@ -1429,51 +1429,37 @@ fn start_affected_project_refresh(
             .map(PathBuf::from)
             .filter(|path| path_is_within(&normalize_path(path), &normalize_path(&root)))
             .collect();
-        let options = scanner::ScanOptions {
-            depth: settings.preferences.scan_depth,
-            include_hidden: settings.preferences.include_hidden,
-            exclusions: settings.exclusions.clone(),
-        };
-        for changed in changed_paths {
+        let selected_ids = &settings.preferences.project_display.favorite_project_ids;
+        for project in &prior {
+            if !selected_ids.contains(&project.id) {
+                continue;
+            }
             if cancellation.load(Ordering::Relaxed) {
                 result.cancelled = true;
                 break;
             }
-            let changed = PathBuf::from(changed);
-            if !changed.is_absolute() {
+            let project_path = Path::new(&project.path);
+            if !affected_paths
+                .iter()
+                .any(|path| paths_overlap(&normalize_path(path), &normalize_path(project_path)))
+            {
                 continue;
             }
-            let mut candidate = if changed.is_dir() {
-                changed
-            } else {
-                changed.parent().unwrap_or(&root).to_path_buf()
-            };
-            for _ in 0..64 {
-                let Ok(canonical) = candidate.canonicalize() else {
-                    break;
-                };
-                if !path_is_within(&normalize_path(&canonical), &normalize_path(&root))
-                    || !candidates.insert(normalize_path(&canonical))
-                {
-                    break;
-                }
-                if scanner::directory_is_in_discovery_scope(&canonical, &root, &options) {
-                    match scanner::refresh_project_directory(&canonical, &cancellation) {
-                        Ok(Some(project)) => result.projects.push(project),
-                        Ok(None) => {}
-                        Err(error) if result.errors.len() < 500 => result.errors.push(error),
-                        Err(_) => {}
-                    }
-                    result.directories_scanned += 1;
-                }
-                if canonical == root {
-                    break;
-                }
-                let Some(parent) = canonical.parent() else {
-                    break;
-                };
-                candidate = parent.to_path_buf();
+            candidates.insert(normalize_path(project_path));
+            match scanner::refresh_project_directory(project_path, &cancellation) {
+                Ok(Some(project)) => result.projects.push(project),
+                Ok(None) => {}
+                Err(error) => result.errors.push(error),
             }
+            result.directories_scanned += 1;
+        }
+        if candidates.is_empty() {
+            result.projects = prior;
+            if let Ok(mut scans) = active_scans().lock() {
+                scans.remove(&scan_id);
+            }
+            let _ = app.emit("project-scan-finished", result);
+            return;
         }
         let refreshed_ids: HashSet<String> = result
             .projects
@@ -1596,6 +1582,34 @@ fn path_is_within(candidate: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+type WatchStamp = Option<(u64, Option<SystemTime>, bool)>;
+fn watch_path_changed(stamps: &mut HashMap<String, WatchStamp>, path: &Path) -> bool {
+    let stamp = fs::metadata(path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok(), m.is_dir()));
+    let key = normalize_path(path);
+    if stamps.get(&key) == Some(&stamp) {
+        return false;
+    }
+    if stamps.len() >= 4096 {
+        stamps.clear();
+    }
+    stamps.insert(key, stamp);
+    true
+}
+
+fn watch_event_changes_content(kind: &notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Create(_)
+            | notify::EventKind::Remove(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+            | notify::EventKind::Modify(notify::event::ModifyKind::Any)
+            | notify::EventKind::Any
+    )
+}
+
 fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>) {
     let (sender, receiver) = mpsc::channel::<WatchCommand>();
     if WATCH_COMMANDS.set(sender.clone()).is_err() {
@@ -1615,6 +1629,7 @@ fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>)
         };
         let mut watched_exclusions = exclusions;
         let mut watched_root = None;
+        let mut content_stamps = HashMap::new();
         let set_root = |watcher: &mut notify::RecommendedWatcher,
                         watched_root: &mut Option<PathBuf>,
                         next: PathBuf| {
@@ -1643,7 +1658,11 @@ fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>)
                     let _ = app.emit("project-watch-error", error);
                 }
                 WatchCommand::Event(Ok(event)) => {
+                    if !watch_event_changes_content(&event.kind) {
+                        continue;
+                    }
                     let mut changed_paths = event.paths;
+                    let max_deadline = Instant::now() + Duration::from_secs(2);
                     let mut deadline = Instant::now() + Duration::from_millis(350);
                     loop {
                         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1652,8 +1671,12 @@ fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>)
                         }
                         match receiver.recv_timeout(remaining) {
                             Ok(WatchCommand::Event(Ok(next))) => {
-                                changed_paths.extend(next.paths);
-                                deadline = Instant::now() + Duration::from_millis(350);
+                                if watch_event_changes_content(&next.kind) {
+                                    changed_paths.extend(next.paths);
+                                    changed_paths.truncate(512);
+                                    deadline = (Instant::now() + Duration::from_millis(350))
+                                        .min(max_deadline);
+                                }
                             }
                             Ok(WatchCommand::Event(Err(error))) => {
                                 let _ = app.emit("project-watch-error", error);
@@ -1672,6 +1695,35 @@ fn start_project_watcher(app: AppHandle, root: PathBuf, exclusions: Vec<String>)
                         changed_paths
                             .retain(|path| !watcher_path_excluded(path, root, &watched_exclusions));
                     }
+                    // Only saved selected projects receive content refresh. Catalog discovery is manual.
+                    if let Ok(settings) = settings_path(&app).and_then(|path| load_settings(&path))
+                    {
+                        if let Ok(path) = project_inventory_path(&app) {
+                            let selected: Vec<_> = inventory::load(&path, &settings.project_root)
+                                .into_iter()
+                                .filter(|p| {
+                                    settings
+                                        .preferences
+                                        .project_display
+                                        .favorite_project_ids
+                                        .contains(&p.id)
+                                })
+                                .collect();
+                            changed_paths.retain(|path| {
+                                selected.iter().any(|p| {
+                                    path_is_within(
+                                        &normalize_path(path),
+                                        &normalize_path(Path::new(&p.path)),
+                                    )
+                                })
+                            });
+                        } else {
+                            changed_paths.clear();
+                        }
+                    } else {
+                        changed_paths.clear();
+                    }
+                    changed_paths.retain(|path| watch_path_changed(&mut content_stamps, path));
                     if !changed_paths.is_empty() {
                         changed_paths.truncate(128);
                         invalidate_project_facts(&changed_paths);
@@ -2247,6 +2299,51 @@ mod tests {
             workflow_skill_status(folder.path(), "dev-work"),
             "incompatible"
         );
+    }
+
+    #[test]
+    fn watcher_coalesces_duplicate_content_notifications() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("issue.md");
+        let mut stamps = HashMap::new();
+        fs::write(&path, "first").unwrap();
+        assert!(watch_path_changed(&mut stamps, &path));
+        assert!(!watch_path_changed(&mut stamps, &path));
+        fs::write(&path, "changed content").unwrap();
+        assert!(watch_path_changed(&mut stamps, &path));
+        assert!(!watch_path_changed(&mut stamps, &path));
+        fs::remove_file(&path).unwrap();
+        assert!(watch_path_changed(&mut stamps, &path));
+        assert!(!watch_path_changed(&mut stamps, &path));
+    }
+
+    #[test]
+    fn watcher_ignores_inspection_but_accepts_content_changes() {
+        use notify::{
+            event::{
+                AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+                RenameMode,
+            },
+            EventKind,
+        };
+        assert!(!watch_event_changes_content(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!watch_event_changes_content(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime)
+        )));
+        assert!(watch_event_changes_content(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(watch_event_changes_content(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        )));
+        assert!(watch_event_changes_content(&EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(watch_event_changes_content(&EventKind::Remove(
+            RemoveKind::File
+        )));
     }
 
     #[test]

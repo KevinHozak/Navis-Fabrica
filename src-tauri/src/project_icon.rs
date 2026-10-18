@@ -25,6 +25,8 @@ const ICON_CANDIDATES: &[&str] = &[
     "public/logo.webp",
     "public/logo.jpg",
     "public/logo.svg",
+    "assets/icon.png",
+    "assets/play-store-icon.png",
     "src-tauri/icons/icon.png",
     "src-tauri/icons/icon.ico",
     "public/favicon.png",
@@ -34,7 +36,6 @@ const ICON_CANDIDATES: &[&str] = &[
     "public/icon-192.png",
     "src/app/icon.png",
     "app/icon.png",
-    "assets/icon.png",
     "assets/favicon.png",
     "icon.png",
     "favicon.png",
@@ -242,6 +243,36 @@ mod tests {
         fs::create_dir_all(project.path().join("frontend")).unwrap();
         std::os::unix::fs::symlink(outside.path(), project.path().join("frontend/public")).unwrap();
         assert_eq!(data_url(project.path()), None);
+    }
+
+    #[test]
+    fn prefers_small_store_artwork_over_stale_web_icons_when_native_icon_is_oversized() {
+        let project = tempdir().unwrap();
+        fs::create_dir_all(project.path().join("assets")).unwrap();
+        fs::create_dir_all(project.path().join("public")).unwrap();
+        fs::write(
+            project.path().join("assets/icon.png"),
+            vec![0; MAX_ICON_BYTES as usize + 1],
+        )
+        .unwrap();
+        let current_icon = b"\x89PNG\r\n\x1a\ncurrent-g-icon";
+        fs::write(
+            project.path().join("assets/play-store-icon.png"),
+            current_icon,
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("public/icon-192.png"),
+            b"\x89PNG\r\n\x1a\nstale-web-icon",
+        )
+        .unwrap();
+        assert_eq!(
+            data_url(project.path()).unwrap(),
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(current_icon)
+            )
+        );
     }
 
     #[test]

@@ -1,0 +1,25 @@
+﻿# [PROJECT NAME] Workflow Prompts
+
+## Repository orientation
+
+Read the applicable `AGENTS.md`, `GOALS.md`, `PLANS.md`, `PROMPTS.md`, `harness/build-log.md`, and relevant files under `harness/context/`. Perform a read-only discovery pass. Report the repository purpose, current state, constraints, available checks, and unknowns. Do not edit files.
+
+## Phase preparation
+
+Read the selected phase file under `harness/build/` and all referenced context. Summarize scope, exact files, acceptance criteria, risks, and non-goals. Record authorization already present in the request or selected workflow; ask only for a missing material decision. A planning-only request stops here. When the enclosing request also authorizes implementation, proceed within that scope.
+
+## Execute one approved phase
+
+Execute the authorized phase and any continuation explicitly included in the enclosing request. Follow red, green, refactor, and verification where appropriate. Run the repository's applicable checks. For dev-work/dev-push, scoped commit, push, and PR delivery follow the shared delivery contract without another approval gate. Do not infer merge, deployment, unrelated work, or publication authority for a local-only workflow.
+
+## Verification and evidence
+
+Inspect the final diff and repository status. Record exact commands and observed results in `harness/build-log.md`, linking private evidence without copying sensitive payloads. If a check fails, distinguish product defects from environment or runner-protocol failures before choosing a scoped correction; passing checks do not establish untested behavior.
+
+## Review and remediation
+
+Review only the selected scope. Prioritize correctness, security, data integrity, recovery behavior, and user-visible regressions. Cite exact files and lines. Implement scoped remediation when the enclosing request or dev-work already authorizes it; otherwise report findings and ask before repairs.
+
+## Phase completion and handoff
+
+Summarize the completed scope, changed files, tests, validation evidence and remaining risks. Stop at the requested boundary; continue to the next phase only when already included in the enclosing request.

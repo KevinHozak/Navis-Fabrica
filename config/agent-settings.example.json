@@ -1,0 +1,7 @@
+{
+  "settings_path": "/absolute/private/fabrica/settings.json",
+  "openrouter_provider_id": "your-openrouter-profile-id",
+  "ledger_path": "/absolute/private/fabrica/model-usage.sqlite3",
+  "daily_budget_usd": 1,
+  "per_call_budget_usd": 0.05
+}

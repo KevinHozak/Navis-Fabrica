@@ -1,0 +1,28 @@
+﻿{
+  "description": "USD per million tokens: uncached input, cached input, cache writes, output. Current-rate reconstructions only. No aliases for unknown exact models.",
+  "models": {
+    "gpt-6.1-sol": {
+      "short_per_million": [2, 0.1, 2.5, 10],
+      "long_per_million": [4, 0.2, 5, 15],
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verified_on": "2026-10-16"
+    },
+    "gpt-6-luna": {
+      "short_per_million": [0.1, 0.01, 0.125, 0.5],
+      "long_per_million": [0.2, 0.02, 0.25, 0.75],
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verified_on": "2026-10-16"
+    },
+    "gpt-6-astra": {
+      "short_per_million": [10, 1, 12.5, 50],
+      "long_per_million": [20, 2, 25, 75],
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verified_on": "2026-10-16"
+    },
+    "meta/muse-spark-open": {
+      "short_per_million": [1.25, 0.15, 1.25, 4.25],
+      "source": "https://openrouter.ai/meta/muse-spark-open",
+      "verified_on": "2026-10-16"
+    }
+  }
+}

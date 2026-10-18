@@ -39,3 +39,9 @@ Detached workers require a Windows host that permits breakaway. Explicit foregro
 ## Product context
 
 [Product plan](docs/product-plan.md), [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md) include earlier design context. Current source and runner readiness distinguish implementation from verified acceptance. Local projects do not need a GitHub remote to use the issue store or runner.
+
+## Shared model-assisted workflows
+
+See [agent model workflows](docs/agent-model-workflows.md) for the portable text-helper CLI, routing policy, usage accounting and caller-owned skill integration. Private settings and ledgers stay outside this public repository.
+
+See [shared agent helpers](docs/shared-agent-helpers.md) for evidence, harness generation, skill validation, private usage reporting, backups and extracted version/build helpers. Skill instructions remain caller-owned.

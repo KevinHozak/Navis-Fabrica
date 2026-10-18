@@ -12,3 +12,7 @@ src-tauri/gen/schemas/
 Thumbs.db
 planning/github-state.json
 /runner-core/target*/
+
+# Python helper bytecode
+__pycache__/
+*.py[cod]

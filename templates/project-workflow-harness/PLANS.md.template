@@ -1,0 +1,24 @@
+﻿# [PROJECT NAME] Plan
+
+## Current state
+
+[Summarize the observed repository state. Do not invent missing requirements.]
+
+## Phase sequence
+
+1. [Phase name]
+2. [Phase name]
+3. [Phase name]
+
+## Phase dependencies
+
+[Describe which phases depend on earlier evidence or approvals.]
+
+## Acceptance criteria
+
+- [Criterion]
+- [Criterion]
+
+## Decisions and open questions
+
+- [Decision or question]

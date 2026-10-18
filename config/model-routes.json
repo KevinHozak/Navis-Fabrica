@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "routes": {
+    "coding-advice": {
+      "provider": "openrouter",
+      "model": "qwen/qwen3-coder-next",
+      "input_envelope": 8192,
+      "max_output_tokens": 1024,
+      "timeout_seconds": 45
+    },
+    "extract": {
+      "provider": "openrouter",
+      "model": "qwen/qwen3-coder-next",
+      "input_envelope": 8192,
+      "max_output_tokens": 512,
+      "timeout_seconds": 45
+    },
+    "documents": {
+      "provider": "openrouter",
+      "model": "google/gemini-3.5-flash-lite",
+      "input_envelope": 32768,
+      "max_output_tokens": 2048,
+      "timeout_seconds": 45
+    },
+    "review": {
+      "provider": "openrouter",
+      "model": "anthropic/claude-sonnet-4.6",
+      "input_envelope": 8192,
+      "max_output_tokens": 1024,
+      "timeout_seconds": 45
+    },
+    "draft-local": {
+      "provider": "ollama",
+      "model": "gemma3:4b",
+      "input_envelope": 2048,
+      "max_output_tokens": 256,
+      "timeout_seconds": 45
+    },
+    "code-local": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "input_envelope": 2048,
+      "max_output_tokens": 256,
+      "timeout_seconds": 45
+    }
+  }
+}

@@ -374,7 +374,7 @@ function App() {
           <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
           <div hidden={section !== "batches"}><BatchRunnerPanel /></div>
           {section === "local-issues" || section === "batches" ? null : section === "settings" ? (
-            <><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} /><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
+            <><details className="panel advanced-settings"><summary>My Projects</summary><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} /></details><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
           ) : section === "providers" ? (
             <ProvidersPanel />
           ) : section === "runs" ? selectedProject ? isDesktopApp() ? (

@@ -8,7 +8,6 @@ export function ProjectCollection({ projects, manage = false, onSelect }: { proj
   const [preferences, setPreferences] = useState(defaultProjectDisplayPreferences);
   const [ready, setReady] = useState(false);
   const [message, setMessage] = useState("");
-  const [query, setQuery] = useState("");
   const runs = useWorkflowActivity();
   const [selected, setSelected] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -27,15 +26,13 @@ export function ProjectCollection({ projects, manage = false, onSelect }: { proj
     finally { setSaving(false); }
   }
   const unique = [...new Map(projects.map(p => [p.id, p])).values()];
-  const visible = unique.filter(p => (manage || preferences.favoriteProjectIds.includes(p.id)) && (!manage || `${p.name} ${p.path}`.toLowerCase().includes(query.toLowerCase())));
+  const visible = unique.filter(p => manage || preferences.favoriteProjectIds.includes(p.id));
   return <section className="my-projects">
-    {manage && <><h2>My Projects collection</h2><p>Choose your projects. Discovered clones stay outside your collection until you select them. Existing favorites are your initial saved selection.</p></>}
-    {manage && <label className="settings-field"><span>Find a project to include</span><input type="search" value={query} onChange={e => setQuery(e.target.value)} /></label>}
     {message && <p role="status">{message}</p>}
     {!ready ? <p>Loading saved collection…</p> : <>
       {manage ? <><div className="collection-options">{visible.map(p => <label key={p.id}><input type="checkbox" disabled={saving} checked={preferences.favoriteProjectIds.includes(p.id)} onChange={e => setPreferences({ ...preferences, favoriteProjectIds: e.target.checked ? [...preferences.favoriteProjectIds, p.id] : preferences.favoriteProjectIds.filter(id => id !== p.id) })} /><span><strong>{p.name}</strong><small>{p.path}</small></span></label>)}</div>
       {preferences.favoriteProjectIds.filter(id => !unique.some(p => p.id === id)).map(id => <label className="collection-missing" key={id}><input type="checkbox" checked disabled={saving} onChange={() => setPreferences({ ...preferences, favoriteProjectIds: preferences.favoriteProjectIds.filter(item => item !== id) })} />Unavailable saved project: {id}</label>)}
-      {!visible.length && <p>No discovered candidates match. Use Discover project folders in Settings or review the folder below.</p>}
+      {!visible.length && <p>No discovered projects yet. Use Discover project folders in Settings.</p>}
       <button className="button button-primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save My Projects"}</button></> : <>
       {!visible.length && <div className="empty-state"><h3>{preferences.favoriteProjectIds.length ? "No available projects match" : "Choose your projects"}</h3><p>Your collection only includes projects you select.</p><a href="#settings">Manage My Projects in Settings</a></div>}
       <div className="my-project-grid" role="list" aria-label={manage ? "Project candidates" : "My Projects"}>{visible.map(p => <div role="listitem" key={p.id}><ProjectCard project={p} runs={runs} selected={p.id === selected} onClick={() => { setSelected(p.id); setOpenedIds(ids => ids.includes(p.id) ? ids : [...ids, p.id]); onSelect(p.id); }} /></div>)}</div>

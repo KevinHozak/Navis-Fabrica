@@ -131,22 +131,21 @@ fn frontend_does_not_depend_on_the_unrestricted_shell_plugin() {
 
 #[test]
 fn project_cards_preserve_keyboard_and_screen_reader_contracts() {
-    let app = fs::read_to_string(manifest_path("../src/App.tsx")).unwrap();
+    let collection = fs::read_to_string(manifest_path("../src/ProjectCollection.tsx")).unwrap();
     for contract in [
         "role=\"list\"",
         "role=\"listitem\"",
-        "className=\"project-card-select\"",
-        "aria-pressed={selectedProjectId === project.id}",
-        "onClick={() => onSelect(project.id)}",
+        "my-project-card${selected ?",
+        "aria-pressed={selected}",
+        "onClick={onClick}",
         "Working tree clean",
-        "Uncommitted changes",
-        "Working tree status unavailable",
+        "Changed files unavailable",
     ] {
-        assert!(app.contains(contract), "project cards missing {contract}");
+        assert!(collection.contains(contract), "project cards missing {contract}");
     }
     let styles = fs::read_to_string(manifest_path("../src/styles.css")).unwrap();
     assert!(styles.contains(":focus-visible"));
-    assert!(styles.contains(".project-card-grid"));
+    assert!(styles.contains(".my-project-grid"));
     assert!(styles.contains("@media (prefers-reduced-motion: reduce)"));
 }
 

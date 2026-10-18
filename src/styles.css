@@ -392,6 +392,9 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .my-project-card { text-align: left; padding: 26px; min-height: 220px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; cursor: pointer; }
 .my-project-card:hover, .my-project-card.selected { border-color: #75b9ed; background: #1a2a3a; }
 .my-project-card h3 { font-size: 1.3rem; margin: 0 0 12px; }
+.my-project-card-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.my-project-card-heading h3 { margin: 0; }
+.my-project-icon { width: 36px; height: 36px; flex: 0 0 36px; border-radius: 8px; object-fit: contain; }
 .my-project-card small, .my-project-card dt { color: #abb9c9; }
 .my-project-card dl { display: flex; gap: 32px; margin: 24px 0; }
 .my-project-card dd { margin: 8px 0 0; font-size: 1.2rem; }

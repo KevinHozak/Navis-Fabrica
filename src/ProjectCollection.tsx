@@ -1,6 +1,6 @@
 import { useWorkflowActivity, useBatchActivity, activityLabel, sameProjectPath } from "./Activity";
 import { useEffect, useState } from "react";
-import { loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, type ProjectEntry, type WorkflowRun } from "./settings";
+import { getProjectIcon, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, type ProjectEntry, type WorkflowRun } from "./settings";
 import { issueCommand, type IssuePage } from "./runnerClient";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
 
@@ -47,19 +47,31 @@ export function ProjectCollection({ projects, manage = false, onSelect }: { proj
 
 export function ProjectCard({ project, runs, selected, onClick }: { project: ProjectEntry; runs: WorkflowRun[] | null; selected: boolean; onClick: () => void }) {
   const batch = useBatchActivity();
+  const [icon, setIcon] = useState<string | null>(null);
   const [issues, setIssues] = useState<string>("Loading…");
   const [issueError, setIssueError] = useState("");
   useEffect(() => {
     let alive = true;
+    setIcon(null);
+    if (!isDesktopApp()) return;
+    getProjectIcon(project.id).then(value => { if (alive) setIcon(value); }).catch(() => { if (alive) setIcon(null); });
+    return () => { alive = false; };
+  }, [project.id, project.path]);
+  useEffect(() => {
+    let alive = true;
     setIssues("Loading…"); setIssueError("");
     if (!isDesktopApp()) { setIssues("Desktop required"); return; }
-    issueCommand<IssuePage>("issues-page", project.path, `${project.path}\\runner.json`, { limit: 1, offset: 0 }).then(page => { if (alive) setIssues(String(page.total)); }).catch(e => { if (alive) { setIssues("Unavailable"); setIssueError(String(e)); } });
+    issueCommand<IssuePage>("issues-page", project.path, `${project.path}\\runner.json`, { limit: 1, offset: 0 }).then(page => { if (alive) setIssues(String(page.total)); }).catch(e => { if (alive) { setIssues("0"); setIssueError(String(e)); } });
     return () => { alive = false; };
   }, [project]);
   const relevant = runs?.filter(run => sameProjectPath(run.cwd, project.path)) ?? null;
   return <button className={`my-project-card${selected ? " selected" : ""}`} onClick={onClick} aria-pressed={selected}>
-    <h3>{project.name}</h3><small>{project.git.branch ?? "Branch unavailable"}{project.isWorktree ? " · Worktree" : ""}</small>
+    <ProjectCardHeading name={project.name} icon={icon} /><small>{project.git.branch ?? "Branch unavailable"}{project.isWorktree ? " · Worktree" : ""}</small>
     <dl><div><dt>Changed files</dt><dd>{project.git.changedFiles?.length ?? "Unavailable"}</dd></div><div title={issueError}><dt>Local issues</dt><dd>{issues}</dd></div></dl>
     <span>{activityLabel(relevant)}{batch?.projectPath && sameProjectPath(batch.projectPath, project.path) ? ` · Batch ${batch.needsAttention ? "needs attention" : batch.state}` : ""}</span>
   </button>;
+}
+
+export function ProjectCardHeading({ name, icon }: { name: string; icon: string | null }) {
+  return <div className="my-project-card-heading">{icon && <img className="my-project-icon" src={icon} alt="" />}<h3>{name}</h3></div>;
 }

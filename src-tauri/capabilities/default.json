@@ -48,6 +48,7 @@
     "allow-evaluate-provider-fallback",
     "allow-calibrate-routing",
     "allow-get-project-inventory",
+    "allow-get-project-icon",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

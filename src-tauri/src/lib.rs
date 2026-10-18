@@ -21,6 +21,7 @@ mod inventory;
 pub use navis_fabrica_runner_core as runner_core;
 pub mod jev;
 mod process;
+mod project_icon;
 pub mod providers;
 mod routing;
 mod runs;
@@ -645,6 +646,16 @@ fn get_project_inventory(app: AppHandle) -> Result<Vec<scanner::ProjectEntry>, S
         &project_inventory_path(&app)?,
         &settings.project_root,
     ))
+}
+
+#[tauri::command]
+fn get_project_icon(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    let project = inventory::load(&project_inventory_path(&app)?, &settings.project_root)
+        .into_iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| "The selected project is no longer in the local inventory.".to_owned())?;
+    Ok(project_icon::data_url(Path::new(&project.path)))
 }
 
 #[tauri::command]
@@ -1800,6 +1811,7 @@ pub fn run() {
             get_runner_context,
             get_settings,
             get_project_inventory,
+            get_project_icon,
             start_affected_project_refresh,
             discover_workflow_skills,
             save_settings,

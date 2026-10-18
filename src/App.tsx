@@ -328,7 +328,7 @@ function App() {
       <a className="skip-link" href="#main-content" onClick={(event) => { event.preventDefault(); document.getElementById("main-content")?.focus(); }}>Skip to content</a>
       <aside className="sidebar" aria-label="Application navigation">
         <a className="brand" href="#projects" aria-label="Navis-Fabrica home">
-          <span className="brand-mark" aria-hidden="true">N</span>
+          <img className="brand-mark" src={new URL("../src-tauri/icons/icon.png", import.meta.url).href} alt="" width={34} height={34} />
           <span className="brand-copy"><strong>navis</strong><span>FABRICA</span></span>
         </a>
 
@@ -347,14 +347,13 @@ function App() {
             <span className="local-dot" aria-hidden="true" />
             <div><strong>Local workspace</strong><span>On this device</span></div>
           </div>
-          <div className="sidebar-footer"><span className="version-mark">NF</span><span>Navis-Fabrica</span><span className="version-number">v{__APP_VERSION__}</span></div>
         </div>
       </aside>
 
       <div className="main-column">
         <header className="toolbar">
           <div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{current.label}</strong></div>
-          <div className="toolbar-actions"><ActivityEntry /><span className="toolbar-divider" /><button className="avatar" type="button" aria-label="Local profile">K</button></div>
+          <div className="toolbar-actions"><ActivityEntry /></div>
         </header>
 
         <main id="main-content" className="content" tabIndex={-1}>
@@ -385,9 +384,6 @@ function App() {
           ) : (
             <section className="panel empty-state"><h2>Activity</h2><p>Choose a project from My Projects to open its actions.</p><div className="project-actions"><a href="#projects">My Projects</a><a href="#batches">Local issue batches</a></div></section>
           ) : null}
-
-
-          <footer className="content-footer"><span className="footer-orbit" aria-hidden="true">✳</span><span>Built for steady progress.</span><span className="footer-version">v{__APP_VERSION__}</span></footer>
         </main>
       </div>
     </div>

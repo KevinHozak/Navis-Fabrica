@@ -1765,15 +1765,24 @@ pub fn run() {
                     .elapsed()
                     .as_millis()
                     .clamp(1, u64::MAX as u128) as u64;
-                let _ = APP_STARTUP_MS.compare_exchange(
+                let first_load = APP_STARTUP_MS.compare_exchange(
                     0,
                     elapsed,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
+                if first_load.is_ok() {
+                    // Reveal only after the initially hidden window has been maximized.
+                    if let Err(error) = webview.window().show() {
+                        eprintln!("Failed to show the main window: {error}");
+                    }
+                }
             }
         })
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.maximize()?;
+            }
             let handle = app.handle().clone();
             let settings = settings_path(&handle)
                 .ok()

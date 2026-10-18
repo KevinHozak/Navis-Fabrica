@@ -2,6 +2,12 @@
 
 Fabrica owns the reusable helper and configurable model routes. Agent skill instructions are maintained separately by the caller. User configuration and runtime data belong outside this public checkout. No key is stored in these files. This helper performs text inference only; coding jobs retain the existing Rust runner, credential broker and paid gateway.
 
+## Codex coding executor
+
+Use **GPT-6 Luna** (`gpt-6-luna`) with **medium** reasoning for all local coding tasks. This is the user's coding executor preference; apply it through the host chat or Codex runtime's supported model controls. If the current executor setting cannot be inspected or changed, report that limitation instead of claiming the preference is active.
+
+This preference is separate from the optional OpenRouter and Ollama text-helper routes below. Keep their configured models and provider settings unchanged. Do not add an optional helper review solely for extra confidence on a simple coding task.
+
 ## Run a bounded task
 
 Requires Python 3.10+ and the standard library. Install Ollama separately for local inference. Point `FABRICA_AGENT_CONFIG` at a private copy of `config/agent-settings.example.json`; set its provider profile ID and settings path. The profile's secretRef resolves through Windows Credential Manager using the same contract as the Rust broker. On other platforms supply `OPENROUTER_API_KEY` through your secret manager/process environment. Never put a key in a CLI argument, tracked settings or prompt.

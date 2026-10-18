@@ -27,10 +27,10 @@ export function ProjectCollection({ projects, manage = false, onSelect }: { proj
     finally { setSaving(false); }
   }
   const unique = [...new Map(projects.map(p => [p.id, p])).values()];
-  const visible = unique.filter(p => (manage || preferences.favoriteProjectIds.includes(p.id)) && `${p.name} ${p.path}`.toLowerCase().includes(query.toLowerCase()));
+  const visible = unique.filter(p => (manage || preferences.favoriteProjectIds.includes(p.id)) && (!manage || `${p.name} ${p.path}`.toLowerCase().includes(query.toLowerCase())));
   return <section className="my-projects">
     {manage && <><h2>My Projects collection</h2><p>Choose your projects. Discovered clones stay outside your collection until you select them. Existing favorites are your initial saved selection.</p></>}
-    <label className="settings-field"><span>{manage ? "Find a project to include" : "Find in My Projects"}</span><input type="search" value={query} onChange={e => setQuery(e.target.value)} /></label>
+    {manage && <label className="settings-field"><span>Find a project to include</span><input type="search" value={query} onChange={e => setQuery(e.target.value)} /></label>}
     {message && <p role="status">{message}</p>}
     {!ready ? <p>Loading saved collection…</p> : <>
       {manage ? <><div className="collection-options">{visible.map(p => <label key={p.id}><input type="checkbox" disabled={saving} checked={preferences.favoriteProjectIds.includes(p.id)} onChange={e => setPreferences({ ...preferences, favoriteProjectIds: e.target.checked ? [...preferences.favoriteProjectIds, p.id] : preferences.favoriteProjectIds.filter(id => id !== p.id) })} /><span><strong>{p.name}</strong><small>{p.path}</small></span></label>)}</div>

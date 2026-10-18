@@ -653,13 +653,29 @@ pub fn execute(request: CoreRequest) -> CoreResponse {
                     .map_err(CoreError::from_issue)?,
             )
             .map_err(|e| CoreError::invalid(e.to_string()))?),
-            Operation::IssuesPage => Ok(serde_json::to_value(
-                service
-                    .store(false)?
-                    .page(request.offset.unwrap_or(0), request.limit.unwrap_or(100))
-                    .map_err(CoreError::from_issue)?,
-            )
-            .map_err(|e| CoreError::invalid(e.to_string()))?),
+            Operation::IssuesPage => {
+                let page = match fs::metadata(&service.issues_path) {
+                    Ok(metadata) if metadata.is_dir() => service
+                        .store(false)?
+                        .page(request.offset.unwrap_or(0), request.limit.unwrap_or(100))
+                        .map_err(CoreError::from_issue)?,
+                    Ok(_) => {
+                        return Err(CoreError::invalid(
+                            "issuesDir must resolve to a directory inside the project",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        issues::IssuePage {
+                            items: Vec::new(),
+                            total: 0,
+                            offset: request.offset.unwrap_or(0),
+                            limit: request.limit.unwrap_or(100),
+                        }
+                    }
+                    Err(error) => return Err(CoreError::io(error)),
+                };
+                Ok(serde_json::to_value(page).map_err(|e| CoreError::invalid(e.to_string()))?)
+            }
             Operation::IssuesShow => {
                 let id = request
                     .issue_id
@@ -901,6 +917,24 @@ mod tests {
         assert_eq!(page["total"], 1);
         assert_eq!(page["items"][0]["id"], "FAB-S001");
         assert!(page["items"][0].get("body").is_none());
+    }
+    #[test]
+    fn missing_issue_directory_is_an_empty_page_but_invalid_config_stays_an_error() {
+        let (_d, project, config) = setup();
+        let page = execute(request(
+            Operation::IssuesPage,
+            Some(project.clone()),
+            Some(config.clone()),
+        ));
+        assert!(page.ok, "{:?}", page.error);
+        let page = page.result.unwrap();
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["items"], json!([]));
+
+        fs::write(&config, "not valid json").unwrap();
+        let failed = execute(request(Operation::IssuesPage, Some(project), Some(config)));
+        assert!(!failed.ok);
+        assert_eq!(failed.error.unwrap().code, "INVALID_ARGUMENT");
     }
     #[test]
     fn supported_submission_without_required_arguments_fails_closed() {

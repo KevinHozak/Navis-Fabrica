@@ -224,6 +224,7 @@ export type GitFacts = {
   status: "available" | "detached" | "unborn" | "unsafeOwnership" | "gitUnavailable" | "notRepository" | "error";
   branch: string | null;
   dirty: boolean | null;
+  changedFiles?: string[] | null;
   latestCommit: { shortHash: string; subject: string } | null;
   remotes: { name: string; url: string | null; github: { owner: string; repository: string; canonicalUrl: string } | null }[];
   upstream: { status: "tracking" | "noUpstream" | "unavailable"; ahead: number | null; behind: number | null };

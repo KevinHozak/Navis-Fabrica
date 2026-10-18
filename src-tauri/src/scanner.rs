@@ -63,6 +63,8 @@ pub struct GitFacts {
     pub status: String,
     pub branch: Option<String>,
     pub dirty: Option<bool>,
+    #[serde(default)]
+    pub changed_files: Option<Vec<String>>,
     pub latest_commit: Option<LatestCommit>,
     pub remotes: Vec<GitRemote>,
     pub upstream: UpstreamDivergence,
@@ -294,7 +296,7 @@ pub fn scan_bounded(
                     was_cancelled = true;
                     break;
                 }
-                if is_git_repository && git.remotes.iter().any(|remote| remote.github.is_some()) {
+                {
                     project_ids.insert(key.clone());
                     projects.push(ProjectEntry {
                         id: key,
@@ -371,9 +373,6 @@ pub fn refresh_project_directory(
     if let Some(error) = errors.first() {
         return Err(error.clone());
     }
-    if !is_git_repository {
-        return Ok(None);
-    }
     let mut names = HashSet::new();
     for entry in fs::read_dir(&canonical)
         .map_err(|error| format!("Could not inspect a changed project folder: {error}"))?
@@ -382,10 +381,9 @@ pub fn refresh_project_directory(
             entry.map_err(|error| format!("Could not inspect a changed project entry: {error}"))?;
         names.insert(entry.file_name().to_string_lossy().to_lowercase());
     }
-    let git = inspect_git(&canonical, true, cancelled);
-    if cancelled.load(Ordering::Relaxed)
-        || !git.remotes.iter().any(|remote| remote.github.is_some())
-    {
+    let detected_stacks = detect_stacks(&canonical, &names);
+    let git = inspect_git(&canonical, is_git_repository, cancelled);
+    if cancelled.load(Ordering::Relaxed) || (!is_git_repository && detected_stacks.is_empty()) {
         return Ok(None);
     }
     let mut tool_availability = HashMap::new();
@@ -398,7 +396,7 @@ pub fn refresh_project_directory(
         path: canonical.to_string_lossy().into_owned(),
         is_git_repository,
         is_worktree,
-        detected_stacks: detect_stacks(&canonical, &names),
+        detected_stacks,
         git,
         workflow_prerequisites: workflow_prerequisites(
             &canonical,
@@ -778,12 +776,35 @@ fn executable_available(name: &str, cache: &mut HashMap<String, bool>) -> bool {
     available
 }
 
+fn parse_changed_files(value: &str) -> Vec<String> {
+    let mut entries = value.split('\0').filter(|entry| !entry.is_empty());
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next() {
+        if let Some(path) = entry.get(3..) {
+            files.push(path.to_owned());
+        }
+        if entry
+            .as_bytes()
+            .first()
+            .is_some_and(|b| *b == b'R' || *b == b'C')
+            || entry
+                .as_bytes()
+                .get(1)
+                .is_some_and(|b| *b == b'R' || *b == b'C')
+        {
+            entries.next();
+        }
+    }
+    files
+}
+
 fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitFacts {
     if !is_repository {
         return GitFacts {
             status: "notRepository".to_owned(),
             branch: None,
             dirty: None,
+            changed_files: None,
             latest_commit: None,
             remotes: Vec::new(),
             upstream: UpstreamDivergence {
@@ -818,20 +839,21 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
         },
         Err(status) => return empty_git_facts(&status),
     };
-    let dirty = match git_output(
+    let changed_files = match git_output(
         path,
         &[
             "--no-optional-locks",
             "status",
             "--porcelain=v1",
-            "--untracked-files=normal",
+            "-z",
+            "--untracked-files=all",
         ],
         cancelled,
     ) {
-        Ok(Some(value)) => Some(!value.is_empty()),
-        Ok(None) => Some(false),
+        Ok(value) => Some(parse_changed_files(value.as_deref().unwrap_or(""))),
         Err(status) => return empty_git_facts(&status),
     };
+    let dirty = changed_files.as_ref().map(|files| !files.is_empty());
     let latest_commit = match git_output(path, &["log", "-1", "--format=%H%x00%s"], cancelled) {
         Ok(Some(value)) => {
             let (hash, subject) = value.split_once('\0').unwrap_or((&value, ""));
@@ -917,6 +939,7 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
         status: status.to_owned(),
         branch,
         dirty,
+        changed_files,
         latest_commit,
         remotes,
         upstream,
@@ -928,6 +951,7 @@ fn empty_git_facts(status: &str) -> GitFacts {
         status: status.to_owned(),
         branch: None,
         dirty: None,
+        changed_files: None,
         latest_commit: None,
         remotes: Vec::new(),
         upstream: UpstreamDivergence {
@@ -960,7 +984,12 @@ fn git_output(
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
     let output = run_git_command(&mut command, cancelled)?;
     if output.status.success() {
-        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let value = if args.contains(&"-z") {
+            raw.into_owned()
+        } else {
+            raw.trim().to_owned()
+        };
         Ok((!value.is_empty()).then_some(value))
     } else {
         let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
@@ -1141,6 +1170,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
+    #[test]
+    fn changed_files_preserve_paths_and_count_renames_once() {
+        assert_eq!(
+            parse_changed_files(
+                " M spaced name.txt\0R  renamed ü.txt\0old name.txt\0?? folder/new.txt\0"
+            ),
+            vec!["spaced name.txt", "renamed ü.txt", "folder/new.txt"]
+        );
+        assert!(parse_changed_files("").is_empty());
+    }
+
     fn inspect_git_fixture(path: &Path) -> GitFacts {
         inspect_git(path, true, &AtomicBool::new(false))
     }
@@ -1240,6 +1280,7 @@ mod tests {
         let facts = inspect_git_fixture(root.path());
         assert_eq!(facts.status, "available");
         assert_eq!(facts.dirty, Some(true));
+        assert_eq!(facts.changed_files, Some(vec!["untracked.txt".into()]));
         assert_eq!(
             facts.latest_commit.as_ref().unwrap().subject,
             "fixture commit"
@@ -1290,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_lists_only_github_repositories_and_keeps_local_git_facts() {
+    fn scan_lists_local_and_other_host_candidates_and_keeps_git_facts() {
         let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let github = root.path().join("github");
         init_github_repo(&github, "git@github.com:Owner/Repo.git");
@@ -1310,9 +1351,24 @@ mod tests {
 
         let result = scan_fixture(root.path(), 1);
 
-        assert_eq!(result.projects.len(), 1);
-        let project = &result.projects[0];
-        assert_eq!(project.name, "github");
+        assert_eq!(result.projects.len(), 4);
+        let project = result
+            .projects
+            .iter()
+            .find(|project| project.name == "github")
+            .unwrap();
+        assert!(result
+            .projects
+            .iter()
+            .any(|project| project.name == "local-only"));
+        assert!(result
+            .projects
+            .iter()
+            .any(|project| project.name == "other-host"));
+        assert!(result
+            .projects
+            .iter()
+            .any(|project| project.name == "folder"));
         assert!(project.is_git_repository);
         assert_eq!(project.git.dirty, Some(true));
         assert_eq!(
@@ -1553,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn excludes_local_repositories_and_stack_folders_without_github_remotes() {
+    fn discovers_local_repository_and_worktree_candidates() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo with spaces");
         fs::create_dir_all(repo.join(".git")).unwrap();
@@ -1565,7 +1621,14 @@ mod tests {
         fs::write(linked.join(".git"), "gitdir: ../git-metadata\n").unwrap();
 
         let result = scan_fixture(root.path(), 3);
-        assert!(result.projects.is_empty());
+        assert!(result
+            .projects
+            .iter()
+            .any(|project| project.name == "repo with spaces"));
+        assert!(result
+            .projects
+            .iter()
+            .any(|project| project.name == "linked-worktree"));
     }
 
     #[test]
@@ -1607,7 +1670,8 @@ mod tests {
 
         assert!(scan_fixture(root.path(), 2).projects.is_empty());
         let included = scan_fixture(root.path(), 3);
-        assert!(included.projects.is_empty());
+        assert_eq!(included.projects.len(), 1);
+        assert_eq!(included.projects[0].name, "three");
     }
 
     #[test]
@@ -1821,7 +1885,7 @@ mod tests {
             "100-project fixture: first result {first_result:?} (target <3s), total {total:?} (target <5s), projects {}, folders {}",
             result.projects.len(), result.directories_scanned
         );
-        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects.len(), 100);
         assert!(first_result < Duration::from_secs(3));
         assert!(total < Duration::from_secs(5));
     }

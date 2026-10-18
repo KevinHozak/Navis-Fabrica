@@ -1,0 +1,38 @@
+import assert from 'node:assert/strict';
+import { build } from 'esbuild';
+import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+const require = createRequire(import.meta.url);
+async function load(entry) {
+  const result = await build({ entryPoints:[entry], bundle:true, platform:'node', format:'cjs', write:false, packages:'external', jsx:'automatic' });
+  const mod = { exports:{} };
+  new Function('require','module','exports',result.outputFiles[0].text)(require,mod,mod.exports);
+  return mod.exports;
+}
+const { ProjectCard, ProjectCollection } = await load('src/ProjectCollection.tsx');
+const { activityLabel, sameProjectPath } = await load('src/Activity.tsx');
+const settings = await load('src/settings.ts');
+globalThis.window = {};
+const storage = new Map();
+globalThis.localStorage = { getItem:k => storage.get(k) ?? null, setItem:(k,v) => storage.set(k,v) };
+assert.deepEqual((await settings.loadSettings()).preferences.projectDisplay.favoriteProjectIds,[]);
+await settings.saveProjectDisplayPreferences({ favoriteProjectIds:['owned'], hiddenProjectIds:[], view:'all' });
+assert.deepEqual((await settings.loadSettings()).preferences.projectDisplay.favoriteProjectIds,['owned']);
+assert.equal(sameProjectPath('C:/Projects/Owned/','c:\\projects\\owned'),true);
+assert.equal(activityLabel(null),'Activity unavailable');
+assert.equal(activityLabel([]),'No active work');
+assert.equal(activityLabel([{state:'needsInput',startedAtMs:1}]),'Needs attention');
+assert.equal(activityLabel([{state:'running',startedAtMs:1}]),'1 active');
+assert.equal(activityLabel([{state:'failed',startedAtMs:1},{state:'completed',startedAtMs:2}]),'No active work');
+const project = { id:'owned', name:'Owned project', path:'C:\\Projects\\Owned', isGitRepository:true,isWorktree:false,detectedStacks:[],workflowPrerequisites:[],git:{branch:'main',dirty:false,changedFiles:[],status:'available',latestCommit:null,remotes:[],upstream:{status:'noUpstream',ahead:null,behind:null}} };
+const card = (p,runs=[]) => renderToStaticMarkup(React.createElement(ProjectCard,{project:p,runs,selected:false,onClick:()=>{}}));
+assert.match(card(project),/Changed files<\/dt><dd>0<\/dd>/);
+assert.match(card({...project,git:{...project.git,changedFiles:['one.txt','two.txt']}}),/Changed files<\/dt><dd>2<\/dd>/);
+assert.match(card({...project,git:{...project.git,changedFiles:null}}),/Changed files<\/dt><dd>Unavailable<\/dd>/);
+assert.match(card(project),/Local issues<\/dt><dd>Loading/);
+assert.doesNotMatch(card(project),/GitHub|Latest commit|Detected stacks/);
+const empty = renderToStaticMarkup(React.createElement(ProjectCollection,{projects:[project],onSelect:()=>{}}));
+assert.doesNotMatch(empty,/Owned project/); // Discovery alone cannot include a card.
+console.log('UX regressions passed: collection persistence, unknown/count states, activity states and explicit collection boundary.');

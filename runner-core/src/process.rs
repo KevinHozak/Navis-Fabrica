@@ -412,7 +412,11 @@ pub(crate) fn terminate_child_tree_until(
     // Even when the deadline has just elapsed, attempt identity-checked tree
     // termination and direct-child kill. The result remains an error if the
     // caller's bound leaves no time to verify that cleanup completed.
-    let tree_result = terminate_owned_process_until(identity, deadline);
+    // Leave part of the same budget for direct-child termination and exit
+    // confirmation if the process-tree helper consumes its entire allowance.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let tree_deadline = deadline - remaining.min(Duration::from_millis(100));
+    let tree_result = terminate_owned_process_until(identity, tree_deadline);
     let direct_result = match child.try_wait() {
         Ok(Some(_)) => Ok(()),
         Ok(None) => child.kill().or_else(|error| match child.try_wait() {
@@ -1455,14 +1459,10 @@ pub(crate) fn run_streamed(
         sender,
     );
     let mut timed_out = Instant::now() >= deadline;
-    if cancelled || cancel.load(Ordering::Acquire) || timed_out {
-        cancelled |= cancel.load(Ordering::Acquire);
-        let _ = terminate_owned_process(identity);
-        let _ = child.kill();
-    }
+    cancelled |= cancel.load(Ordering::Acquire);
     let mut total = 0usize;
     let mut output_incomplete = false;
-    let status = loop {
+    let mut status = loop {
         while let Ok(output) = receiver.try_recv() {
             if cancel.load(Ordering::Acquire) {
                 cancelled = true;
@@ -1484,15 +1484,11 @@ pub(crate) fn run_streamed(
         }
         if cancelled || cancel.load(Ordering::Acquire) {
             cancelled = true;
-            let _ = terminate_owned_process(identity);
-            let _ = child.kill();
-            break child.wait().ok();
+            break None;
         }
         if timed_out || Instant::now() >= deadline {
             timed_out = true;
-            let _ = terminate_owned_process(identity);
-            let _ = child.kill();
-            break child.wait().ok();
+            break None;
         }
         if let Some(done) = child.try_wait()? {
             break Some(done);
@@ -1502,22 +1498,16 @@ pub(crate) fn run_streamed(
         } else if let Ok(output) = receiver.recv_timeout(Duration::from_millis(20)) {
             if cancel.load(Ordering::Acquire) {
                 cancelled = true;
-                let _ = terminate_owned_process(identity);
-                let _ = child.kill();
-                break child.wait().ok();
+                break None;
             }
             if Instant::now() >= deadline {
                 timed_out = true;
-                let _ = terminate_owned_process(identity);
-                let _ = child.kill();
-                break child.wait().ok();
+                break None;
             }
             total = total.saturating_add(output.bytes.len());
             if sink(output) == ProcessControl::Cancel {
                 cancelled = true;
-                let _ = terminate_owned_process(identity);
-                let _ = child.kill();
-                break child.wait().ok();
+                break None;
             }
         }
     };
@@ -1527,7 +1517,7 @@ pub(crate) fn run_streamed(
     // handles held by descendants).
     let drain_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
     loop {
-        if cancel.load(Ordering::Acquire) {
+        if cancelled || cancel.load(Ordering::Acquire) {
             cancelled = true;
             output_incomplete = true;
             break;
@@ -1540,7 +1530,6 @@ pub(crate) fn run_streamed(
         }
         if now >= drain_deadline {
             output_incomplete = true;
-            let _ = terminate_owned_process(identity);
             break;
         }
         let wait = (drain_deadline - now).min(Duration::from_millis(20));
@@ -1549,7 +1538,6 @@ pub(crate) fn run_streamed(
                 if sink(output) == ProcessControl::Cancel {
                     cancelled = true;
                     output_incomplete = true;
-                    let _ = terminate_owned_process(identity);
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -1561,6 +1549,14 @@ pub(crate) fn run_streamed(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
         }
+    }
+    if cancelled || timed_out || output_incomplete {
+        // One cleanup budget covers tree termination and direct-child exit.
+        // Never renew it after a slow durable callback or wait without a bound.
+        let cleanup_deadline = Instant::now() + Duration::from_millis(500);
+        output_incomplete |=
+            terminate_child_tree_until(&mut child, identity, cleanup_deadline).is_err();
+        status = child.try_wait().ok().flatten();
     }
     Ok(ProcessResult {
         status,
@@ -1735,5 +1731,64 @@ mod deadline_tests {
             after_callback < Duration::from_secs(2),
             "expired run cleanup failed to return promptly: {after_callback:?}"
         );
+    }
+
+    #[test]
+    fn streamed_cleanup_stops_a_live_child_after_callback_timeout_or_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        for expire_callback in [true, false] {
+            let mut identity = None;
+            let mut callback_finished = None;
+            let result = run_streamed(
+                &std::env::current_exe().unwrap(),
+                &[
+                    "--ignored".into(),
+                    "--exact".into(),
+                    "process::deadline_tests::streamed_cleanup_child_waits".into(),
+                ],
+                directory.path(),
+                &[],
+                &[],
+                if expire_callback {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(10)
+                },
+                1024,
+                &AtomicBool::new(false),
+                |started| {
+                    identity = Some(started);
+                    if expire_callback {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    assert!(process_identity_matches(started).unwrap());
+                    callback_finished = Some(Instant::now());
+                    if expire_callback {
+                        ProcessControl::Continue
+                    } else {
+                        ProcessControl::Cancel
+                    }
+                },
+                |_| ProcessControl::Continue,
+            )
+            .unwrap();
+            assert_eq!(result.timed_out, expire_callback);
+            assert_eq!(result.cancelled, !expire_callback);
+            assert!(result.output_incomplete);
+            assert!(
+                callback_finished.unwrap().elapsed() < Duration::from_secs(2),
+                "cleanup must not accumulate separate termination allowances"
+            );
+            assert!(
+                !process_identity_matches(identity.unwrap()).unwrap(),
+                "bounded cleanup must still terminate the owned live child"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked by the streamed cleanup test"]
+    fn streamed_cleanup_child_waits() {
+        thread::sleep(Duration::from_secs(30));
     }
 }

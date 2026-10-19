@@ -388,7 +388,7 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 
 /* Calm collection home */
 .my-projects { padding: 20px; }
-.my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 22px; margin: 24px 0; }
+.my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 22px; margin: 24px 0; }
 .my-project-card { text-align: left; padding: 26px; min-height: 220px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; cursor: pointer; }
 .my-project-card:hover, .my-project-card.selected { border-color: #75b9ed; background: #1a2a3a; }
 .my-project-card h3 { font-size: 1.3rem; margin: 0 0 12px; }
@@ -407,7 +407,7 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .project-actions { display: flex; gap: 16px; margin: 20px 0; flex-wrap: wrap; }
 .advanced-settings { margin: 20px; padding: 20px; }
 .advanced-settings summary { cursor: pointer; padding: 10px; }
-@media (max-width: 900px) { .my-project-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); } }
+@media (max-width: 900px) { .my-project-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); } }
 .activity-entry { color: #abb9c9; font-size: 13px; text-decoration: none; }
 .activity-overview { padding: 24px; margin-bottom: 24px; }
 .activity-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; gap: 16px; border-bottom: 1px solid #272e3a; }

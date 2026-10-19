@@ -357,19 +357,19 @@ function App() {
         </header>
 
         <main id="main-content" className="content" tabIndex={-1}>
-          <div className="page-heading">
+          {section !== "projects" && <div className="page-heading">
             <div>
               <p className="eyebrow">YOUR WORKSPACE</p>
-              <h1>{section === "projects" ? "My Projects" : current.label}</h1>
-              <p className="page-subtitle">{section === "projects" ? "A clear view of the work taking shape." : section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : "Follow your work and open project actions."}</p>
+              <h1>{current.label}</h1>
+              <p className="page-subtitle">{section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : "Follow your work and open project actions."}</p>
             </div>
             {section === "settings" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
               <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Rediscover project folders" : "Discover project folders"}
             </button>}
             {section === "settings" && <p role="status">{scanning ? "Discovering folders…" : scanError || freshnessLabel}</p>}{section === "settings" && Boolean(scanResult?.errors.length) && <details><summary>Some folders could not be inspected</summary><ul>{scanResult?.errors.map((error,index) => <li key={index}>{error}</li>)}</ul></details>}
-          </div>
+          </div>}
 
-          <div hidden={section !== "projects"}><p className="scan-measurement" role="status">{freshnessLabel}</p>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} /></div>
+          <div hidden={section !== "projects"}>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} /></div>
           {section === "runs" && <ActivityOverview projects={projects} onSelect={setSelectedProjectId} />}
           <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
           <div hidden={section !== "batches"}><BatchRunnerPanel /></div>

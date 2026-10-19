@@ -36,3 +36,53 @@ This explicit check consumes the readiness gate when a caller configures it; it 
 Batch workers use `JobsStore::claim_ids` and `reconcile_expired_ids` with their persisted batch job ID set. Shared job databases therefore do not let one worker claim another batch's queued job or mark its expired lease for reconciliation. The unscoped methods remain available to standalone coordinators.
 
 The fingerprint uses Git's configured object hash over deterministic snapshot material and includes the exact Git HEAD. It intentionally excludes ignored files and Git metadata outside the described source view. Checks should therefore run with the repository's declared check commands and should not rely on ignored build output as source evidence.
+
+
+## Deterministic finite contracts
+
+Checks may opt into a `contract` declaration. Existing checks and serialized policies without it retain their current behavior. A declaration explicitly owns exact acceptance criterion strings and lists every finite input/expected specimen in that scope. It does not infer coverage from command success, test names, prose, or a subset of passing tests. Duplicate/unknown specimen IDs, duplicate criterion ownership and criteria absent from the merged policy/reviewer acceptance list are rejected.
+
+Example check (the owning project must provide the declared harness):
+
+```json
+{
+  "id": "double-contract",
+  "program": "node",
+  "args": ["scripts/check-double-contract.cjs"],
+  "cwd": ".",
+  "timeout_ms": 10000,
+  "output_limit_bytes": 65536,
+  "contract": {
+    "criteria": ["double(1) returns 2"],
+    "specimens": [{"id": "one", "input": 1, "expected": 2}]
+  }
+}
+```
+
+The trusted harness exits zero when it successfully produces a complete report, even when a comparison differs. Its stdout must be only this versioned JSON protocol; diagnostics belong on stderr:
+
+```json
+{
+  "schema_version": 1,
+  "observations": [{
+    "specimen_id": "one",
+    "input": 1,
+    "assertion": "deep_equal",
+    "expected": 2,
+    "actual": 2,
+    "executed": true
+  }]
+}
+```
+
+The host compares the reported input and expected value to the declaration, then compares actual against that authoritative expected value. Every specimen must occur exactly once as an executed `deep_equal` assertion. JSON comparisons use serde_json value equality, including its numeric representation rules; declarations and harnesses should use matching numeric representations. Contract declarations are limited to 128 KiB, 64 criteria, and 128 specimens; reports are limited to 256 KiB and the configured output limit, whichever is smaller. Combined declaration/observation evidence is limited to 192 KiB so the receipt fits the 256 KiB checkpoint budget; larger evidence is inconclusive and stores the reason without the oversized observations. The legacy `agents_delivery_contract` adapter cannot be combined with a finite contract on the same check.
+
+- `passed`: complete trustworthy report, every comparison matches.
+- `failed`: complete trustworthy report contains a demonstrated mismatch. A nonzero command exit alone is not a demonstrated contract defect.
+- `inconclusive`: missing, malformed, duplicate, unexpected, weak, unexecuted or wrong-expectation observations; unavailable command; nonzero exit; timeout; cancellation; truncated/incomplete or oversized output. Even a partial report containing a mismatch remains inconclusive until the report satisfies the complete declared protocol.
+
+Inconclusive contracts use the existing `NeedsInput` outcome and cannot verify or complete a job. Completed reports and host-derived status are persisted in `verification_check_N` checkpoints; command-unavailable cases record a needs-input/inconclusive checkpoint with the reason. Source snapshots before and after execution remain authoritative; stale-source checks, issue fingerprints, gate ownership, deadlines, cancellation, ordinary check failures and human acceptance are still enforced. A deserialized `passed` flag cannot override inconsistent contract observations.
+
+Only fully passed, explicitly owned criterion strings leave the independent review scope. The current reviewer evaluates every remaining criterion, including reviewer-task acceptance merged by the supervisor; its failures and manual acceptance remain blocking. If every criterion is contracted, verification skips live reviewer metadata refresh, reviewer capacity reservation and model dispatch, and records `method: deterministic_contracts` for the scoped result. Configured reviewer identity fields remain part of the backward-compatible envelope, not proof that a model ran. Mixed jobs record `method: independent_reviewer` and provide the reviewer only a bounded summary of passed contract scopes. No broader correctness claim follows from those results.
+
+The declaration and harness are trusted workflow configuration. This protocol validates observed structured output and source freshness; it does not prove a malicious harness executed the target or make an incorrect specification correct. Do not use a finite specimen declaration to claim broad or human-only requirements. Raw observation inputs/expected/actual values are retained as job evidence: contract authors must avoid secrets and sensitive data. No arbitrary-shell frontend API is added; commands run through existing explicitly scoped local checks and managed process ownership.

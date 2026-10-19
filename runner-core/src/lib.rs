@@ -2,6 +2,7 @@
 //! This crate has no Tauri AppHandle or WebView dependency.
 
 pub mod budgets;
+pub mod contracts;
 pub mod credentials;
 pub mod isolation;
 pub mod issues;

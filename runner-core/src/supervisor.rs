@@ -3206,255 +3206,281 @@ impl Supervisor {
             source,
             remaining_ms,
         )?;
-        let submit_job = request
-            .jobs
-            .iter()
-            .find(|entry| entry.issue_id == job.issue_id)
-            .ok_or_else(|| {
-                SupervisorError::Verification("needs_input: reviewed issue route is missing".into())
-            })?;
-        let route_key = paid_policy_key(&job.issue_id, &reviewer_task.task_id);
-        let committed_route = request.resolved_routes.get(&route_key).ok_or_else(|| {
-            SupervisorError::Verification(
-                "needs_input: reviewer route was not bound to preview".into(),
-            )
-        })?;
-        let commitment = request.route_commitments.get(&route_key).ok_or_else(|| {
-            SupervisorError::Verification(
-                "needs_input: reviewer route lacks semantic commitment".into(),
-            )
-        })?;
-        if committed_route.provider_id != commitment.provider_id
-            || committed_route.model_id != commitment.model_id
-        {
-            return Err(SupervisorError::Verification(
-                "needs_input: reviewer route differs from semantic commitment".into(),
-            ));
-        }
-        let reviewer_profile = settings
-            .providers
-            .iter()
-            .find(|profile| profile.id == committed_route.provider_id)
-            .ok_or_else(|| {
-                SupervisorError::Verification(
-                    "needs_input: reviewer provider profile is missing".into(),
-                )
-            })?;
-        let kind_consented = match &request.dispatch_refresh_consent {
-            crate::provider_observations::ModelFreeRefreshConsent::Disabled => false,
-            crate::provider_observations::ModelFreeRefreshConsent::Providers { kinds } => {
-                kinds.contains(&reviewer_profile.kind)
-            }
-        };
-        let current_facts = if kind_consented {
-            let remaining = deadline_ms.saturating_sub(now_ms());
-            if remaining < 1000 || lease_lost.load(Ordering::SeqCst) {
-                let reason =
-                    "batch deadline or verification lease ended before reviewer metadata refresh";
-                let _ = jobs.record_verification_checkpoint(
-                    job.id,
-                    &job.source_fingerprint,
-                    "verification_route_refresh",
-                    &json!({"state":"needs_input","reason":reason}),
-                    now_ms(),
-                );
-                return Err(SupervisorError::Verification("needs_input: batch deadline or verification lease ended before reviewer metadata refresh".into()));
-            }
-            let fresh = match crate::provider_observations::fresh_candidate_facts(
-                settings,
-                &committed_route.provider_id,
-                &committed_route.model_id,
-                Instant::now() + Duration::from_millis(remaining as u64),
-                &request.dispatch_refresh_consent,
-            ) {
-                Ok(fresh) => fresh,
-                Err(error) => {
-                    let reason =
-                        format!("reviewer metadata refresh failed before dispatch: {error}");
-                    let _ = jobs.record_verification_checkpoint(
-                        job.id,
-                        &job.source_fingerprint,
-                        "verification_route_refresh",
-                        &json!({"state":"needs_input","reason":reason}),
-                        now_ms(),
-                    );
-                    return Err(SupervisorError::Verification(format!(
-                        "needs_input: {reason}"
-                    )));
-                }
-            };
-            if lease_lost.load(Ordering::SeqCst) || now_ms() >= deadline_ms {
-                let reason =
-                    "batch deadline or verification lease ended during reviewer metadata refresh";
-                let _ = jobs.record_verification_checkpoint(
-                    job.id,
-                    &job.source_fingerprint,
-                    "verification_route_refresh",
-                    &json!({"state":"needs_input","reason":reason}),
-                    now_ms(),
-                );
-                return Err(SupervisorError::Verification("needs_input: batch deadline or verification lease ended during reviewer metadata refresh".into()));
-            }
-            if let Err(error) =
-                check_fresh_route_commitment(request, settings, submit_job, reviewer_task, &fresh)
+        // Contract-only verification needs neither live reviewer metadata nor a model reservation.
+        let reviewer: Box<dyn crate::verification::ReviewExecutor> =
+            if !crate::verification::requires_independent_review(&envelope)
+                .map_err(|error| SupervisorError::Verification(format!("needs_input: {error}")))?
             {
-                let reason =
-                    format!("reviewer metadata no longer matches the reviewed commitment: {error}");
-                let _ = jobs.record_verification_checkpoint(job.id, &job.source_fingerprint,
-                    "verification_route_refresh", &json!({"state":"needs_input","reason":reason,"snapshotFingerprint":fresh.snapshot_fingerprint,"settingsFingerprint":fresh.settings_fingerprint,"runtimeIdentityFingerprint":fresh.runtime_identity_fingerprint,"observedAtMs":fresh.observed_at_ms}), now_ms());
-                return Err(SupervisorError::Verification(format!(
-                    "needs_input: {reason}"
-                )));
-            }
-            jobs.record_verification_checkpoint(job.id, &job.source_fingerprint,
-                "verification_route_refresh", &json!({"state":"matched","snapshotFingerprint":fresh.snapshot_fingerprint,"settingsFingerprint":fresh.settings_fingerprint,"runtimeIdentityFingerprint":fresh.runtime_identity_fingerprint,"observedAtMs":fresh.observed_at_ms}), now_ms())
-                .map_err(|error| SupervisorError::Verification(error.to_string()))?;
-            vec![fresh.facts]
-        } else {
-            let reviewed_observation_fingerprint = request
-                .provider_observation_fingerprint
-                .as_deref()
-                .ok_or_else(|| {
+                Box::new(ContractOnlyReviewer)
+            } else {
+                let submit_job = request
+                    .jobs
+                    .iter()
+                    .find(|entry| entry.issue_id == job.issue_id)
+                    .ok_or_else(|| {
+                        SupervisorError::Verification(
+                            "needs_input: reviewed issue route is missing".into(),
+                        )
+                    })?;
+                let route_key = paid_policy_key(&job.issue_id, &reviewer_task.task_id);
+                let committed_route = request.resolved_routes.get(&route_key).ok_or_else(|| {
                     SupervisorError::Verification(
-                        "needs_input: provider routing evidence was not bound to preview".into(),
+                        "needs_input: reviewer route was not bound to preview".into(),
                     )
                 })?;
-            let (facts, current_observation_fingerprint, observation_problem) =
-                load_provider_observations(settings, &self.paths.root, now_ms().max(0) as u128)
-                    .map_err(|error| {
-                        SupervisorError::Verification(format!("needs_input: {error}"))
+                let commitment = request.route_commitments.get(&route_key).ok_or_else(|| {
+                    SupervisorError::Verification(
+                        "needs_input: reviewer route lacks semantic commitment".into(),
+                    )
+                })?;
+                if committed_route.provider_id != commitment.provider_id
+                    || committed_route.model_id != commitment.model_id
+                {
+                    return Err(SupervisorError::Verification(
+                        "needs_input: reviewer route differs from semantic commitment".into(),
+                    ));
+                }
+                let reviewer_profile = settings
+                    .providers
+                    .iter()
+                    .find(|profile| profile.id == committed_route.provider_id)
+                    .ok_or_else(|| {
+                        SupervisorError::Verification(
+                            "needs_input: reviewer provider profile is missing".into(),
+                        )
                     })?;
-            if observation_problem.is_some()
-                || reviewed_observation_fingerprint != current_observation_fingerprint
-            {
-                return Err(SupervisorError::Verification(format!(
+                let kind_consented = match &request.dispatch_refresh_consent {
+                    crate::provider_observations::ModelFreeRefreshConsent::Disabled => false,
+                    crate::provider_observations::ModelFreeRefreshConsent::Providers { kinds } => {
+                        kinds.contains(&reviewer_profile.kind)
+                    }
+                };
+                let current_facts = if kind_consented {
+                    let remaining = deadline_ms.saturating_sub(now_ms());
+                    if remaining < 1000 || lease_lost.load(Ordering::SeqCst) {
+                        let reason =
+                    "batch deadline or verification lease ended before reviewer metadata refresh";
+                        let _ = jobs.record_verification_checkpoint(
+                            job.id,
+                            &job.source_fingerprint,
+                            "verification_route_refresh",
+                            &json!({"state":"needs_input","reason":reason}),
+                            now_ms(),
+                        );
+                        return Err(SupervisorError::Verification("needs_input: batch deadline or verification lease ended before reviewer metadata refresh".into()));
+                    }
+                    let fresh = match crate::provider_observations::fresh_candidate_facts(
+                        settings,
+                        &committed_route.provider_id,
+                        &committed_route.model_id,
+                        Instant::now() + Duration::from_millis(remaining as u64),
+                        &request.dispatch_refresh_consent,
+                    ) {
+                        Ok(fresh) => fresh,
+                        Err(error) => {
+                            let reason = format!(
+                                "reviewer metadata refresh failed before dispatch: {error}"
+                            );
+                            let _ = jobs.record_verification_checkpoint(
+                                job.id,
+                                &job.source_fingerprint,
+                                "verification_route_refresh",
+                                &json!({"state":"needs_input","reason":reason}),
+                                now_ms(),
+                            );
+                            return Err(SupervisorError::Verification(format!(
+                                "needs_input: {reason}"
+                            )));
+                        }
+                    };
+                    if lease_lost.load(Ordering::SeqCst) || now_ms() >= deadline_ms {
+                        let reason =
+                    "batch deadline or verification lease ended during reviewer metadata refresh";
+                        let _ = jobs.record_verification_checkpoint(
+                            job.id,
+                            &job.source_fingerprint,
+                            "verification_route_refresh",
+                            &json!({"state":"needs_input","reason":reason}),
+                            now_ms(),
+                        );
+                        return Err(SupervisorError::Verification("needs_input: batch deadline or verification lease ended during reviewer metadata refresh".into()));
+                    }
+                    if let Err(error) = check_fresh_route_commitment(
+                        request,
+                        settings,
+                        submit_job,
+                        reviewer_task,
+                        &fresh,
+                    ) {
+                        let reason = format!(
+                            "reviewer metadata no longer matches the reviewed commitment: {error}"
+                        );
+                        let _ = jobs.record_verification_checkpoint(job.id, &job.source_fingerprint,
+                    "verification_route_refresh", &json!({"state":"needs_input","reason":reason,"snapshotFingerprint":fresh.snapshot_fingerprint,"settingsFingerprint":fresh.settings_fingerprint,"runtimeIdentityFingerprint":fresh.runtime_identity_fingerprint,"observedAtMs":fresh.observed_at_ms}), now_ms());
+                        return Err(SupervisorError::Verification(format!(
+                            "needs_input: {reason}"
+                        )));
+                    }
+                    jobs.record_verification_checkpoint(job.id, &job.source_fingerprint,
+                "verification_route_refresh", &json!({"state":"matched","snapshotFingerprint":fresh.snapshot_fingerprint,"settingsFingerprint":fresh.settings_fingerprint,"runtimeIdentityFingerprint":fresh.runtime_identity_fingerprint,"observedAtMs":fresh.observed_at_ms}), now_ms())
+                .map_err(|error| SupervisorError::Verification(error.to_string()))?;
+                    vec![fresh.facts]
+                } else {
+                    let reviewed_observation_fingerprint = request
+                        .provider_observation_fingerprint
+                        .as_deref()
+                        .ok_or_else(|| {
+                            SupervisorError::Verification(
+                                "needs_input: provider routing evidence was not bound to preview"
+                                    .into(),
+                            )
+                        })?;
+                    let (facts, current_observation_fingerprint, observation_problem) =
+                        load_provider_observations(
+                            settings,
+                            &self.paths.root,
+                            now_ms().max(0) as u128,
+                        )
+                        .map_err(|error| {
+                            SupervisorError::Verification(format!("needs_input: {error}"))
+                        })?;
+                    if observation_problem.is_some()
+                        || reviewed_observation_fingerprint != current_observation_fingerprint
+                    {
+                        return Err(SupervisorError::Verification(format!(
                     "needs_input: provider routing evidence changed or became unavailable before reviewer dispatch: {}",
                     observation_problem.unwrap_or_else(|| "observation snapshot fingerprint changed".into())
                 )));
-            }
-            facts
-        };
-        let reviewer_pricing_time = if kind_consented {
-            current_facts
-                .iter()
-                .find(|fact| {
-                    fact.provider_id == committed_route.provider_id
-                        && fact.model_id == committed_route.model_id
-                })
-                .and_then(|fact| fact.pricing_verified_at_ms)
-                .and_then(|value| u64::try_from(value).ok())
-        } else {
-            None
-        };
-        let reviewer_route = route_task(
-            request,
-            settings,
-            submit_job,
-            reviewer_task,
-            &current_facts,
-            reviewer_pricing_time,
-        )
-        .map_err(|error| SupervisorError::Verification(format!("needs_input: {error}")))?;
-        if !reviewer_route.eligible
-            || reviewer_route.provider_id.as_deref() != Some(policy.reviewer.provider_id.as_str())
-            || reviewer_route.model_id.as_deref() != Some(policy.reviewer.model_id.as_str())
-            || request.resolved_routes.get(&route_key).is_none()
-        {
-            return Err(SupervisorError::Verification(format!(
-                "needs_input: reviewer route no longer matches the reviewed preview: {}",
-                reviewer_route.reasons.join("; ")
-            )));
-        }
-        let reviewer_limits = review_limits(request, &job.issue_id)?;
-        let reviewer_budget_seconds = reviewer_limits.2.min((remaining_ms / 1000).max(1) as u64);
-        let reservation_id = format!(
-            "{}-{}-review-r{}-a{}",
-            safe_checkpoint_key(&request.batch_id),
-            job.id,
-            repair_round(jobs, job.id),
-            job.attempt_count
-        );
-        let budgets = BudgetStore::open(&self.paths.budgets)?;
-        let reviewer_reservation = ReservationRequest {
-            reservation_id: reservation_id.clone(),
-            batch_id: request.batch_id.clone(),
-            job_id: job.id.to_string(),
-            task_id: safe_checkpoint_key(&policy.reviewer.task_id),
-            provider_id: policy.reviewer.provider_id.clone(),
-            model_id: policy.reviewer.model_id.clone(),
-            runtime_id: settings
-                .providers
-                .iter()
-                .find(|p| p.id == policy.reviewer.provider_id)
-                .map(|p| p.kind.telemetry_id().to_owned())
-                .unwrap_or_else(|| "unknown".into()),
-            max_tokens: reviewer_limits.0,
-            max_cost_micros: Some(reviewer_limits.1),
-            max_seconds: reviewer_budget_seconds,
-            is_paid: false,
-            pricing_source: None,
-            pricing_verified_at_ms: None,
-        };
-        let batches = BatchStore::open(&self.paths.batches)?;
-        reserve_with_capacity_wait(&budgets, &reviewer_reservation, deadline_ms, || {
-            if now_ms() >= deadline_ms {
-                return Err(SupervisorError::Verification(
+                    }
+                    facts
+                };
+                let reviewer_pricing_time = if kind_consented {
+                    current_facts
+                        .iter()
+                        .find(|fact| {
+                            fact.provider_id == committed_route.provider_id
+                                && fact.model_id == committed_route.model_id
+                        })
+                        .and_then(|fact| fact.pricing_verified_at_ms)
+                        .and_then(|value| u64::try_from(value).ok())
+                } else {
+                    None
+                };
+                let reviewer_route = route_task(
+                    request,
+                    settings,
+                    submit_job,
+                    reviewer_task,
+                    &current_facts,
+                    reviewer_pricing_time,
+                )
+                .map_err(|error| SupervisorError::Verification(format!("needs_input: {error}")))?;
+                if !reviewer_route.eligible
+                    || reviewer_route.provider_id.as_deref()
+                        != Some(policy.reviewer.provider_id.as_str())
+                    || reviewer_route.model_id.as_deref() != Some(policy.reviewer.model_id.as_str())
+                    || request.resolved_routes.get(&route_key).is_none()
+                {
+                    return Err(SupervisorError::Verification(format!(
+                        "needs_input: reviewer route no longer matches the reviewed preview: {}",
+                        reviewer_route.reasons.join("; ")
+                    )));
+                }
+                let reviewer_limits = review_limits(request, &job.issue_id)?;
+                let reviewer_budget_seconds =
+                    reviewer_limits.2.min((remaining_ms / 1000).max(1) as u64);
+                let reservation_id = format!(
+                    "{}-{}-review-r{}-a{}",
+                    safe_checkpoint_key(&request.batch_id),
+                    job.id,
+                    repair_round(jobs, job.id),
+                    job.attempt_count
+                );
+                let budgets = BudgetStore::open(&self.paths.budgets)?;
+                let reviewer_reservation = ReservationRequest {
+                    reservation_id: reservation_id.clone(),
+                    batch_id: request.batch_id.clone(),
+                    job_id: job.id.to_string(),
+                    task_id: safe_checkpoint_key(&policy.reviewer.task_id),
+                    provider_id: policy.reviewer.provider_id.clone(),
+                    model_id: policy.reviewer.model_id.clone(),
+                    runtime_id: settings
+                        .providers
+                        .iter()
+                        .find(|p| p.id == policy.reviewer.provider_id)
+                        .map(|p| p.kind.telemetry_id().to_owned())
+                        .unwrap_or_else(|| "unknown".into()),
+                    max_tokens: reviewer_limits.0,
+                    max_cost_micros: Some(reviewer_limits.1),
+                    max_seconds: reviewer_budget_seconds,
+                    is_paid: false,
+                    pricing_source: None,
+                    pricing_verified_at_ms: None,
+                };
+                let batches = BatchStore::open(&self.paths.batches)?;
+                reserve_with_capacity_wait(&budgets, &reviewer_reservation, deadline_ms, || {
+                    if now_ms() >= deadline_ms {
+                        return Err(SupervisorError::Verification(
                     "needs_input: absolute batch deadline expired while waiting for reviewer capacity"
                         .into(),
                 ));
-            }
-            if lease_lost.load(Ordering::SeqCst) {
-                return Err(SupervisorError::Verification(
+                    }
+                    if lease_lost.load(Ordering::SeqCst) {
+                        return Err(SupervisorError::Verification(
                     "needs_input: verification lease ownership was lost while waiting for reviewer capacity"
                         .into(),
                 ));
-            }
-            if matches!(
-                batches.control_state(batch_id)?.as_str(),
-                "cancelling" | "cancelled"
-            ) {
-                return Err(SupervisorError::Verification(
-                    "needs_input: batch cancellation requested before reviewer dispatch".into(),
-                ));
-            }
-            if !batches.verification_lease_owned(batch_id, job.id, worker_id, now_ms())? {
-                return Err(SupervisorError::Verification(
+                    }
+                    if matches!(
+                        batches.control_state(batch_id)?.as_str(),
+                        "cancelling" | "cancelled"
+                    ) {
+                        return Err(SupervisorError::Verification(
+                            "needs_input: batch cancellation requested before reviewer dispatch"
+                                .into(),
+                        ));
+                    }
+                    if !batches.verification_lease_owned(batch_id, job.id, worker_id, now_ms())? {
+                        return Err(SupervisorError::Verification(
                     "needs_input: verification lease is no longer owned while waiting for reviewer capacity"
                         .into(),
                 ));
-            }
-            Ok(())
-        })?;
-        let observer = Arc::new(ReviewRuntimeSink {
-            jobs: JobsStore::open(&self.paths.jobs)?,
-            budgets,
-            job_id: job.id,
-            attempt_number: job.attempt_count,
-            issue_fingerprint: job.source_fingerprint.clone(),
-            reservation_id,
-            dispatched: Mutex::new((false, false)),
-        });
-        let reviewer_remaining_ms = deadline_ms.saturating_sub(now_ms());
-        if reviewer_remaining_ms < 1000 {
-            return Err(SupervisorError::Verification(
-                "needs_input: batch deadline expired before reviewer dispatch".into(),
-            ));
-        }
-        let timeout = reviewer_limits
-            .2
-            .min((reviewer_remaining_ms / 1000).max(1) as u64);
-        let reviewer = runtime::RuntimeReviewExecutor::new(
-            settings.clone(),
-            record.worktree_path.clone(),
-            timeout,
-        )
-        .map_err(SupervisorError::Runtime)?
-        .with_build_output(record.build_output_path.clone())
-        .with_reasoning_effort(policy.reviewer.reasoning_effort.clone())
-        .with_deadline(
-            std::time::Instant::now() + Duration::from_millis(reviewer_remaining_ms as u64),
-        )
-        .with_observer(observer);
+                    }
+                    Ok(())
+                })?;
+                let observer = Arc::new(ReviewRuntimeSink {
+                    jobs: JobsStore::open(&self.paths.jobs)?,
+                    budgets,
+                    job_id: job.id,
+                    attempt_number: job.attempt_count,
+                    issue_fingerprint: job.source_fingerprint.clone(),
+                    reservation_id,
+                    dispatched: Mutex::new((false, false)),
+                });
+                let reviewer_remaining_ms = deadline_ms.saturating_sub(now_ms());
+                if reviewer_remaining_ms < 1000 {
+                    return Err(SupervisorError::Verification(
+                        "needs_input: batch deadline expired before reviewer dispatch".into(),
+                    ));
+                }
+                let timeout = reviewer_limits
+                    .2
+                    .min((reviewer_remaining_ms / 1000).max(1) as u64);
+                let reviewer = runtime::RuntimeReviewExecutor::new(
+                    settings.clone(),
+                    record.worktree_path.clone(),
+                    timeout,
+                )
+                .map_err(SupervisorError::Runtime)?
+                .with_build_output(record.build_output_path.clone())
+                .with_reasoning_effort(policy.reviewer.reasoning_effort.clone())
+                .with_deadline(
+                    std::time::Instant::now() + Duration::from_millis(reviewer_remaining_ms as u64),
+                )
+                .with_observer(observer);
+                Box::new(reviewer)
+            };
+        let batches = BatchStore::open(&self.paths.batches)?;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_watch = VerificationCancelWatcher::start(
             self.paths.clone(),
@@ -3543,6 +3569,17 @@ impl Supervisor {
         drop(on_check_spawn);
         drop(cancel_watch);
         result
+    }
+}
+
+/// Defensive sentinel: a scope-planning error must not dispatch or silently pass review.
+struct ContractOnlyReviewer;
+impl crate::verification::ReviewExecutor for ContractOnlyReviewer {
+    fn review(
+        &self,
+        _: &crate::verification::ReviewRequest,
+    ) -> Result<crate::verification::ReviewResult, String> {
+        Err("independent review unexpectedly required for contract-only verification".into())
     }
 }
 
@@ -7051,6 +7088,7 @@ mod supervisor_tests {
                 timeout_ms: 5_000,
                 output_limit_bytes: 1024,
                 adapter: None,
+                contract: None,
             }],
             reviewer: ReviewerIdentity {
                 task_id: "review".into(),
@@ -7108,6 +7146,40 @@ mod supervisor_tests {
             ]
         );
         assert_eq!(envelope.checks[0].timeout_ms, 3_000);
+
+        let mut contracted = policy.clone();
+        contracted.checks[0].contract = Some(crate::contracts::ContractSpec {
+            criteria: vec!["policy criterion".into()],
+            specimens: vec![crate::contracts::ContractSpecimen {
+                id: "sample".into(),
+                input: json!(1),
+                expected: json!(2),
+            }],
+        });
+        let mixed = build_verification_envelope(
+            &contracted,
+            &reviewer_task,
+            "issue".into(),
+            "implement".into(),
+            envelope.code_snapshot.clone(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(mixed.checks[0].timeout_ms, 1000);
+        assert_eq!(mixed.checks[0].contract, contracted.checks[0].contract);
+        assert!(crate::verification::requires_independent_review(&mixed).unwrap());
+        contracted.checks[0].contract.as_mut().unwrap().criteria =
+            mixed.acceptance_criteria.clone();
+        let deterministic = build_verification_envelope(
+            &contracted,
+            &reviewer_task,
+            "issue".into(),
+            "implement".into(),
+            envelope.code_snapshot.clone(),
+            1000,
+        )
+        .unwrap();
+        assert!(!crate::verification::requires_independent_review(&deterministic).unwrap());
     }
 
     #[test]
@@ -7673,6 +7745,7 @@ mod supervisor_tests {
                     timeout_ms: 1000,
                     output_limit_bytes: 1024,
                     adapter: None,
+                    contract: None,
                 }],
                 reviewer: ReviewerIdentity {
                     task_id: "review".into(),
@@ -8916,6 +8989,7 @@ mod supervisor_tests {
             timeout_ms: 60_000,
             output_limit_bytes: 1024,
             adapter: None,
+            contract: None,
         };
         let executor = DeadlineCheckExecutor {
             deadline_ms: now_ms() - 1,

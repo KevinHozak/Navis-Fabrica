@@ -3,6 +3,7 @@
 //! This module records evidence only after observing the check itself. A worker's
 //! claim that checks passed is never accepted as verification evidence.
 
+use crate::contracts::{ContractEvidence, ContractSpec, ContractStatus};
 use crate::jobs::{JobsError, JobsStore, VerificationEvidence};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,8 @@ pub struct CheckSpec {
     pub output_limit_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<CheckAdapter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ContractSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +107,8 @@ pub struct CheckReceipt {
     pub truncated: bool,
     pub output_bytes: usize,
     pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ContractEvidence>,
 }
 
 pub trait CheckExecutor: Send + Sync {
@@ -347,6 +352,12 @@ pub(crate) fn validate_check(check: &CheckSpec) -> Result<(), String> {
     if check.output_limit_bytes == 0 || check.output_limit_bytes > DEFAULT_OUTPUT_LIMIT * 16 {
         return Err("output limit must be between 1 byte and 1 MiB".into());
     }
+    if let Some(contract) = &check.contract {
+        if check.adapter.is_some() {
+            return Err("contract cannot be combined with a legacy adapter".into());
+        }
+        crate::contracts::validate_spec(contract, &contract.criteria)?;
+    }
     if check.adapter == Some(CheckAdapter::AgentsDeliveryContract) {
         if !check.program.is_absolute()
             || check.cwd != Path::new(".")
@@ -524,6 +535,33 @@ pub trait ReviewExecutor: Send + Sync {
     fn review(&self, request: &ReviewRequest) -> Result<ReviewResult, String>;
 }
 
+impl<T: ReviewExecutor + ?Sized> ReviewExecutor for Box<T> {
+    fn review(&self, request: &ReviewRequest) -> Result<ReviewResult, String> {
+        (**self).review(request)
+    }
+}
+
+/// Static scope planning only; execution still must prove every contract.
+pub(crate) fn requires_independent_review(envelope: &VerificationEnvelope) -> Result<bool, String> {
+    let mut owned = std::collections::HashSet::new();
+    for check in &envelope.checks {
+        validate_check(check)?;
+        if let Some(contract) = &check.contract {
+            crate::contracts::validate_spec(contract, &envelope.acceptance_criteria)?;
+            for criterion in &contract.criteria {
+                if !owned.insert(criterion.as_str()) {
+                    return Err("contract criterion has overlapping ownership".into());
+                }
+            }
+        }
+    }
+    Ok(owned.is_empty()
+        || envelope
+            .acceptance_criteria
+            .iter()
+            .any(|criterion| !owned.contains(criterion.as_str())))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepairProgress {
     pub round: u8,
@@ -598,6 +636,8 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 VerificationError::NeedsInput(
                     "delivery-contract adapter command failed or was unavailable; inspect the configured interpreter and paths".into(),
                 )
+            } else if spec.contract.is_some() {
+                VerificationError::NeedsInput("contract command was unavailable; no contract conclusion is established".into())
             } else if let Some(detail) = error.strip_prefix("check_process_registration_failed:") {
                 VerificationError::NeedsInput(format!(
                     "check process identity could not be persisted; cancellation of the owned process was requested; inspect process evidence: {}",
@@ -622,7 +662,9 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
             }
             validate_delivery_contract_report(&out.stdout, repository, &before)?;
         }
-        if output_bytes > spec.output_limit_bytes.min(DEFAULT_OUTPUT_LIMIT * 16) {
+        if spec.contract.is_none()
+            && output_bytes > spec.output_limit_bytes.min(DEFAULT_OUTPUT_LIMIT * 16)
+        {
             return Err(VerificationError::Invalid(
                 "check executor exceeded its configured output limit".into(),
             ));
@@ -634,8 +676,27 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 after: after.fingerprint,
             });
         }
-        let passed =
-            out.exit_code == Some(0) && !out.timed_out && !out.cancelled && !out.output_incomplete;
+        let contract = spec.contract.as_ref().map(|declaration| {
+            let complete = out.exit_code == Some(0)
+                && !out.timed_out
+                && !out.cancelled
+                && !out.output_incomplete
+                && !out.truncated
+                && output_bytes
+                    <= spec
+                        .output_limit_bytes
+                        .min(crate::contracts::MAX_CONTRACT_REPORT_BYTES);
+            crate::contracts::evaluate(declaration, &out.stdout, complete)
+        });
+        let passed = match &contract {
+            Some(evidence) => evidence.status == ContractStatus::Passed,
+            None => {
+                out.exit_code == Some(0)
+                    && !out.timed_out
+                    && !out.cancelled
+                    && !out.output_incomplete
+            }
+        };
         Ok(CheckReceipt {
             check_id: spec.id.clone(),
             source: before,
@@ -646,6 +707,7 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
             truncated: out.truncated,
             output_bytes,
             passed,
+            contract,
         })
     }
 
@@ -676,9 +738,41 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 "review requires passing checks for the exact source snapshot".into(),
             ));
         }
+        let mut owned = std::collections::HashSet::new();
+        for receipt in &request.check_receipts {
+            if let Some(evidence) = &receipt.contract {
+                if receipt.exit_code != Some(0)
+                    || receipt.timed_out
+                    || receipt.cancelled
+                    || receipt.output_incomplete
+                    || receipt.truncated
+                {
+                    return Err(VerificationError::Invalid(
+                        "contract process evidence is incomplete".into(),
+                    ));
+                }
+                crate::contracts::validate_evidence(evidence, &request.acceptance_criteria)
+                    .map_err(VerificationError::Invalid)?;
+                for criterion in &evidence.spec.criteria {
+                    if !owned.insert(criterion.clone()) {
+                        return Err(VerificationError::Invalid(
+                            "contract criterion has overlapping ownership".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let mut remaining = request.clone();
+        remaining
+            .acceptance_criteria
+            .retain(|criterion| !owned.contains(criterion));
+        if remaining.acceptance_criteria.is_empty() && !owned.is_empty() {
+            return Ok(ReviewResult { passed: true, findings: vec![], manual_acceptance: vec![],
+                details: "All declared acceptance criteria passed their finite contracts; no uncovered review criteria remain. No broader correctness claim is made.".into() });
+        }
         let result = self
             .reviewer
-            .review(request)
+            .review(&remaining)
             .map_err(VerificationError::ReviewFailed)?;
         validate_review_result(&result)?;
         Ok(result)
@@ -822,6 +916,20 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 "at least one declared check is required".into(),
             ));
         }
+        let mut owned = std::collections::HashSet::new();
+        for check in &envelope.checks {
+            if let Some(contract) = &check.contract {
+                crate::contracts::validate_spec(contract, &envelope.acceptance_criteria)
+                    .map_err(VerificationError::Invalid)?;
+                for criterion in &contract.criteria {
+                    if !owned.insert(criterion) {
+                        return Err(VerificationError::Invalid(
+                            "contract criterion has overlapping ownership".into(),
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(path) = issue_path {
             validate_authoritative_issue_source(store, job_id, path, &envelope.issue_fingerprint)?;
         }
@@ -860,6 +968,16 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
             let receipt = match receipt_result {
                 Ok(receipt) => receipt,
                 Err(VerificationError::NeedsInput(reason)) => {
+                    if spec.contract.is_some() {
+                        store.record_verification_checkpoint(
+                            job_id,
+                            &envelope.issue_fingerprint,
+                            &step_name,
+                            &json!({"state":"needs_input", "contractStatus":"inconclusive",
+                                "checkId":&spec.id,"reason":&reason}),
+                            now_ms,
+                        )?;
+                    }
                     return Ok(VerificationOutcome::NeedsInput { reason });
                 }
                 Err(error) => return Err(error),
@@ -869,10 +987,24 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 &envelope.issue_fingerprint,
                 &step_name,
                 &json!({
-                    "state":if receipt.cancelled || receipt.output_incomplete { "needs_input" } else { "completed" }, "receipt":&receipt
+                    "state":if receipt.cancelled || receipt.output_incomplete || receipt.contract.as_ref().is_some_and(|c| c.status == ContractStatus::Inconclusive) { "needs_input" } else { "completed" }, "receipt":&receipt
                 }),
                 now_ms,
             )?;
+            if let Some(contract) = &receipt.contract {
+                if contract.status == ContractStatus::Inconclusive {
+                    return Ok(VerificationOutcome::NeedsInput {
+                        reason: format!(
+                            "contract {} is inconclusive: {}",
+                            receipt.check_id,
+                            contract
+                                .reason
+                                .as_deref()
+                                .unwrap_or("insufficient evidence")
+                        ),
+                    });
+                }
+            }
             if receipt.cancelled || receipt.output_incomplete {
                 return Ok(VerificationOutcome::NeedsInput {
                     reason: if receipt.cancelled {
@@ -883,6 +1015,16 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 });
             }
             if !receipt.passed {
+                if let Some(contract) = &receipt.contract {
+                    return Err(VerificationError::CheckFailed(format!(
+                        "contract {}: {}",
+                        receipt.check_id,
+                        contract
+                            .reason
+                            .as_deref()
+                            .unwrap_or("demonstrated specimen mismatch")
+                    )));
+                }
                 return Err(VerificationError::CheckFailed(format!(
                     "{} exit={:?} timed_out={}",
                     receipt.check_id, receipt.exit_code, receipt.timed_out
@@ -897,6 +1039,13 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                 after: source.fingerprint,
             });
         }
+        let contract_only =
+            !requires_independent_review(envelope).map_err(VerificationError::Invalid)?;
+        let review_method = if contract_only {
+            "deterministic_contracts"
+        } else {
+            "independent_reviewer"
+        };
         let review_request = ReviewRequest {
             job_id,
             worker_task_id: envelope.worker_task_id.clone(),
@@ -911,7 +1060,7 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
             &envelope.issue_fingerprint,
             "verification_review",
             &json!({
-                "state":"started", "reviewer":&envelope.reviewer, "codeHead":&source.head,
+                "state":if contract_only { "skipped_contract_only" } else { "started" }, "method":review_method, "reviewer":&envelope.reviewer, "codeHead":&source.head,
                 "codeFingerprint":&source.fingerprint
             }),
             now_ms,
@@ -922,7 +1071,7 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
             &envelope.issue_fingerprint,
             "verification_review",
             &json!({
-                "state":"completed", "passed":review.passed, "findings":&review.findings,
+                "state":"completed", "method":review_method, "passed":review.passed, "findings":&review.findings,
                 "manualAcceptance":&review.manual_acceptance, "details":&review.details
             }),
             now_ms,
@@ -965,6 +1114,7 @@ impl<E: CheckExecutor, R: ReviewExecutor> VerificationService<E, R> {
                     "codeHead": &source.head,
                     "codeFingerprint": &source.fingerprint,
                     "exitCode": r.exit_code,
+                    "reviewMethod": review_method,
                     "reviewerTask": &envelope.reviewer.task_id,
                     "reviewerProvider": &envelope.reviewer.provider_id,
                     "reviewerModel": &envelope.reviewer.model_id,
@@ -1657,6 +1807,7 @@ mod tests {
             timeout_ms: 1000,
             output_limit_bytes: 1024,
             adapter: None,
+            contract: None,
         }
     }
 
@@ -1742,6 +1893,7 @@ mod tests {
             timeout_ms: 10_000,
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT,
             adapter: None,
+            contract: None,
         };
         let cancel = AtomicBool::new(false);
         let mut spawned_identity = None;
@@ -1794,6 +1946,7 @@ mod tests {
             timeout_ms: 30_000,
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT,
             adapter: None,
+            contract: None,
         };
 
         let result = ProcessCheckExecutor
@@ -2032,6 +2185,7 @@ mod tests {
             timeout_ms: 10_000,
             output_limit_bytes: MAX_DELIVERY_REPORT_BYTES,
             adapter: Some(CheckAdapter::AgentsDeliveryContract),
+            contract: None,
         };
         let repository_identity = repository.path().canonicalize().unwrap();
         let ready_report = serde_json::json!({
@@ -2909,5 +3063,383 @@ mod tests {
     #[test]
     fn optional_contract_adapter_fails_explicitly_when_unavailable() {
         assert!(require_contract_adapter(false).is_err());
+    }
+
+    fn finite_contract_spec() -> CheckSpec {
+        let mut check = spec();
+        check.contract = Some(ContractSpec {
+            criteria: vec!["pass".into()],
+            specimens: vec![crate::contracts::ContractSpecimen {
+                id: "sample".into(),
+                input: json!(1),
+                expected: json!(2),
+            }],
+        });
+        check
+    }
+    fn finite_output(actual: i32) -> CheckOutput {
+        CheckOutput { exit_code:Some(0),stdout:json!({"schema_version":1,"observations":[
+            {"specimen_id":"sample","input":1,"assertion":"deep_equal","expected":2,"actual":actual,"executed":true}
+        ]}).to_string(),..Default::default() }
+    }
+    struct ContractCheck {
+        output: CheckOutput,
+        mutate: bool,
+        unavailable: bool,
+    }
+    impl CheckExecutor for ContractCheck {
+        fn execute(&self, repository: &Path, _: &CheckSpec) -> Result<CheckOutput, String> {
+            if self.mutate {
+                std::fs::write(repository.join("changed.txt"), "changed").unwrap();
+            }
+            if self.unavailable {
+                return Err("missing command".into());
+            }
+            Ok(self.output.clone())
+        }
+    }
+    struct NoContractReviewer;
+    impl ReviewExecutor for NoContractReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewResult, String> {
+            panic!("contract-only criteria must not dispatch review")
+        }
+    }
+    fn contract_envelope(source: SourceSnapshot) -> VerificationEnvelope {
+        VerificationEnvelope {
+            issue_fingerprint: "contract-issue".into(),
+            worker_task_id: "worker".into(),
+            code_snapshot: source,
+            checks: vec![finite_contract_spec()],
+            reviewer: ReviewerIdentity {
+                task_id: "review".into(),
+                provider_id: "fixture".into(),
+                model_id: "fixture".into(),
+                reasoning_effort: None,
+            },
+            acceptance_criteria: vec!["pass".into()],
+        }
+    }
+    #[test]
+    fn old_check_configuration_has_no_implicit_contract() {
+        let mut value = serde_json::to_value(spec()).unwrap();
+        value.as_object_mut().unwrap().remove("contract");
+        let check: CheckSpec = serde_json::from_value(value).unwrap();
+        assert!(check.contract.is_none());
+    }
+    #[test]
+    fn contract_only_gate_persists_evidence_without_model_review() {
+        let (repository, source) = repo();
+        let data = tempfile::tempdir().unwrap();
+        let store = JobsStore::open(data.path().join("jobs.db")).unwrap();
+        let id = awaiting_job(&store, "contract-only", "contract-issue");
+        let service = VerificationService {
+            checks: ContractCheck {
+                output: finite_output(2),
+                mutate: false,
+                unavailable: false,
+            },
+            reviewer: NoContractReviewer,
+        };
+        let outcome = service
+            .verify_job(repository.path(), &store, id, &contract_envelope(source), 5)
+            .unwrap();
+        assert!(matches!(outcome, VerificationOutcome::Verified { .. }));
+        let checkpoint = store
+            .get_checkpoint(id, "verification_check_0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint["receipt"]["contract"]["status"], "passed");
+        assert_eq!(
+            checkpoint["receipt"]["contract"]["observations"][0]["actual"],
+            2
+        );
+    }
+    #[test]
+    fn contract_failures_and_inconclusive_reports_never_verify() {
+        let mut missing = finite_output(2);
+        missing.stdout = json!({"schema_version":1,"observations":[]}).to_string();
+        let outputs = vec![
+            finite_output(3),
+            missing,
+            CheckOutput {
+                exit_code: Some(1),
+                ..finite_output(2)
+            },
+            CheckOutput {
+                timed_out: true,
+                ..finite_output(2)
+            },
+            CheckOutput {
+                cancelled: true,
+                ..finite_output(2)
+            },
+            CheckOutput {
+                truncated: true,
+                ..finite_output(2)
+            },
+            CheckOutput {
+                output_incomplete: true,
+                ..finite_output(2)
+            },
+        ];
+        for (index, output) in outputs.into_iter().enumerate() {
+            let (repository, source) = repo();
+            let data = tempfile::tempdir().unwrap();
+            let store = JobsStore::open(data.path().join("jobs.db")).unwrap();
+            let id = awaiting_job(&store, &format!("contract-{index}"), "contract-issue");
+            let service = VerificationService {
+                checks: ContractCheck {
+                    output,
+                    mutate: false,
+                    unavailable: false,
+                },
+                reviewer: NoContractReviewer,
+            };
+            let result =
+                service.verify_job(repository.path(), &store, id, &contract_envelope(source), 5);
+            if index == 0 {
+                assert!(matches!(result, Err(VerificationError::CheckFailed(_))));
+            } else {
+                assert!(matches!(result, Ok(VerificationOutcome::NeedsInput { .. })));
+            }
+            assert_eq!(
+                store.get(id).unwrap().state,
+                crate::jobs::JobState::AwaitingVerification
+            );
+            let cp = store
+                .get_checkpoint(id, "verification_check_0")
+                .unwrap()
+                .unwrap();
+            assert!(cp["receipt"]["contract"].is_object());
+            assert!(store
+                .get_checkpoint(id, "verification_review")
+                .unwrap()
+                .is_none());
+        }
+    }
+    #[test]
+    fn unavailable_contract_command_is_checkpointed_as_inconclusive() {
+        let (repository, source) = repo();
+        let data = tempfile::tempdir().unwrap();
+        let store = JobsStore::open(data.path().join("jobs.db")).unwrap();
+        let id = awaiting_job(&store, "contract-unavailable", "contract-issue");
+        let service = VerificationService {
+            checks: ContractCheck {
+                output: finite_output(2),
+                mutate: false,
+                unavailable: true,
+            },
+            reviewer: NoContractReviewer,
+        };
+        assert!(matches!(
+            service.verify_job(repository.path(), &store, id, &contract_envelope(source), 5),
+            Ok(VerificationOutcome::NeedsInput { .. })
+        ));
+        let cp = store
+            .get_checkpoint(id, "verification_check_0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cp["contractStatus"], "inconclusive");
+    }
+    #[test]
+    fn contract_source_mutation_cannot_create_passing_receipt() {
+        let (repository, source) = repo();
+        let service = VerificationService {
+            checks: ContractCheck {
+                output: finite_output(2),
+                mutate: true,
+                unavailable: false,
+            },
+            reviewer: NoContractReviewer,
+        };
+        assert!(matches!(
+            service.run_check(repository.path(), &source, &finite_contract_spec()),
+            Err(VerificationError::StaleSource { .. })
+        ));
+    }
+    struct RemainingReview {
+        result: ReviewResult,
+    }
+    impl ReviewExecutor for RemainingReview {
+        fn review(&self, request: &ReviewRequest) -> Result<ReviewResult, String> {
+            assert_eq!(
+                request.acceptance_criteria,
+                vec!["outside contract".to_string()]
+            );
+            Ok(self.result.clone())
+        }
+    }
+    #[test]
+    fn mixed_scope_preserves_reviewer_failure_and_manual_acceptance() {
+        for failed in [false, true] {
+            let (repository, source) = repo();
+            let data = tempfile::tempdir().unwrap();
+            let store = JobsStore::open(data.path().join("jobs.db")).unwrap();
+            let id = awaiting_job(&store, "contract-mixed", "contract-issue");
+            let service = VerificationService {
+                checks: ContractCheck {
+                    output: finite_output(2),
+                    mutate: false,
+                    unavailable: false,
+                },
+                reviewer: RemainingReview {
+                    result: ReviewResult {
+                        passed: !failed,
+                        findings: if failed {
+                            vec!["defect".into()]
+                        } else {
+                            vec![]
+                        },
+                        manual_acceptance: if failed {
+                            vec![]
+                        } else {
+                            vec!["human acceptance".into()]
+                        },
+                        details: "outside review".into(),
+                    },
+                },
+            };
+            let mut envelope = contract_envelope(source);
+            envelope.acceptance_criteria.push("outside contract".into());
+            let result = service.verify_job(repository.path(), &store, id, &envelope, 5);
+            if failed {
+                assert!(matches!(result, Err(VerificationError::ReviewFailed(_))));
+            } else {
+                assert!(matches!(
+                    result,
+                    Ok(VerificationOutcome::NeedsManualAcceptance { .. })
+                ));
+            }
+            assert_ne!(
+                store.get(id).unwrap().state,
+                crate::jobs::JobState::Verified
+            );
+        }
+    }
+    #[test]
+    fn contract_cannot_claim_unknown_or_overlapping_acceptance() {
+        let (repository, source) = repo();
+        let data = tempfile::tempdir().unwrap();
+        let store = JobsStore::open(data.path().join("jobs.db")).unwrap();
+        let id = awaiting_job(&store, "contract-scope", "contract-issue");
+        let service = VerificationService {
+            checks: ContractCheck {
+                output: finite_output(2),
+                mutate: false,
+                unavailable: false,
+            },
+            reviewer: NoContractReviewer,
+        };
+        let mut envelope = contract_envelope(source);
+        envelope.acceptance_criteria = vec!["other".into()];
+        assert!(matches!(
+            service.verify_job(repository.path(), &store, id, &envelope, 5),
+            Err(VerificationError::Invalid(_))
+        ));
+        envelope.acceptance_criteria = vec!["pass".into()];
+        let mut duplicate = finite_contract_spec();
+        duplicate.id = "second".into();
+        envelope.checks.push(duplicate);
+        assert!(matches!(
+            service.verify_job(repository.path(), &store, id, &envelope, 5),
+            Err(VerificationError::Invalid(_))
+        ));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn real_process_contract_report_is_consumed_by_the_host() {
+        let (repository, source) = repo();
+        let mut check = finite_contract_spec();
+        check.program = "powershell.exe".into();
+        check.args = vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "[Console]::Out.Write('{}')",
+                finite_output(2).stdout.replace('\'', "''")
+            ),
+        ];
+        check.timeout_ms = 10_000;
+        let service = VerificationService {
+            checks: ProcessCheckExecutor,
+            reviewer: NoContractReviewer,
+        };
+        let receipt = service
+            .run_check(repository.path(), &source, &check)
+            .unwrap();
+        assert!(receipt.passed);
+        assert_eq!(receipt.contract.unwrap().status, ContractStatus::Passed);
+    }
+
+    #[test]
+    fn mixed_contracts_cannot_bypass_a_failed_ordinary_check() {
+        struct MixedCheck;
+        impl CheckExecutor for MixedCheck {
+            fn execute(&self, _: &Path, check: &CheckSpec) -> Result<CheckOutput, String> {
+                Ok(if check.contract.is_some() {
+                    finite_output(2)
+                } else {
+                    CheckOutput {
+                        exit_code: Some(1),
+                        ..Default::default()
+                    }
+                })
+            }
+        }
+        let (repository, source) = repo();
+        let data = tempfile::tempdir().unwrap();
+        let store = JobsStore::open(data.path().join("jobs.db")).unwrap();
+        let id = awaiting_job(&store, "mixed-ordinary", "contract-issue");
+        let service = VerificationService {
+            checks: MixedCheck,
+            reviewer: NoContractReviewer,
+        };
+        let mut envelope = contract_envelope(source);
+        let mut ordinary = spec();
+        ordinary.id = "ordinary".into();
+        envelope.checks.push(ordinary);
+        assert!(matches!(
+            service.verify_job(repository.path(), &store, id, &envelope, 5),
+            Err(VerificationError::CheckFailed(_))
+        ));
+        assert_eq!(
+            store.get(id).unwrap().state,
+            crate::jobs::JobState::AwaitingVerification
+        );
+        assert!(store
+            .get_checkpoint(id, "verification_review")
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn direct_review_rejects_a_forged_passing_contract_flag() {
+        let (repository, source) = repo();
+        let service = VerificationService {
+            checks: ContractCheck {
+                output: finite_output(2),
+                mutate: false,
+                unavailable: false,
+            },
+            reviewer: NoContractReviewer,
+        };
+        let mut receipt = service
+            .run_check(repository.path(), &source, &finite_contract_spec())
+            .unwrap();
+        receipt.contract.as_mut().unwrap().observations[0].actual = json!(999);
+        let envelope = contract_envelope(source.clone());
+        let request = ReviewRequest {
+            job_id: 1,
+            worker_task_id: envelope.worker_task_id,
+            issue_fingerprint: envelope.issue_fingerprint,
+            source,
+            reviewer: envelope.reviewer,
+            check_receipts: vec![receipt],
+            acceptance_criteria: envelope.acceptance_criteria,
+        };
+        assert!(matches!(
+            service.review(&request),
+            Err(VerificationError::Invalid(_))
+        ));
     }
 }

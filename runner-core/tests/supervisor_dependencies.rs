@@ -121,6 +121,7 @@ fn selected_gp_chain_waits_for_verified_predecessors_and_independent_issue_can_d
                 timeout_ms: 1000,
                 output_limit_bytes: 1024,
                 adapter: None,
+                contract: None,
             }],
             reviewer: ReviewerIdentity {
                 task_id: "review".into(),

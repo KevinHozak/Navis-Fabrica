@@ -234,7 +234,7 @@ while ($line=[Console]::In.ReadLine()) {
         }],
         verification: vec![VerificationPolicy { issue_id: "TEST-L001".into(), acceptance_criteria: acceptance,
             reviewer: ReviewerIdentity { task_id: "review".into(), provider_id: "fixture-codex".into(), model_id: "fixture-model".into(), reasoning_effort: None },
-            checks: vec![CheckSpec { id: "expected-output".into(), program: powershell, args: vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "if ([IO.File]::ReadAllText((Join-Path (Get-Location) 'result.txt')) -ne 'verified fixture result') { exit 1 }".into()], cwd: ".".into(), timeout_ms: 5000, output_limit_bytes: 4096, adapter: None }],
+            checks: vec![CheckSpec { id: "expected-output".into(), program: powershell, args: vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "if ([IO.File]::ReadAllText((Join-Path (Get-Location) 'result.txt')) -ne 'verified fixture result') { exit 1 }".into()], cwd: ".".into(), timeout_ms: 5000, output_limit_bytes: 4096, adapter: None, contract: None }],
         }],
         policy: BatchPolicy { window_seconds: 120, max_concurrency: 1, max_auth_retries: 0, max_network_retries: 0,
             budget: BudgetPolicy { max_tokens: 10000, max_cost_micros: 0, max_seconds: 120, max_concurrency: 1 },

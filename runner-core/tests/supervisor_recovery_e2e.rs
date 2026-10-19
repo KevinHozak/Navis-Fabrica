@@ -261,6 +261,7 @@ fn run_recovery_fixture(temp: &tempfile::TempDir, stage_handoff: Option<&Path>) 
                 timeout_ms: 5000,
                 output_limit_bytes: 4096,
                 adapter: None,
+                contract: None,
             }],
         });
     }
@@ -1081,10 +1082,18 @@ fn run_cold_restart_recovery(handoff_path: &Path) {
     }
     assert_initial_implementation_calls(&handoff.invocation_dir);
 
+    // A fixture heartbeat can extend a lease after the staging handoff was written.
+    // All recorded processes are stopped above, so the reopened durable leases are stable.
+    let durable_lease_until = ids
+        .iter()
+        .map(|id| jobs.get(*id).unwrap().lease_until_ms.unwrap_or(0))
+        .max()
+        .unwrap_or(0);
     let reconcile_at = handoff
         .crash_lease_until_ms
         .max(handoff.gated_lease_until_ms)
-        + 1;
+        .max(durable_lease_until)
+        .saturating_add(1);
     jobs.reconcile_expired_ids(&ids, reconcile_at).unwrap();
     for id in ids {
         let held = jobs.get(id).unwrap();

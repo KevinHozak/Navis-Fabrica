@@ -356,7 +356,7 @@ function App() {
           <div className="toolbar-actions"><ActivityEntry /></div>
         </header>
 
-        <main id="main-content" className="content" tabIndex={-1}>
+        <main id="main-content" className={`content${section === "projects" ? " content-projects" : ""}`} tabIndex={-1}>
           {section !== "projects" && <div className="page-heading">
             <div>
               <p className="eyebrow">YOUR WORKSPACE</p>

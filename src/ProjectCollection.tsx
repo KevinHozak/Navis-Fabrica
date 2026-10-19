@@ -45,7 +45,7 @@ export function ProjectCollection({ projects, manage = false, onSelect }: { proj
 export function ProjectCard({ project, runs, selected, onClick }: { project: ProjectEntry; runs: WorkflowRun[] | null; selected: boolean; onClick: () => void }) {
   const batch = useBatchActivity();
   const [icon, setIcon] = useState<string | null>(null);
-  const [issues, setIssues] = useState({ epics: "Loading…", stories: "Loading…" });
+  const [issues, setIssues] = useState({ epics: "0", stories: "0" });
   const [issueError, setIssueError] = useState("");
   useEffect(() => {
     let alive = true;
@@ -56,8 +56,8 @@ export function ProjectCard({ project, runs, selected, onClick }: { project: Pro
   }, [project.id, project.path]);
   useEffect(() => {
     let alive = true;
-    setIssues({ epics: "Loading…", stories: "Loading…" }); setIssueError("");
-    if (!isDesktopApp()) { setIssues({ epics: "Desktop required", stories: "Desktop required" }); return; }
+    setIssues({ epics: "0", stories: "0" }); setIssueError("");
+    if (!isDesktopApp()) { setIssues({ epics: "0", stories: "0" }); return; }
     async function loadCounts() {
       let epics = 0;
       let stories = 0;
@@ -74,13 +74,13 @@ export function ProjectCard({ project, runs, selected, onClick }: { project: Pro
       }
       if (alive) setIssues({ epics: String(epics), stories: String(stories) });
     }
-    void loadCounts().catch(e => { if (alive) { setIssues({ epics: "Unavailable", stories: "Unavailable" }); setIssueError(String(e)); } });
+    void loadCounts().catch(e => { if (alive) { setIssues({ epics: "0", stories: "0" }); setIssueError(String(e)); } });
     return () => { alive = false; };
   }, [project]);
   const relevant = runs?.filter(run => sameProjectPath(run.cwd, project.path)) ?? null;
   return <button className={`my-project-card${selected ? " selected" : ""}`} onClick={onClick} aria-pressed={selected}>
     <ProjectCardHeading name={project.name} icon={icon} /><small>{project.git.branch ?? "Branch unavailable"}{project.isWorktree ? " · Worktree" : ""}</small>
-    <dl><div><dt>Changed files</dt><dd>{project.git.changedFiles?.length ?? "Unavailable"}</dd></div><div title={issueError}><dt>Epics</dt><dd>{issues.epics}</dd></div><div title={issueError}><dt>Stories</dt><dd>{issues.stories}</dd></div></dl>
+    <dl><div><dt>Changes</dt><dd className={(project.git.changedFiles?.length ?? 0) > 0 ? "count-changes" : undefined}>{project.git.changedFiles?.length ?? 0}</dd></div><div title={issueError}><dt>Epics</dt><dd className={Number(issues.epics) > 0 ? "count-epics" : undefined}>{issues.epics}</dd></div><div title={issueError}><dt>Stories</dt><dd className={Number(issues.stories) > 0 ? "count-stories" : undefined}>{issues.stories}</dd></div></dl>
     <span>{activityLabel(relevant)}{batch?.projectPath && sameProjectPath(batch.projectPath, project.path) ? ` · Batch ${batch.needsAttention ? "needs attention" : batch.state}` : ""}</span>
   </button>;
 }

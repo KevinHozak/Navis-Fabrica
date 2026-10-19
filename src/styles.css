@@ -396,8 +396,10 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .my-project-card-heading h3 { margin: 0; }
 .my-project-icon { width: 36px; height: 36px; flex: 0 0 36px; border-radius: 8px; object-fit: contain; }
 .my-project-card small, .my-project-card dt { color: #abb9c9; }
-.my-project-card dl { display: flex; flex-wrap: wrap; gap: 24px; margin: 24px 0; }
-.my-project-card dd { margin: 8px 0 0; font-size: 1.2rem; }
+.my-project-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 24px 0; }
+.my-project-card dl > div { min-width: 0; padding: 12px 8px; border: 1px solid #34465b; border-radius: 9px; background: #101923; text-align: center; }
+.my-project-card dt { font-size: .7rem; line-height: 1.3; white-space: nowrap; }
+.my-project-card dd { margin: 6px 0 0; font-size: 1.6rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .collection-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 20px 0; }
 .collection-options label { display: flex; gap: 12px; padding: 16px; background: #151e29; border-radius: 10px; align-items: center; }
 .collection-options small { display: block; overflow-wrap: anywhere; color: #abb9c9; margin-top: 6px; }
@@ -417,3 +419,11 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 @media (max-width: 900px) { .sidebar { flex-basis: 150px; } }
 
 fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
+
+.content.content-projects { padding-top: 20px; }
+.content-projects .my-projects { padding-top: 0; }
+.content-projects .my-project-grid { margin-top: 12px; }
+
+.my-project-card dd.count-changes { color: #f1c27c; }
+.my-project-card dd.count-epics { color: #c4acfa; }
+.my-project-card dd.count-stories { color: #8cc5fa; }

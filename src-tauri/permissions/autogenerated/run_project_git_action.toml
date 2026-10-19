@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-project-git-action"
+description = "Enables the run_project_git_action command without any pre-configured scope."
+commands.allow = ["run_project_git_action"]
+
+[[permission]]
+identifier = "deny-run-project-git-action"
+description = "Denies the run_project_git_action command without any pre-configured scope."
+commands.deny = ["run_project_git_action"]

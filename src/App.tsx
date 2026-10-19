@@ -1,4 +1,5 @@
-import { ActivityEntry, ActivityOverview } from "./Activity";
+import { ActivityEntry, ActivityOverview, sameProjectPath } from "./Activity";
+import { mergeRefreshPaths as mergePaths, settleRefreshPaths, withoutRefreshPaths as withoutPaths } from "./projectRefreshState";
 import { ProjectCollection } from "./ProjectCollection";
 import { useEffect, useRef, useState } from "react";
 import { SettingsPanel } from "./SettingsPanel";
@@ -49,12 +50,17 @@ function App() {
   const [progress, setProgress] = useState<ProjectScanProgress | null>(null);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [quickAction, setQuickAction] = useState<{ action: "dev-push" | "dev-build"; effects?: ("commit" | "push")[]; nonce: number } | null>(null);
   const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
   const [scanDurationMs, setScanDurationMs] = useState<number | null>(null);
   const [firstProjectMs, setFirstProjectMs] = useState<number | null>(null);
   const [scanError, setScanError] = useState("");
   const [watchError, setWatchError] = useState("");
   const [inventoryFreshness, setInventoryFreshness] = useState<InventoryFreshness>("loading");
+  const [refreshingPaths, setRefreshingPaths] = useState<string[]>([]);
+  const [refreshErrorPaths, setRefreshErrorPaths] = useState<string[]>([]);
+  const [projectRefreshVersions, setProjectRefreshVersions] = useState<Record<string, number>>({});
+  const [startupRefreshPending, setStartupRefreshPending] = useState(() => isDesktopApp());
   const [projectRoot, setProjectRoot] = useState("C:\\Projects");
   const activeScanId = useRef("");
   const scanStartedAt = useRef<number | null>(null);
@@ -63,9 +69,25 @@ function App() {
   const refreshAfterScan = useRef<string[]>([]);
   const fullRefreshAfterScan = useRef(false);
   const partialScanIds = useRef(new Set<string>());
+  const scanPaths = useRef(new Map<string, string[]>());
   const beginScanRef = useRef<(forceRefresh: boolean, maxDirectories?: number) => void>(() => undefined);
   const beginAffectedRefreshRef = useRef<(paths: string[]) => void>(() => undefined);
   const desktop = isDesktopApp();
+
+  function failCurrentScan(error: unknown) {
+    const failedPaths = mergePaths([...scanPaths.current.values()].flat(), refreshAfterScan.current);
+    scanPaths.current.clear();
+    activeScanId.current = "";
+    refreshAfterScan.current = [];
+    fullRefreshAfterScan.current = false;
+    partialScanIds.current.clear();
+    setRefreshingPaths([]);
+    setRefreshErrorPaths(current => mergePaths(current, failedPaths));
+    setStartupRefreshPending(false);
+    setScanStatus("error");
+    setInventoryFreshness("stale");
+    setScanError(error instanceof Error ? error.message : String(error));
+  }
 
   useEffect(() => {
     const handleNavigation = () => {
@@ -80,6 +102,15 @@ function App() {
     loadSettings().then((settings) => {
       setProjectRoot(settings.projectRoot);
     }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const updateProject = (event: Event) => {
+      const project = (event as CustomEvent<ProjectEntry>).detail;
+      setProjects((items) => items.map((item) => item.id === project.id ? project : item));
+    };
+    window.addEventListener("fabrica-project-updated", updateProject);
+    return () => window.removeEventListener("fabrica-project-updated", updateProject);
   }, []);
 
   useEffect(() => {
@@ -108,13 +139,12 @@ function App() {
       else stop();
       markScanListenerReady();
     }).catch((error: unknown) => {
-      if (active) {
-        setScanStatus("error");
-        setScanError(error instanceof Error ? error.message : String(error));
-      }
+      if (active) failCurrentScan(error);
     });
     onProjectScanFinished((result) => {
       if (!active || result.scanId !== activeScanId.current) return;
+      const completedPaths = scanPaths.current.get(result.scanId) ?? [];
+      scanPaths.current.delete(result.scanId);
       activeScanId.current = "";
       if (scanStartedAt.current !== null) {
         setScanDurationMs(Math.round(performance.now() - scanStartedAt.current));
@@ -133,11 +163,36 @@ function App() {
       setScanStatus(result.fatalError ? "error" : result.cancelled ? "cancelled" : "complete");
       const partial = partialScanIds.current.delete(result.scanId);
       setInventoryFreshness(result.fatalError || result.errors.length ? "stale" : result.cancelled ? "saved" : partial ? "partial" : "current");
-      if (!result.cancelled && fullRefreshAfterScan.current) {
+      const queuedFullRefresh = fullRefreshAfterScan.current;
+      const queuedPaths = refreshAfterScan.current;
+      const continueRefresh = !result.cancelled && !result.fatalError;
+      const settledPaths = continueRefresh ? completedPaths : mergePaths(completedPaths, queuedPaths);
+      const failedPaths = result.fatalError
+        ? settledPaths
+        : result.errors.length
+          ? completedPaths.filter(path => !result.projects.some(project => sameProjectPath(project.path, path)))
+          : [];
+      setRefreshingPaths(current => settleRefreshPaths(current, settledPaths, queuedPaths, continueRefresh));
+      setRefreshErrorPaths(current => mergePaths(withoutPaths(current, settledPaths), failedPaths));
+      if (continueRefresh) {
+        setProjectRefreshVersions(current => {
+          const next = { ...current };
+          for (const project of result.projects) {
+            if (completedPaths.some(path => sameProjectPath(path, project.path)) && !failedPaths.some(path => sameProjectPath(path, project.path))) {
+              next[project.id] = (next[project.id] ?? 0) + 1;
+            }
+          }
+          return next;
+        });
+      }
+      if (!continueRefresh) {
+        fullRefreshAfterScan.current = false;
+        refreshAfterScan.current = [];
+      } else if (queuedFullRefresh) {
         fullRefreshAfterScan.current = false;
         refreshAfterScan.current = [];
         window.setTimeout(() => beginScanRef.current(true), 0);
-      } else if (!result.cancelled && refreshAfterScan.current.length) {
+      } else if (queuedPaths.length) {
         const pending = [...new Set(refreshAfterScan.current)];
         refreshAfterScan.current = [];
         window.setTimeout(() => beginAffectedRefreshRef.current(pending), 0);
@@ -147,16 +202,14 @@ function App() {
       else stop();
       markScanListenerReady();
     }).catch((error: unknown) => {
-      if (active) {
-        setScanStatus("error");
-        setScanError(error instanceof Error ? error.message : String(error));
-      }
+      if (active) failCurrentScan(error);
     });
 
     onProjectScanInvalidated((paths) => {
       if (!active) return;
       if (activeScanId.current) {
-        refreshAfterScan.current = [...new Set([...refreshAfterScan.current, ...paths])].slice(0, 512);
+        refreshAfterScan.current = mergePaths(refreshAfterScan.current, paths).slice(0, 512);
+        setRefreshingPaths(current => mergePaths(current, paths.slice(0, 512)));
       } else beginAffectedRefreshRef.current(paths);
     }).then((stop) => {
       if (active) unlistenInvalidated = stop;
@@ -216,11 +269,20 @@ function App() {
 
   // Catalog discovery is explicit. On startup only re-inspect saved collection entries.
   useEffect(() => {
-    if (!desktop || !scanListenersReady) return;
+    if (!desktop) { setStartupRefreshPending(false); return; }
+    if (!scanListenersReady) return;
     let active = true;
     Promise.all([loadSettings(), getProjectInventory()]).then(([settings, inventory]) => {
-      if (active) beginAffectedRefreshRef.current(inventory.filter(p => settings.preferences.projectDisplay.favoriteProjectIds.includes(p.id)).map(p => p.path));
-    }).catch(() => undefined);
+      if (active) {
+        beginAffectedRefreshRef.current(inventory.filter(p => settings.preferences.projectDisplay.favoriteProjectIds.includes(p.id)).map(p => p.path));
+        setStartupRefreshPending(false);
+      }
+    }).catch((error: unknown) => {
+      if (active) {
+        setStartupRefreshPending(false);
+        setScanError(error instanceof Error ? error.message : String(error));
+      }
+    });
     return () => { active = false; };
   }, [desktop, scanListenersReady]);
 
@@ -247,7 +309,12 @@ function App() {
 
   async function beginScan(forceRefresh = true, maxDirectories?: number) {
     if (activeScanId.current) {
-      if (forceRefresh) fullRefreshAfterScan.current = true;
+      if (forceRefresh) {
+        fullRefreshAfterScan.current = true;
+        const paths = projects.map(project => project.path);
+        refreshAfterScan.current = mergePaths(refreshAfterScan.current, paths).slice(0, 512);
+        setRefreshingPaths(current => mergePaths(current, paths));
+      }
       return;
     }
     if (!desktop) {
@@ -256,6 +323,10 @@ function App() {
       return;
     }
     const id = crypto.randomUUID();
+    const paths = projects.map(project => project.path);
+    scanPaths.current.set(id, paths);
+    setRefreshingPaths(current => mergePaths(current, paths));
+    setRefreshErrorPaths(current => withoutPaths(current, paths));
     activeScanId.current = id;
     cancelRequested.current = false;
     setScanId(id);
@@ -274,20 +345,22 @@ function App() {
       await startProjectScan(id, forceRefresh, maxDirectories);
       if (cancelRequested.current) await cancelProjectScan(id);
     } catch (error) {
-      activeScanId.current = "";
-      setScanStatus("error");
-      setInventoryFreshness("stale");
-      setScanError(error instanceof Error ? error.message : String(error));
+      failCurrentScan(error);
     }
   }
 
   async function beginAffectedRefresh(paths: string[]) {
     if (!desktop || !paths.length) return;
     if (activeScanId.current) {
-      refreshAfterScan.current = [...new Set([...refreshAfterScan.current, ...paths])].slice(0, 512);
+      refreshAfterScan.current = mergePaths(refreshAfterScan.current, paths).slice(0, 512);
+      setRefreshingPaths(current => mergePaths(current, paths.slice(0, 512)));
       return;
     }
     const id = crypto.randomUUID();
+    const scanPathsToRefresh = mergePaths(paths).slice(0, 512);
+    scanPaths.current.set(id, scanPathsToRefresh);
+    setRefreshingPaths(current => mergePaths(current, scanPathsToRefresh));
+    setRefreshErrorPaths(current => withoutPaths(current, scanPathsToRefresh));
     partialScanIds.current.add(id);
     activeScanId.current = id;
     cancelRequested.current = false;
@@ -298,13 +371,9 @@ function App() {
     setProgress(null);
     setScanError("");
     try {
-      await startAffectedProjectRefresh(id, paths.slice(0, 512));
+      await startAffectedProjectRefresh(id, scanPathsToRefresh);
     } catch (error) {
-      activeScanId.current = "";
-      partialScanIds.current.delete(id);
-      setScanStatus("error");
-      setInventoryFreshness("stale");
-      setScanError(error instanceof Error ? error.message : String(error));
+      failCurrentScan(error);
     }
   }
 
@@ -369,16 +438,16 @@ function App() {
             {section === "settings" && <p role="status">{scanning ? "Discovering folders…" : scanError || freshnessLabel}</p>}{section === "settings" && Boolean(scanResult?.errors.length) && <details><summary>Some folders could not be inspected</summary><ul>{scanResult?.errors.map((error,index) => <li key={index}>{error}</li>)}</ul></details>}
           </div>}
 
-          <div hidden={section !== "projects"}>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} /></div>
+          <div hidden={section !== "projects"}>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} onQuickAction={(id, action, effects) => { setSelectedProjectId(id); setQuickAction({ action, effects, nonce: Date.now() }); window.location.hash = "runs"; }} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} /></div>
           {section === "runs" && <ActivityOverview projects={projects} onSelect={setSelectedProjectId} />}
           <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
           <div hidden={section !== "batches"}><BatchRunnerPanel /></div>
           {section === "local-issues" || section === "batches" ? null : section === "settings" ? (
-            <><details className="panel advanced-settings"><summary>My Projects</summary><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} /></details><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
+            <><details className="panel advanced-settings"><summary>My Projects</summary><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} /></details><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
           ) : section === "providers" ? (
             <ProvidersPanel />
           ) : section === "runs" ? selectedProject ? isDesktopApp() ? (
-            <><div className="project-actions"><a href="#batches">Local issue batches</a><a href="#local-issues">Local issue workspace</a></div><RunsPanel defaultCwd={selectedProject.path} project={selectedProject} issue={null} /></>
+            <><div className="project-actions"><a href="#batches">Local issue batches</a><a href="#local-issues">Local issue workspace</a></div><RunsPanel defaultCwd={selectedProject.path} project={selectedProject} issue={null} quickAction={quickAction} /></>
           ) : (
             <div className="panel empty-state"><h3>Workflow execution needs the desktop app</h3><p>The browser preview can inspect project context, but it cannot launch local processes.</p></div>
           ) : (

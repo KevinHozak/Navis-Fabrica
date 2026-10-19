@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { isDesktopApp, listWorkflowRuns, onWorkflowRunUpdated, type WorkflowRun, type ProjectEntry } from "./settings";
+import { sameProjectPath } from "./projectRefreshState";
+export { sameProjectPath } from "./projectRefreshState";
 export type BatchActivity = { batchId: string; projectPath?: string; state: string; needsAttention: boolean };
 let latestBatchActivity: BatchActivity | null = null;
 export function publishBatchActivity(value: BatchActivity | null) {
@@ -16,7 +18,6 @@ export function useBatchActivity() {
   return batch;
 }
 const active = new Set(["queued", "running", "cancelling"]);
-export const sameProjectPath = (a: string, b: string) => a.replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase() === b.replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase();
 export function useWorkflowActivity() {
   const [runs, setRuns] = useState<WorkflowRun[] | null>(null);
   useEffect(() => {

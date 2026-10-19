@@ -9,7 +9,7 @@ import {
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
 const maxPendingRunEvents = 2_000;
 
-export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; project: ProjectEntry; issue: GitHubIssue | null }) {
+export function RunsPanel({ defaultCwd, project, issue, quickAction }: { defaultCwd: string; project: ProjectEntry; issue: GitHubIssue | null; quickAction?: { action: "dev-push" | "dev-build"; effects?: ("commit" | "push")[]; nonce: number } | null }) {
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [executable, setExecutable] = useState("");
   const [cwd, setCwd] = useState(defaultCwd);
@@ -96,6 +96,9 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
   }, []);
 
   useEffect(() => setCwd(defaultCwd), [defaultCwd]);
+  useEffect(() => { if (quickAction) { setWorkflowAction(quickAction.action); setWorkflowIntent(""); setScopePathsText(quickAction.action === "dev-push" ? (project.git.changedFiles ?? []).join("\n") : ""); setBuildProfile("release"); setRequestedEffects(new Set(quickAction.effects ?? [])); } }, [quickAction?.nonce]);
+  const supportsGithubPush = project.git.remotes.some((remote) => Boolean(remote.github));
+  useEffect(() => { if (!supportsGithubPush) setRequestedEffects((prior) => new Set([...prior].filter((effect) => effect === "commit"))); }, [project.id, supportsGithubPush]);
   useEffect(() => { loadSettings().then((settings) => {
     const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId);
     const model = provider?.models.find((item) => item.id === settings.providerSelection.modelId);
@@ -273,8 +276,11 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
     if (workflowAction === "dev-build" && selectedProviderKind !== "codex") {
       setError("The dev-build action requires the configured Codex provider."); return;
     }
-    if (workflowAction === "dev-push" && (!project.git.remotes.some((remote) => remote.github) || project.git.dirty !== true)) {
-      setError("Push changes needs a GitHub remote and a verified set of changed files."); return;
+    if (workflowAction === "dev-push" && project.git.dirty !== true) {
+      setError("Commit changes needs a verified set of changed files."); return;
+    }
+    if ((requestedEffects.has("push") || requestedEffects.has("createPullRequest")) && !supportsGithubPush) {
+      setError("Push requires a supported GitHub remote. Commit-only is available for this repository."); return;
     }
     const skill = skills.find((item) => item.id === workflowAction);
     if (!skill || skill.status !== "available" || !skill.compatibleAgents.includes("Codex")) {
@@ -300,6 +306,7 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
           ? `Run the dev-build skill for the selected Tauri project using the ${buildProfile} profile. Verify the generated artifact exists and inspect its embedded FileVersion and ProductVersion. Report this exact machine-readable line: NAVIS_BUILD_ARTIFACT:{"profile":"${buildProfile}","path":"<absolute path>","fileVersion":"<FileVersion>","productVersion":"<ProductVersion>"}. Clearly label the profile as ${buildProfile.toUpperCase()}${buildProfile === "debug" ? " (DEBUG BUILD; NOT A RELEASE ARTIFACT)" : " (RELEASE)"}. Do not commit, push, or create a pull request.`
           : `Run the ${workflowAction} skill for the selected project.`,
         `User's intentional scope: ${workflowIntent.trim()}`,
+        ...(workflowAction === "dev-push" && !project.git.remotes.length ? ["This repository has no configured remote. Perform only the explicitly requested local commit; do not configure a remote or attempt GitHub authentication or any remote operation."] : []),
         `Selected issue context (read-only): ${issueContext}`,
         `Detected project stacks and prerequisite status: ${JSON.stringify({ stacks: project.detectedStacks, prerequisites: project.workflowPrerequisites })}`,
         `Selected change paths: ${paths.length ? paths.join("\\n") : "The issue skill must determine its focused files from the issue criteria."}`,
@@ -378,13 +385,13 @@ export function RunsPanel({ defaultCwd, project, issue }: { defaultCwd: string; 
       <div className="panel-heading"><div><h2 id="agent-workflow-title">Agent-backed project actions</h2><p>Runs the installed workflow through the configured Codex provider and records its output.</p></div></div>
       <div className="panel-rule" />
       <form className="run-launch-form" onSubmit={(event) => { void startAgentWorkflow(event); }}>
-        <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push" | "dev-build")}><option value="dev-push">Review and push selected changes</option><option value="dev-build">Build project</option></select></label>
+        <label>Action<select value={workflowAction} onChange={(event) => setWorkflowAction(event.target.value as "dev-work" | "dev-push" | "dev-build")}><option value="dev-push">{supportsGithubPush ? "Review, commit & push selected changes" : "Review and commit selected changes"}</option><option value="dev-build">Build project</option></select></label>
         <label>Project<input value={`${project.name} · ${displayDirectoryPath(project.path)}`} readOnly aria-readonly="true" /></label>
         {workflowAction === "dev-work" && <label>Issue context<input value={issue ? `#${issue.number} · ${issue.title}${issue.blocked ? " · blocked" : ""}` : "No issue selected"} readOnly aria-readonly="true" /></label>}
         {workflowAction === "dev-push" && <label>Changed file paths, one per line<textarea rows={3} required value={scopePathsText} onChange={(event) => setScopePathsText(event.target.value)} placeholder="src/file.ts" /></label>}
         {workflowAction === "dev-build" && <label>Build profile<select value={buildProfile} onChange={(event) => setBuildProfile(event.target.value as "release" | "debug")}><option value="release">Release (default)</option><option value="debug">Debug (development only)</option></select></label>}
         <label>Intentional change scope<textarea rows={3} required maxLength={8000} value={workflowIntent} onChange={(event) => setWorkflowIntent(event.target.value)} placeholder={workflowAction === "dev-build" ? "Describe the build target or relevant constraints." : "What should the agent change, and what should it leave alone?"} /></label>
-        {workflowAction !== "dev-build" && <fieldset className="run-effect-options"><legend>Allow side effects (each requires an explicit choice)</legend>{(["commit", "push", "createPullRequest"] as const).map((effect) => <label key={effect} className="run-checkbox"><input type="checkbox" checked={requestedEffects.has(effect)} disabled={effect === "createPullRequest" && !requestedEffects.has("push")} onChange={(event) => setRequestedEffects((prior) => { const next = new Set(prior); if (event.target.checked) next.add(effect); else { next.delete(effect); if (effect === "push") next.delete("createPullRequest"); } return next; })} /><span>{effect === "createPullRequest" ? "Create or update pull request" : effect === "push" ? "Push branch" : "Commit changes"}</span></label>)}</fieldset>}
+        {workflowAction !== "dev-build" && <fieldset className="run-effect-options"><legend>Allow side effects (each requires an explicit choice)</legend>{(["commit", "push", "createPullRequest"] as const).map((effect) => { const remoteEffect = effect !== "commit"; const disabled = (remoteEffect && !supportsGithubPush) || (effect === "createPullRequest" && !requestedEffects.has("push")); const reason = remoteEffect && !supportsGithubPush ? "Requires a supported GitHub remote" : effect === "createPullRequest" && !requestedEffects.has("push") ? "Requires Push branch" : undefined; return <label key={effect} className="run-checkbox" title={reason}><input type="checkbox" checked={requestedEffects.has(effect)} disabled={disabled} onChange={(event) => setRequestedEffects((prior) => { const next = new Set(prior); if (event.target.checked) next.add(effect); else { next.delete(effect); if (effect === "push") next.delete("createPullRequest"); } return next; })} /><span>{effect === "createPullRequest" ? "Create or update pull request" : effect === "push" ? "Push branch" : "Commit changes"}</span></label>; })}</fieldset>}
         <div className="run-launch-options"><p className="registry-context-note">{workflowAction === "dev-work" ? "Requires a clean Git checkout. The dev-work skill creates an isolated worktree when appropriate." : workflowAction === "dev-push" ? "Preflight verifies that selected paths match every changed file. No automatic staging or stashing." : `Tauri only. ${buildProfile === "release" ? "Release is the default." : "DEBUG BUILD; it is not a release artifact."} The run records its output; inspect reported artifact path and version before use.`} Codex authentication is checked before launch; GitHub CLI authentication is checked before a permitted push.</p><button className="button button-primary" type="submit" disabled={busy || !workflowIntent.trim()}>{busy ? "Starting…" : "Start selected action"}</button></div>
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}

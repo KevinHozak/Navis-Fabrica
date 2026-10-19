@@ -6,8 +6,9 @@ use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -37,6 +38,707 @@ static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
 static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
     OnceLock::new();
 static APP_STARTUP_MS: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ProjectGitAction {
+    Pull,
+    Main,
+    Refresh,
+}
+
+fn parse_git_divergence(output: &str) -> Result<(u64, u64), String> {
+    let mut values = output.split_whitespace();
+    let ahead = values
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "Could not read Git divergence.".to_owned())?;
+    let behind = values
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "Could not read Git divergence.".to_owned())?;
+    Ok((ahead, behind))
+}
+
+fn fast_forward_needed(ahead: u64, behind: u64) -> Result<bool, &'static str> {
+    if ahead > 0 && behind > 0 {
+        Err("Branches have diverged.")
+    } else {
+        Ok(behind > 0)
+    }
+}
+
+fn execute_git_action(path: &Path, action: ProjectGitAction) -> Result<(), String> {
+    let git = |args: &[&str]| -> Result<std::process::Output, String> {
+        let mut child = process::command("git")
+            .args(args)
+            .current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "Never")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Could not start Git: {error}"))?;
+        let mut stdout = child.stdout.take().ok_or("Could not read Git output.")?;
+        let mut stderr = child.stderr.take().ok_or("Could not read Git errors.")?;
+        let out_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let err_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("Could not inspect Git: {error}"))?
+            {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                runs::terminate_process_tree(&mut child);
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err("Git action timed out after 30 seconds.".into());
+            }
+            thread::sleep(Duration::from_millis(40));
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: out_reader
+                .join()
+                .map_err(|_| "Could not read Git output.")?,
+            stderr: err_reader
+                .join()
+                .map_err(|_| "Could not read Git errors.")?,
+        })
+    };
+    let require = |args: &[&str], label: &str| -> Result<String, String> {
+        let output = git(args)?;
+        if !output.status.success() {
+            return Err(format!(
+                "{label}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    if !matches!(action, ProjectGitAction::Refresh)
+        && require(&["status", "--porcelain"], "Could not inspect the worktree")? != ""
+    {
+        return Err("Commit or move the uncommitted changes before this Git action.".into());
+    }
+    let branch = if matches!(action, ProjectGitAction::Refresh) {
+        String::new()
+    } else {
+        require(
+            &["branch", "--show-current"],
+            "Could not read the current branch",
+        )?
+    };
+    if !matches!(action, ProjectGitAction::Refresh) && branch.is_empty() {
+        return Err("Git actions require an attached branch.".into());
+    }
+    match action {
+        ProjectGitAction::Pull => {
+            let upstream = require(
+                &["rev-parse", "--symbolic-full-name", "@{upstream}"],
+                "This branch has no upstream",
+            )?;
+            let remote = require(
+                &["config", "--get", &format!("branch.{branch}.remote")],
+                "Could not read the branch upstream remote",
+            )?;
+            let merge_ref = require(
+                &["config", "--get", &format!("branch.{branch}.merge")],
+                "Could not read the branch upstream",
+            )?;
+            if remote != "." {
+                require(
+                    &[
+                        "fetch",
+                        "--no-recurse-submodules",
+                        &remote,
+                        &format!("+{merge_ref}:{upstream}"),
+                    ],
+                    "Could not fetch the upstream",
+                )?;
+            }
+            let counts = require(
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("HEAD...{upstream}"),
+                ],
+                "Could not inspect upstream divergence",
+            )?;
+            let (ahead, behind) = parse_git_divergence(&counts)?;
+            let needs_fast_forward = fast_forward_needed(ahead, behind)
+                .map_err(|_| "The branch and upstream have diverged; pull stopped.")?;
+            if needs_fast_forward {
+                require(
+                    &["merge", "--ff-only", &upstream],
+                    "Upstream cannot be applied as a fast-forward",
+                )?;
+            }
+        }
+        ProjectGitAction::Main => {
+            let worktrees = require(
+                &["worktree", "list", "--porcelain"],
+                "Could not inspect linked worktrees",
+            )?;
+            let main_ref = "refs/heads/main";
+            let main_worktree = worktrees.split("\n\n").any(|entry| {
+                entry
+                    .lines()
+                    .any(|line| line == format!("branch {main_ref}"))
+                    && !entry.lines().any(|line| {
+                        line.strip_prefix("worktree ").is_some_and(|candidate| {
+                            normalize_path(Path::new(candidate)) == normalize_path(path)
+                        })
+                    })
+            });
+            if main_worktree {
+                return Err("The main branch is checked out in another worktree.".into());
+            }
+            let local_main = git(&["show-ref", "--verify", "--quiet", main_ref])?
+                .status
+                .success();
+            if local_main {
+                let upstream_ref = require(
+                    &["rev-parse", "--symbolic-full-name", "main@{upstream}"],
+                    "The local main branch has no upstream",
+                )?;
+                let remote = require(
+                    &["config", "--get", "branch.main.remote"],
+                    "Could not read main upstream remote",
+                )?;
+                let merge_ref = require(
+                    &["config", "--get", "branch.main.merge"],
+                    "Could not read main upstream branch",
+                )?;
+                if remote != "." {
+                    require(
+                        &["fetch", &remote, &format!("+{merge_ref}:{upstream_ref}")],
+                        "Could not fetch main upstream",
+                    )?;
+                }
+                let counts = require(
+                    &[
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        &format!("main...{upstream_ref}"),
+                    ],
+                    "Could not inspect main divergence",
+                )?;
+                let (ahead, behind) = parse_git_divergence(&counts)?;
+                let needs_fast_forward = fast_forward_needed(ahead, behind)
+                    .map_err(|_| "Local main and its upstream have diverged; switch stopped.")?;
+                if branch != "main" {
+                    require(&["switch", "main"], "Could not switch to main")?;
+                }
+                if needs_fast_forward {
+                    require(
+                        &["merge", "--ff-only", &upstream_ref],
+                        "Main cannot be applied as a fast-forward",
+                    )?;
+                }
+            } else {
+                require(
+                    &[
+                        "fetch",
+                        "origin",
+                        "+refs/heads/main:refs/remotes/origin/main",
+                    ],
+                    "Could not fetch origin/main",
+                )?;
+                require(
+                    &["switch", "--track", "-c", "main", "origin/main"],
+                    "Could not create tracking branch main",
+                )?;
+            }
+        }
+        ProjectGitAction::Refresh => {}
+    }
+    Ok(())
+}
+
+fn project_for_git_action(
+    app: &AppHandle,
+    project_id: &str,
+) -> Result<scanner::ProjectEntry, String> {
+    let settings = load_settings(&settings_path(app)?)?;
+    inventory::load(&project_inventory_path(app)?, &settings.project_root)
+        .into_iter()
+        .find(|project| project.id == project_id && project.is_git_repository)
+        .ok_or_else(|| "The selected Git project is no longer available.".to_owned())
+}
+
+fn git_action(
+    app: AppHandle,
+    project_id: String,
+    action: ProjectGitAction,
+) -> Result<scanner::ProjectEntry, String> {
+    let project = project_for_git_action(&app, &project_id)?;
+    let path = PathBuf::from(&project.path)
+        .canonicalize()
+        .map_err(|_| "The selected project folder is unavailable.".to_owned())?;
+    let action_name = match action {
+        ProjectGitAction::Pull => "git-pull",
+        ProjectGitAction::Main => "git-main",
+        ProjectGitAction::Refresh => "git-refresh",
+    };
+    let mut guard = if matches!(action, ProjectGitAction::Refresh) {
+        None
+    } else {
+        Some(runs::reserve_external_mutation(&app, &path, action_name)?)
+    };
+    if let Err(error) = execute_git_action(&path, action) {
+        if let Some(active) = guard.as_mut() {
+            let _ = active.finish(false, &error);
+        }
+        return Err(error);
+    }
+    let refreshed = scanner::refresh_project_directory(&path, &AtomicBool::new(false))?
+        .ok_or_else(|| "Git completed, but project facts could not be refreshed.".to_owned())?;
+    if let Ok(mut cache) = project_fact_cache().lock() {
+        cache.insert(refreshed.id.clone(), refreshed.clone());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let inventory_path = project_inventory_path(&app)?;
+    let mut projects = inventory::load(&inventory_path, &settings.project_root);
+    if let Some(item) = projects.iter_mut().find(|item| item.id == refreshed.id) {
+        *item = refreshed.clone();
+    }
+    inventory::save(&inventory_path, &settings.project_root, &projects)?;
+    if let Some(active) = guard.as_mut() {
+        active.finish(true, "Git action completed and project facts refreshed.")?;
+    }
+    Ok(refreshed)
+}
+
+#[tauri::command]
+async fn run_project_git_action(
+    app: AppHandle,
+    project_id: String,
+    action: ProjectGitAction,
+) -> Result<scanner::ProjectEntry, String> {
+    tauri::async_runtime::spawn_blocking(move || git_action(app, project_id, action))
+        .await
+        .map_err(|error| format!("Git action task failed: {error}"))?
+}
+
+#[tauri::command]
+fn open_project_folder(app: AppHandle, project_id: String) -> Result<(), String> {
+    let settings = load_settings(&settings_path(&app)?)?;
+    let project = inventory::load(&project_inventory_path(&app)?, &settings.project_root)
+        .into_iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| "The selected project is no longer in the local inventory.".to_owned())?;
+    #[cfg(windows)]
+    {
+        Command::new("explorer.exe")
+            .arg(project.path)
+            .spawn()
+            .map_err(|e| format!("Could not open project folder: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = project;
+        Err("Opening project folders is supported on Windows.".into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseExecutableVersion {
+    path: String,
+    version: Option<String>,
+}
+
+fn cargo_manifest_directory(project_root: &Path) -> Option<PathBuf> {
+    let conventional = project_root.join("src-tauri");
+    if conventional.join("Cargo.toml").is_file() {
+        return Some(conventional);
+    }
+    project_root
+        .join("Cargo.toml")
+        .is_file()
+        .then(|| project_root.to_path_buf())
+}
+
+fn safe_binary_name(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.chars().any(|c| "/\\:*?\"<>|".contains(c)))
+    .then_some(value)
+}
+
+fn cargo_target_directory(manifest_dir: &Path, project_root: &Path) -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("CARGO_TARGET_DIR") {
+        let path = PathBuf::from(value);
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            manifest_dir.join(path)
+        });
+    }
+    let mut current = manifest_dir.to_path_buf();
+    for _ in 0..12 {
+        let config = current.join(".cargo/config.toml");
+        if let Ok(metadata) = fs::metadata(&config) {
+            if metadata.len() > 256 * 1024 {
+                return Err("Cargo config is too large to inspect safely.".into());
+            }
+            let value = fs::read_to_string(&config)
+                .map_err(|error| format!("Could not read Cargo config: {error}"))?;
+            let parsed: toml::Value = toml::from_str(&value)
+                .map_err(|error| format!("Could not parse Cargo config: {error}"))?;
+            if let Some(target) = parsed
+                .get("build")
+                .and_then(|build| build.get("target-dir"))
+                .and_then(toml::Value::as_str)
+            {
+                let target = PathBuf::from(target);
+                return Ok(if target.is_absolute() {
+                    target
+                } else {
+                    current.join(target)
+                });
+            }
+        }
+        if current == project_root || !current.pop() {
+            break;
+        }
+    }
+    let manifest = manifest_dir.join("Cargo.toml");
+    let manifest_value: toml::Value = fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|source| toml::from_str(&source).ok())
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    if let Some(workspace_path) = manifest_value
+        .get("package")
+        .and_then(|package| package.get("workspace"))
+        .and_then(toml::Value::as_str)
+    {
+        return Ok(manifest_dir.join(workspace_path).join("target"));
+    }
+    let mut current = manifest_dir.to_path_buf();
+    for _ in 0..12 {
+        if let Ok(source) = fs::read_to_string(current.join("Cargo.toml")) {
+            if toml::from_str::<toml::Value>(&source)
+                .ok()
+                .and_then(|value| value.get("workspace").cloned())
+                .is_some()
+            {
+                return Ok(current.join("target"));
+            }
+        }
+        if current == project_root || !current.pop() {
+            break;
+        }
+    }
+    Ok(manifest_dir.join("target"))
+}
+
+fn resolve_release_executable(project_root: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(manifest_dir) = cargo_manifest_directory(project_root) else {
+        return Ok(None);
+    };
+    let manifest_source = fs::read_to_string(manifest_dir.join("Cargo.toml"))
+        .map_err(|error| format!("Could not read project Cargo manifest: {error}"))?;
+    if manifest_source.len() > 1024 * 1024 {
+        return Err("Project Cargo manifest is too large to inspect safely.".into());
+    }
+    let manifest: toml::Value = toml::from_str(&manifest_source)
+        .map_err(|error| format!("Could not parse project Cargo manifest: {error}"))?;
+    let package_name = manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .ok_or("Cargo package name is unavailable.")?;
+    let config_paths = [
+        project_root.join("src-tauri/tauri.conf.json"),
+        project_root.join("tauri.conf.json"),
+        manifest_dir.join("tauri.conf.json"),
+    ];
+    let windows_configs = [
+        project_root.join("src-tauri/tauri.windows.conf.json"),
+        project_root.join("tauri.windows.conf.json"),
+        manifest_dir.join("tauri.windows.conf.json"),
+    ];
+    let mut binary_name = None;
+    for path in config_paths.into_iter().chain(windows_configs) {
+        if !path.is_file() {
+            continue;
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("Could not inspect Tauri config: {error}"))?;
+        if metadata.len() > 256 * 1024 {
+            return Err("Tauri config is too large to inspect safely.".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).map_err(|error| format!("Could not read Tauri config: {error}"))?,
+        )
+        .map_err(|error| format!("Could not parse Tauri config: {error}"))?;
+        if let Some(name) = value
+            .get("mainBinaryName")
+            .and_then(serde_json::Value::as_str)
+        {
+            binary_name = Some(name.to_owned());
+        }
+    }
+    let binary_name = binary_name
+        .as_deref()
+        .and_then(safe_binary_name)
+        .unwrap_or(package_name);
+    let target = cargo_target_directory(&manifest_dir, project_root)?;
+    let candidate = target.join("release").join(format!("{binary_name}.exe"));
+    if !candidate.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(candidate.canonicalize().unwrap_or(candidate)))
+}
+
+#[cfg(windows)]
+fn windows_product_version(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+    };
+    let encoded: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut ignored = 0u32;
+    let size = unsafe { GetFileVersionInfoSizeW(encoded.as_ptr(), &mut ignored) } as usize;
+    if size == 0 || size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut bytes = vec![0u8; size];
+    if unsafe { GetFileVersionInfoW(encoded.as_ptr(), 0, size as u32, bytes.as_mut_ptr().cast()) }
+        == 0
+    {
+        return None;
+    }
+    let block = bytes.as_ptr().cast::<std::ffi::c_void>();
+    let translation_query: Vec<u16> = "\\VarFileInfo\\Translation"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut translation: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut translation_len = 0u32;
+    let mut language_page = None;
+    if unsafe {
+        VerQueryValueW(
+            block,
+            translation_query.as_ptr(),
+            &mut translation,
+            &mut translation_len,
+        )
+    } != 0
+        && translation_len >= 4
+    {
+        let pair = unsafe {
+            std::slice::from_raw_parts(translation.cast::<u16>(), (translation_len / 2) as usize)
+        };
+        language_page = Some((pair[0], pair[1]));
+    }
+    for string_key in ["ProductVersion", "FileVersion"] {
+        for (language, code_page) in language_page
+            .into_iter()
+            .chain([(0x0409, 0x04b0), (0x0409, 0x04e4)])
+        {
+            let query: Vec<u16> =
+                format!("\\StringFileInfo\\{language:04x}{code_page:04x}\\{string_key}")
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+            let mut value: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut length = 0u32;
+            if unsafe { VerQueryValueW(block, query.as_ptr(), &mut value, &mut length) } != 0
+                && !value.is_null()
+                && length > 1
+            {
+                let text =
+                    unsafe { std::slice::from_raw_parts(value.cast::<u16>(), length as usize) };
+                let value = String::from_utf16_lossy(text)
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_owned();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    let root_query: Vec<u16> = "\\".encode_utf16().chain(Some(0)).collect();
+    let mut fixed: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut fixed_len = 0u32;
+    if unsafe { VerQueryValueW(block, root_query.as_ptr(), &mut fixed, &mut fixed_len) } != 0
+        && fixed_len as usize >= std::mem::size_of::<VS_FIXEDFILEINFO>()
+    {
+        let fixed = unsafe { fixed.cast::<VS_FIXEDFILEINFO>().read_unaligned() };
+        let version = if fixed.dwProductVersionMS != 0 || fixed.dwProductVersionLS != 0 {
+            (fixed.dwProductVersionMS, fixed.dwProductVersionLS)
+        } else {
+            (fixed.dwFileVersionMS, fixed.dwFileVersionLS)
+        };
+        let (major, minor) = ((version.0 >> 16) & 0xffff, version.0 & 0xffff);
+        let (build, revision) = ((version.1 >> 16) & 0xffff, version.1 & 0xffff);
+        if major != 0 || minor != 0 || build != 0 || revision != 0 {
+            return Some(if revision == 0 {
+                format!("{major}.{minor}.{build}")
+            } else {
+                format!("{major}.{minor}.{build}.{revision}")
+            });
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn windows_product_version(_path: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+mod release_executable_tests {
+    use super::resolve_release_executable;
+    use std::{fs, path::Path};
+    use tempfile::TempDir;
+
+    fn project() -> (TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace with spaces");
+        fs::create_dir_all(root.join("src-tauri/src")).unwrap();
+        fs::write(
+            root.join("src-tauri/Cargo.toml"),
+            "[package]\nname = \"sample-app\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src-tauri/tauri.conf.json"), "{}\n").unwrap();
+        (temp, root)
+    }
+
+    #[test]
+    fn resolves_release_executable_by_package_name_and_ignores_other_profiles() {
+        let (_temp, root) = project();
+        fs::create_dir_all(root.join("src-tauri/target/release/bundle/nsis")).unwrap();
+        fs::create_dir_all(root.join("src-tauri/target/debug")).unwrap();
+        fs::write(
+            root.join("src-tauri/target/release/sample-app.exe"),
+            b"release exe",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src-tauri/target/release/bundle/nsis/setup.exe"),
+            b"installer",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src-tauri/target/debug/sample-app.exe"),
+            b"debug exe",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_release_executable(&root).unwrap(),
+            Some(
+                root.join("src-tauri/target/release/sample-app.exe")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn honors_tauri_binary_name_and_cargo_target_directory() {
+        let (_temp, root) = project();
+        fs::write(
+            root.join("src-tauri/tauri.conf.json"),
+            r#"{"mainBinaryName":"Fabrica Desktop"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src-tauri/.cargo")).unwrap();
+        fs::write(
+            root.join("src-tauri/.cargo/config.toml"),
+            "[build]\ntarget-dir = \"custom output\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src-tauri/custom output/release")).unwrap();
+        let artifact = root.join("src-tauri/custom output/release/Fabrica Desktop.exe");
+        fs::write(&artifact, b"release exe").unwrap();
+        assert_eq!(
+            resolve_release_executable(&root).unwrap(),
+            Some(artifact.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn missing_release_executable_is_absent_and_bad_binary_names_cannot_escape_target() {
+        let (_temp, root) = project();
+        fs::write(
+            root.join("src-tauri/tauri.conf.json"),
+            r#"{"mainBinaryName":"..\\outside"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src-tauri/target/release/bundle/nsis")).unwrap();
+        fs::write(
+            root.join("src-tauri/target/release/bundle/nsis/setup.exe"),
+            b"installer",
+        )
+        .unwrap();
+        assert_eq!(resolve_release_executable(&root).unwrap(), None);
+        assert!(!Path::new(&root.join("outside.exe")).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_version_resource_from_canonical_project_release_executable_when_present() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        if let Some(executable) = resolve_release_executable(repository).unwrap() {
+            assert!(
+                super::windows_product_version(&executable).is_some(),
+                "{}",
+                executable.display()
+            );
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_release_executable_version(
+    app: AppHandle,
+    project_id: String,
+) -> Result<Option<ReleaseExecutableVersion>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = load_settings(&settings_path(&app)?)?;
+        let project = inventory::load(&project_inventory_path(&app)?, &settings.project_root)
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .ok_or_else(|| "The selected project is no longer available.".to_owned())?;
+        let root = PathBuf::from(project.path)
+            .canonicalize()
+            .map_err(|error| format!("Could not resolve project path: {error}"))?;
+        let Some(path) = resolve_release_executable(&root)? else {
+            return Ok(None);
+        };
+        let version = windows_product_version(&path);
+        Ok(Some(ReleaseExecutableVersion {
+            path: path.to_string_lossy().into_owned(),
+            version,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Release version lookup failed: {error}"))?
+}
 
 /// Execute the same versioned, headless protocol used by `fabrica-runner`.
 #[tauri::command]
@@ -1807,6 +2509,9 @@ pub fn run() {
             get_settings,
             get_project_inventory,
             get_project_icon,
+            run_project_git_action,
+            open_project_folder,
+            get_release_executable_version,
             start_affected_project_refresh,
             discover_workflow_skills,
             save_settings,
@@ -1848,6 +2553,328 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Navis-Fabrica");
+}
+
+#[cfg(test)]
+mod project_git_action_tests {
+    use super::{fast_forward_needed, parse_git_divergence};
+
+    #[test]
+    fn parses_git_ahead_behind_and_accepts_only_fast_forward_shapes() {
+        assert_eq!(parse_git_divergence("0\t3\n").unwrap(), (0, 3));
+        assert!(fast_forward_needed(0, 3).unwrap());
+        assert!(!fast_forward_needed(0, 0).unwrap());
+        assert!(!fast_forward_needed(2, 0).unwrap());
+        assert!(fast_forward_needed(2, 3).is_err());
+        assert!(parse_git_divergence("unknown").is_err());
+    }
+}
+
+#[cfg(test)]
+mod git_action_repository_tests {
+    use super::{execute_git_action, ProjectGitAction};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        root: TempDir,
+        repo: PathBuf,
+        seed: PathBuf,
+        remote: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("fabrica git actions ")
+                .tempdir_in(std::env::current_dir().unwrap())
+                .unwrap();
+            let remote = root.path().join("origin.git");
+            let remote_url = format!(
+                "file:///{}",
+                remote
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .replace(' ', "%20")
+            );
+            let seed = root.path().join("seed repo");
+            let repo = root.path().join("working repo with spaces");
+            git(
+                root.path(),
+                &["init", "--initial-branch=main", seed.to_str().unwrap()],
+            );
+            configure(&seed);
+            fs::write(seed.join("base.txt"), "base\n").unwrap();
+            git(&seed, &["add", "base.txt"]);
+            git(&seed, &["commit", "-m", "base"]);
+            let main_head = git(&seed, &["rev-parse", "HEAD"]);
+            let seed_url = format!(
+                "file:///{}",
+                seed.to_string_lossy()
+                    .replace('\\', "/")
+                    .replace(' ', "%20")
+            );
+            git(
+                root.path(),
+                &["clone", "--bare", &seed_url, remote.to_str().unwrap()],
+            );
+            git(&seed, &["remote", "add", "origin", &remote_url]);
+            git(
+                &seed,
+                &["update-ref", "refs/remotes/origin/main", &main_head],
+            );
+            git(&seed, &["branch", "--set-upstream-to=origin/main", "main"]);
+            git(&seed, &["switch", "-c", "feature/test"]);
+            fs::write(seed.join("feature.txt"), "feature\n").unwrap();
+            git(&seed, &["add", "feature.txt"]);
+            git(&seed, &["commit", "-m", "feature"]);
+            let feature_head = git(&seed, &["rev-parse", "HEAD"]);
+            git(
+                root.path(),
+                &[
+                    "--git-dir",
+                    remote.to_str().unwrap(),
+                    "fetch",
+                    &seed_url,
+                    "+refs/heads/feature/test:refs/heads/feature/test",
+                ],
+            );
+            git(
+                &seed,
+                &[
+                    "update-ref",
+                    "refs/remotes/origin/feature/test",
+                    &feature_head,
+                ],
+            );
+            git(
+                &seed,
+                &[
+                    "branch",
+                    "--set-upstream-to=origin/feature/test",
+                    "feature/test",
+                ],
+            );
+            git(
+                root.path(),
+                &[
+                    "clone",
+                    "--branch",
+                    "feature/test",
+                    &remote_url,
+                    repo.to_str().unwrap(),
+                ],
+            );
+            configure(&repo);
+            Self {
+                root,
+                repo,
+                seed,
+                remote,
+            }
+        }
+        fn push_feature(&self, file: &str) {
+            git(&self.seed, &["switch", "feature/test"]);
+            fs::write(self.seed.join(file), "remote\n").unwrap();
+            git(&self.seed, &["add", file]);
+            git(&self.seed, &["commit", "-m", "remote feature"]);
+            let seed_url = format!(
+                "file:///{}",
+                self.seed
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .replace(' ', "%20")
+            );
+            git(
+                self.root.path(),
+                &[
+                    "--git-dir",
+                    self.remote.to_str().unwrap(),
+                    "fetch",
+                    &seed_url,
+                    "+refs/heads/feature/test:refs/heads/feature/test",
+                ],
+            );
+        }
+        fn branch(&self) -> String {
+            git(&self.repo, &["branch", "--show-current"])
+        }
+        fn head(&self) -> String {
+            git(&self.repo, &["rev-parse", "HEAD"])
+        }
+    }
+    fn git(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+    fn configure(path: &Path) {
+        git(path, &["config", "user.name", "Fabrica Test"]);
+        git(path, &["config", "user.email", "fabrica@example.test"]);
+    }
+
+    #[test]
+    fn pull_fast_forwards_clean_checkout_and_noops_when_current() {
+        let fixture = Fixture::new();
+        let previous = fixture.head();
+        fixture.push_feature("remote-change.txt");
+        execute_git_action(&fixture.repo, ProjectGitAction::Pull).unwrap();
+        assert_eq!(fixture.branch(), "feature/test");
+        assert_ne!(fixture.head(), previous);
+        assert_eq!(fixture.head(), git(&fixture.seed, &["rev-parse", "HEAD"]));
+        execute_git_action(&fixture.repo, ProjectGitAction::Pull).unwrap();
+    }
+
+    #[test]
+    fn pull_rejects_divergence_dirty_detached_and_missing_upstream_without_switching() {
+        let fixture = Fixture::new();
+        fs::write(fixture.repo.join("local.txt"), "local\n").unwrap();
+        git(&fixture.repo, &["add", "local.txt"]);
+        git(&fixture.repo, &["commit", "-m", "local only"]);
+        let local_head = fixture.head();
+        fixture.push_feature("remote-only.txt");
+        assert!(execute_git_action(&fixture.repo, ProjectGitAction::Pull)
+            .unwrap_err()
+            .contains("diverged"));
+        assert_eq!(fixture.branch(), "feature/test");
+        assert_eq!(fixture.head(), local_head);
+        git(&fixture.repo, &["reset", "--hard", "origin/feature/test"]);
+        fs::write(fixture.repo.join("base.txt"), "dirty\n").unwrap();
+        assert!(execute_git_action(&fixture.repo, ProjectGitAction::Pull)
+            .unwrap_err()
+            .contains("uncommitted"));
+        assert_eq!(fixture.branch(), "feature/test");
+        git(&fixture.repo, &["checkout", "--", "base.txt"]);
+        git(&fixture.repo, &["checkout", "--detach"]);
+        assert!(execute_git_action(&fixture.repo, ProjectGitAction::Pull)
+            .unwrap_err()
+            .contains("attached branch"));
+        let empty = fixture.root.path().join("no-upstream");
+        git(
+            fixture.root.path(),
+            &["init", "--initial-branch=main", empty.to_str().unwrap()],
+        );
+        configure(&empty);
+        fs::write(empty.join("file.txt"), "x\n").unwrap();
+        git(&empty, &["add", "file.txt"]);
+        git(&empty, &["commit", "-m", "initial"]);
+        assert!(execute_git_action(&empty, ProjectGitAction::Pull)
+            .unwrap_err()
+            .contains("upstream"));
+    }
+
+    #[test]
+    fn main_creates_tracking_branch_when_missing_and_honors_configured_upstream() {
+        let fixture = Fixture::new();
+        execute_git_action(&fixture.repo, ProjectGitAction::Main).unwrap();
+        assert_eq!(fixture.branch(), "main");
+        assert_eq!(
+            git(
+                &fixture.repo,
+                &["rev-parse", "--abbrev-ref", "main@{upstream}"]
+            ),
+            "origin/main"
+        );
+        assert_eq!(fixture.head(), git(&fixture.seed, &["rev-parse", "main"]));
+
+        let fixture = Fixture::new();
+        git(&fixture.repo, &["switch", "-c", "main", "origin/main"]);
+        git(
+            &fixture.repo,
+            &["branch", "--set-upstream-to=origin/feature/test", "main"],
+        );
+        git(&fixture.repo, &["switch", "feature/test"]);
+        execute_git_action(&fixture.repo, ProjectGitAction::Main).unwrap();
+        assert_eq!(fixture.branch(), "main");
+        assert_eq!(
+            git(
+                &fixture.repo,
+                &["rev-parse", "--abbrev-ref", "main@{upstream}"]
+            ),
+            "origin/feature/test"
+        );
+        assert_eq!(
+            fixture.head(),
+            git(&fixture.seed, &["rev-parse", "feature/test"])
+        );
+    }
+
+    #[test]
+    fn main_prechecks_divergence_worktree_ownership_and_fetch_failure() {
+        let fixture = Fixture::new();
+        git(&fixture.repo, &["switch", "-c", "main", "origin/main"]);
+        git(&fixture.repo, &["switch", "main"]);
+        fs::write(fixture.repo.join("local-main.txt"), "local\n").unwrap();
+        git(&fixture.repo, &["add", "local-main.txt"]);
+        git(&fixture.repo, &["commit", "-m", "local main"]);
+        git(&fixture.repo, &["switch", "feature/test"]);
+        git(&fixture.seed, &["switch", "main"]);
+        fs::write(fixture.seed.join("remote-main.txt"), "remote\n").unwrap();
+        git(&fixture.seed, &["add", "remote-main.txt"]);
+        git(&fixture.seed, &["commit", "-m", "remote main"]);
+        let seed_url = format!(
+            "file:///{}",
+            fixture
+                .seed
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace(' ', "%20")
+        );
+        git(
+            fixture.root.path(),
+            &[
+                "--git-dir",
+                fixture.remote.to_str().unwrap(),
+                "fetch",
+                &seed_url,
+                "+refs/heads/main:refs/heads/main",
+            ],
+        );
+        let branch = fixture.branch();
+        let head = fixture.head();
+        assert!(execute_git_action(&fixture.repo, ProjectGitAction::Main)
+            .unwrap_err()
+            .contains("diverged"));
+        assert_eq!(fixture.branch(), branch);
+        assert_eq!(fixture.head(), head);
+
+        let other = fixture.root.path().join("other worktree");
+        git(
+            &fixture.repo,
+            &["worktree", "add", other.to_str().unwrap(), "main"],
+        );
+        assert!(execute_git_action(&fixture.repo, ProjectGitAction::Main)
+            .unwrap_err()
+            .contains("another worktree"));
+        git(
+            &fixture.repo,
+            &["worktree", "remove", other.to_str().unwrap()],
+        );
+        git(&fixture.repo, &["branch", "-D", "main"]);
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                fixture.root.path().join("missing.git").to_str().unwrap(),
+            ],
+        );
+        assert!(execute_git_action(&fixture.repo, ProjectGitAction::Main)
+            .unwrap_err()
+            .contains("fetch"));
+        assert_eq!(fixture.branch(), "feature/test");
+    }
 }
 
 #[tauri::command]

@@ -389,9 +389,45 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 /* Calm collection home */
 .my-projects { padding: 20px; }
 .my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 22px; margin: 24px 0; }
-.my-project-card { width: 100%; min-width: 0; text-align: left; padding: 26px; min-height: 220px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; cursor: pointer; }
+.my-project-card { position: relative; container-type: inline-size; width: 100%; min-width: 0; text-align: left; padding: 20px; min-height: 220px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; }
 .my-project-card:hover, .my-project-card.selected { border-color: #75b9ed; background: #1a2a3a; }
+.project-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.project-card-open { flex: 1 1 150px; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.project-card-open:focus-visible { outline: 2px solid #8cc5fa; outline-offset: 4px; border-radius: 4px; }
+.project-card-version { display: block; width: fit-content; margin-top: 4px; color: #d6e9fb !important; font-variant-numeric: tabular-nums; }
+.project-card-quick-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }
+.project-quick { width: 30px; height: 30px; padding: 0; color: #b7c6d7; cursor: pointer; }
+.project-quick:not(:disabled) { border-color: #568dbe; color: #d4ebff; box-shadow: 0 0 5px #4da8f044; text-shadow: 0 0 5px #73bdff66; }
+.project-quick:hover:not(:disabled), .project-quick:focus-visible:not(:disabled) { border-color: #8bcaff; background: #25405a; color: #f0f8ff; box-shadow: 0 0 8px #62b6ff88; text-shadow: 0 0 7px #8bcaffaa; }
+.project-quick:disabled { opacity: .42; cursor: pointer; }
+.project-quick svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 2px #73bdff88); }
+.project-quick:disabled { box-shadow: none; text-shadow: none; }
+.project-quick:disabled svg { filter: none; }
+.project-card-refresh svg.is-refreshing { animation: spin .85s linear infinite; }
+.project-card-refresh:disabled[aria-busy="true"] { opacity: .9; border-color: #8bcaff; background: #25405a; color: #f0f8ff; box-shadow: 0 0 8px #62b6ff88; }
+.project-card-refresh:disabled[aria-busy="true"] svg { filter: drop-shadow(0 0 3px #8bcaffaa); }
+.project-quick svg path:last-child { fill: none; }
+.project-main { font-size: 11px; font-weight: 700; letter-spacing: 0; }
+.project-card-menu { position: relative; }
+.project-card-menu > summary { list-style: none; }
+.project-card-menu > summary::-webkit-details-marker { display: none; }
+.project-card-menu-pop { position: absolute; z-index: 4; top: 34px; right: 0; display: grid; min-width: 142px; padding: 5px; border: 1px solid #3a4c61; border-radius: 8px; background: #111a25; box-shadow: 0 8px 24px #0008; }
+.project-card-menu-pop button, .project-card-menu-pop a { padding: 8px; border: 0; background: transparent; color: #dce8f5; text-align: left; text-decoration: none; font: inherit; font-size: 12px; cursor: pointer; }
+.project-card-menu-pop button:hover, .project-card-menu-pop a:hover { background: #24384c; }
+.project-card-menu-pop button:disabled { opacity: .5; cursor: pointer; }
+.project-card-action-status { display: block; margin-top: 6px; color: #a9d9ff; overflow-wrap: anywhere; font-size: 11px; }
+.project-card-refresh-error { display: block; margin-top: 6px; color: #f0bbc0; overflow-wrap: anywhere; font-size: 11px; }
+@container (max-width: 370px) {
+  .project-card-top { flex-wrap: wrap; }
+  .project-card-open { flex-basis: 100%; }
+  .project-card-quick-actions { width: 100%; justify-content: flex-end; }
+}
 .my-project-card h3 { font-size: 1.3rem; margin: 0 0 12px; }
+.project-card-open h3 { overflow-wrap: anywhere; }
+
+@media (prefers-reduced-motion: reduce) {
+  .project-card-refresh svg.is-refreshing { animation: none !important; transform: rotate(45deg); }
+}
 .my-project-card-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .my-project-card-heading h3 { margin: 0; }
 .my-project-icon { width: 36px; height: 36px; flex: 0 0 36px; border-radius: 8px; object-fit: contain; }

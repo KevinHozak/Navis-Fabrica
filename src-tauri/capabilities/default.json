@@ -49,6 +49,9 @@
     "allow-calibrate-routing",
     "allow-get-project-inventory",
     "allow-get-project-icon",
+    "allow-run-project-git-action",
+    "allow-open-project-folder",
+    "allow-get-release-executable-version",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

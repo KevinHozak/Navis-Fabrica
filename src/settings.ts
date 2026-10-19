@@ -161,6 +161,7 @@ export type ProjectEntry = {
   git: GitFacts;
   workflowPrerequisites: WorkflowPrerequisite[];
 };
+export type ReleaseExecutableVersion = { path: string; version: string | null };
 
 export type GitHubActivity = {
   owner: string;
@@ -303,6 +304,13 @@ export const isDesktopApp = () => isTauri();
 
 export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
 export const getProjectIcon = (projectId: string) => invoke<string | null>("get_project_icon", { projectId });
+export const getReleaseExecutableVersion = (projectId: string) => invoke<ReleaseExecutableVersion | null>("get_release_executable_version", { projectId });
+export async function runProjectGitAction(projectId: string, action: "pull" | "main" | "refresh"): Promise<ProjectEntry> {
+  const project = await invoke<ProjectEntry>("run_project_git_action", { projectId, action });
+  window.dispatchEvent(new CustomEvent<ProjectEntry>("fabrica-project-updated", { detail: project }));
+  return project;
+}
+export const openProjectFolder = (projectId: string) => invoke<void>("open_project_folder", { projectId });
 
 export const startProjectScan = (scanId: string, forceRefresh: boolean, maxDirectories?: number) =>
   invoke<void>("start_project_scan", { scanId, forceRefresh, maxDirectories: maxDirectories ?? null });

@@ -533,6 +533,148 @@ fn mutation_scope(cwd: &Path) -> String {
         .to_lowercase()
 }
 
+pub struct ExternalMutationGuard {
+    canonical_key: String,
+    app: AppHandle,
+    history_path: PathBuf,
+    run_id: String,
+    finished: bool,
+}
+
+impl ExternalMutationGuard {
+    pub fn finish(&mut self, success: bool, message: &str) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        let changed = if let Ok(mut state) = store().lock() {
+            state.mutating_paths.remove(&self.canonical_key);
+            if let Some(record) = state
+                .records
+                .iter_mut()
+                .find(|record| record.id == self.run_id)
+            {
+                record.state = if success { "completed" } else { "failed" }.into();
+                record.finished_at_ms = Some(now_ms());
+                record.latency_ms = Some(now_ms().saturating_sub(record.started_at_ms));
+                record.exit_code = Some(if success { 0 } else { 1 });
+                record.events.push(RunEvent {
+                    sequence: record.next_sequence,
+                    timestamp_ms: now_ms(),
+                    kind: if success { "completed" } else { "failed" }.into(),
+                    text: message.chars().take(2000).collect(),
+                });
+                record.next_sequence += 1;
+                let changed = record.clone();
+                persist_records(&self.history_path, &state.records)?;
+                Some(changed)
+            } else {
+                return Err("The Git action Activity record is missing.".into());
+            }
+        } else {
+            return Err("Could not access workflow runs to finish the Git action.".into());
+        };
+        self.finished = true;
+        if let Some(record) = changed {
+            let _ = self.app.emit("workflow-run-updated", record);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExternalMutationGuard {
+    fn drop(&mut self) {
+        let _ = self.finish(false, "Git action stopped before completion.");
+    }
+}
+
+pub fn reserve_external_mutation(
+    app: &AppHandle,
+    cwd: &Path,
+    action: &str,
+) -> Result<ExternalMutationGuard, String> {
+    let history = history_path(app)?;
+    let canonical_key = mutation_scope(cwd);
+    let mut state = store()
+        .lock()
+        .map_err(|_| "Could not access workflow runs.".to_string())?;
+    if state.records.is_empty() {
+        state.records = load_records(&history)?;
+    }
+    if state.records.iter().any(|record| {
+        mutation_scope(Path::new(&record.cwd)) == canonical_key
+            && matches!(
+                record.state.as_str(),
+                "queued" | "running" | "needsInput" | "cancelling"
+            )
+    }) {
+        return Err("A workflow is active for this project.".into());
+    }
+    if interrupted_process_owns_scope(&state.records, &canonical_key) {
+        return Err("A prior interrupted workflow process is still running for this repository or worktree.".into());
+    }
+    if !state.mutating_paths.insert(canonical_key.clone()) {
+        return Err("A repository operation is already active for this project.".into());
+    }
+    let run_id = format!(
+        "git-{}-{}",
+        now_ms(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let started_at_ms = now_ms();
+    let record = RunRecord {
+        id: run_id.clone(),
+        executable: "git".into(),
+        provider: None,
+        provider_profile_id: None,
+        model_id: None,
+        cwd: cwd.to_string_lossy().into_owned(),
+        thread_id: None,
+        process_id: None,
+        mutating: true,
+        timeout_seconds: 30,
+        state: "running".into(),
+        started_at_ms,
+        finished_at_ms: None,
+        latency_ms: None,
+        exit_code: None,
+        next_sequence: 2,
+        events: vec![RunEvent {
+            sequence: 1,
+            timestamp_ms: started_at_ms,
+            kind: "started".into(),
+            text: format!("Starting {action}."),
+        }],
+        workflow: Some(WorkflowRunMetadata {
+            action: action.into(),
+            operation_key: run_id.clone(),
+            intent: String::new(),
+            build_profile: None,
+            issue_url: None,
+            scope_paths: Vec::new(),
+            requested_effects: Vec::new(),
+            side_effects: None,
+            build_artifact: None,
+        }),
+        handoff: None,
+    };
+    state.records.insert(0, record.clone());
+    state.records.truncate(MAX_RUNS);
+    if let Err(error) = persist_records(&history, &state.records) {
+        state.records.retain(|entry| entry.id != run_id);
+        state.mutating_paths.remove(&canonical_key);
+        return Err(error);
+    }
+    drop(state);
+    let _ = app.emit("workflow-run-updated", record);
+    Ok(ExternalMutationGuard {
+        canonical_key,
+        app: app.clone(),
+        history_path: history,
+        run_id,
+        finished: false,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitWorktreeSnapshot {
     root: PathBuf,
@@ -895,10 +1037,13 @@ fn verify_workflow_repository(cwd: &Path, workflow: &WorkflowRunMetadata) -> Res
         .filter_map(|line| line.split_whitespace().nth(1))
         .filter_map(github_repository_from_remote)
         .collect::<HashSet<_>>();
-    if repositories.is_empty() {
-        return Err(
-            "Agent-backed issue and push workflows require a configured GitHub remote.".into(),
-        );
+    let requires_github_remote = workflow.action == "dev-work"
+        || workflow
+            .requested_effects
+            .iter()
+            .any(|effect| matches!(effect.as_str(), "push" | "createPullRequest"));
+    if repositories.is_empty() && requires_github_remote {
+        return Err("Issue and remote push workflows require a configured GitHub remote.".into());
     }
     if let Some(url) = &workflow.issue_url {
         let path = url.strip_prefix("https://github.com/").unwrap_or_default();
@@ -2957,6 +3102,11 @@ fn start_run(
                 "A prior interrupted workflow process is still running for this repository or worktree.".into(),
             );
         }
+        if state.mutating_paths.contains(&canonical_key) {
+            return Err(
+                "A repository operation is already active for this project or worktree.".into(),
+            );
+        }
         if request.mutating && !state.mutating_paths.insert(canonical_key.clone()) {
             return Err(
                 "A mutating workflow is already active for this repository or worktree.".into(),
@@ -3153,7 +3303,7 @@ fn start_run(
     Ok(record)
 }
 
-fn terminate_process_tree(child: &mut Child) {
+pub(crate) fn terminate_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         let id = child.id().to_string();
@@ -4211,6 +4361,72 @@ mod tests {
         };
 
         assert!(verify_reported_side_effects(fixture.path(), &workflow, &effects).is_ok());
+    }
+
+    #[test]
+    fn local_only_commit_workflow_allows_unborn_branch_and_verifies_local_receipt() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .unwrap()
+        };
+        let init = git(&["init", "--quiet", "--initial-branch=main"]);
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        assert!(git(&["config", "user.name", "Fixture User"])
+            .status
+            .success());
+        assert!(git(&["config", "user.email", "fixture@example.invalid"])
+            .status
+            .success());
+        fs::write(fixture.path().join("first.txt"), "initial content").unwrap();
+
+        let commit_only = WorkflowRunMetadata {
+            action: "dev-push".into(),
+            operation_key: "d".repeat(64),
+            intent: "Review and commit the selected initial file.".into(),
+            build_profile: None,
+            issue_url: None,
+            scope_paths: vec!["first.txt".into()],
+            requested_effects: vec!["commit".into()],
+            side_effects: None,
+            build_artifact: None,
+        };
+        validate_workflow_metadata(&commit_only).unwrap();
+        ensure_git_scope(fixture.path(), &commit_only.scope_paths).unwrap();
+        verify_workflow_repository(fixture.path(), &commit_only).unwrap();
+
+        assert!(git(&["add", "first.txt"]).status.success());
+        let commit = git(&["commit", "--quiet", "-m", "fixture initial commit"]);
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let effects = WorkflowSideEffects {
+            commit_sha: Some(sha),
+            remote_branch: None,
+            pull_request_url: None,
+            verified: false,
+            verification_message: None,
+        };
+        verify_reported_side_effects(fixture.path(), &commit_only, &effects).unwrap();
+
+        let mut push = commit_only;
+        push.requested_effects.push("push".into());
+        assert!(verify_workflow_repository(fixture.path(), &push)
+            .unwrap_err()
+            .contains("GitHub remote"));
     }
 
     #[test]

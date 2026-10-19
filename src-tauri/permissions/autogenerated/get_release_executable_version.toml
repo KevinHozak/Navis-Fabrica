@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-release-executable-version"
+description = "Enables the get_release_executable_version command without any pre-configured scope."
+commands.allow = ["get_release_executable_version"]
+
+[[permission]]
+identifier = "deny-get-release-executable-version"
+description = "Denies the get_release_executable_version command without any pre-configured scope."
+commands.deny = ["get_release_executable_version"]

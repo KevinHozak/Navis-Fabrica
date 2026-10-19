@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "navis-fabrica"
-version = "0.26.15"
+version = "0.26.19"
 dependencies = [
  "base64 0.22.1",
  "navis-fabrica-runner-core",
@@ -1978,6 +1978,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tempfile",
+ "toml 1.1.8+spec-1.1.0",
  "windows-sys 0.61.2",
 ]
 

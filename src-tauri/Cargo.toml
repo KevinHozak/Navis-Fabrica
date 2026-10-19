@@ -1,6 +1,6 @@
 [package]
 name = "navis-fabrica"
-version = "0.26.8"
+version = "0.26.9"
 description = "Navis-Fabrica desktop workshop"
 edition = "2021"
 
@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.22.1"
+quick-xml = "0.42.0"
 navis-fabrica-runner-core = { path = "../runner-core" }
 notify = "8.2.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }

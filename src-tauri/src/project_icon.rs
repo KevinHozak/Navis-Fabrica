@@ -125,26 +125,179 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn safe_svg(bytes: &[u8]) -> bool {
+    use quick_xml::events::Event;
+
+    if bytes.len() as u64 > MAX_ICON_BYTES {
+        return false;
+    }
     let Ok(svg) = std::str::from_utf8(bytes) else {
         return false;
     };
-    let lower = svg.to_ascii_lowercase();
-    let Some(svg_start) = lower.find("<svg") else {
+    let mut reader = quick_xml::Reader::from_str(svg);
+    let mut depth = 0usize;
+    let mut saw_root = false;
+    let mut closed_root = false;
+
+    loop {
+        let event = reader.read_event();
+        let is_empty = matches!(&event, Ok(Event::Empty(_)));
+        match event {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                if !validate_svg_element(&element) {
+                    return false;
+                }
+                let name = element.name();
+                let name = name.as_ref().as_bytes();
+                let local_name = name.rsplit(|byte| *byte == b':').next().unwrap_or(name);
+                if !saw_root {
+                    if local_name != b"svg" || reader.buffer_position() > 1024 {
+                        return false;
+                    }
+                    saw_root = true;
+                } else if closed_root {
+                    return false;
+                }
+                if local_name.eq_ignore_ascii_case(b"script")
+                    || local_name.eq_ignore_ascii_case(b"foreignObject")
+                    || local_name.eq_ignore_ascii_case(b"style")
+                    || local_name.eq_ignore_ascii_case(b"animate")
+                    || local_name.eq_ignore_ascii_case(b"set")
+                    || local_name.eq_ignore_ascii_case(b"animateTransform")
+                    || local_name.eq_ignore_ascii_case(b"animateMotion")
+                    || local_name.eq_ignore_ascii_case(b"discard")
+                {
+                    return false;
+                }
+                if is_empty {
+                    if depth == 0 {
+                        closed_root = true;
+                    }
+                } else {
+                    depth += 1;
+                }
+            }
+            Ok(Event::End(_)) => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    closed_root = true;
+                }
+            }
+            Ok(Event::Text(text)) => {
+                if depth == 0 && !text.as_ref().as_bytes().iter().all(u8::is_ascii_whitespace) {
+                    return false;
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if depth == 0 && !text.as_ref().as_bytes().iter().all(u8::is_ascii_whitespace) {
+                    return false;
+                }
+            }
+            Ok(Event::GeneralRef(_)) => return false,
+            Ok(Event::Decl(_)) if !saw_root => {}
+            Ok(Event::Decl(_)) => return false,
+            Ok(Event::DocType(_)) | Ok(Event::PI(_)) => return false,
+            Ok(Event::Comment(_)) => {}
+            Ok(Event::Eof) => break,
+            Err(_) => return false,
+        }
+    }
+    saw_root && closed_root && depth == 0
+}
+
+fn validate_svg_element(element: &quick_xml::events::BytesStart<'_>) -> bool {
+    let name = element.name();
+    let name = name.as_ref().as_bytes();
+    let local_name = name.rsplit(|byte| *byte == b':').next().unwrap_or(name);
+    if !local_name.eq_ignore_ascii_case(b"svg") && !local_name.iter().all(u8::is_ascii_alphanumeric)
+    {
         return false;
-    };
-    svg_start <= 1024
-        && ![
-            "<script",
-            "<foreignobject",
-            "<!doctype",
-            "<!entity",
-            "javascript:",
-        ]
-        .iter()
-        .any(|pattern| lower.contains(pattern))
-        && !lower.contains("href=\"http")
-        && !lower.contains("href='http")
-        && !lower.contains("url(http")
+    }
+    for attribute in element.attributes() {
+        let Ok(attribute) = attribute else {
+            return false;
+        };
+        let key = attribute.key.as_ref().as_bytes();
+        let key_lower = key.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+        let local_key = key_lower
+            .rsplit(|byte| *byte == b':')
+            .next()
+            .unwrap_or(&key_lower);
+        if key_lower.starts_with(b"on") || key_lower == b"xml:base" {
+            return false;
+        }
+        let Ok(value) = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) else {
+            return false;
+        };
+        let value = value.trim();
+        if local_key == b"href" && !is_internal_fragment(value) {
+            return false;
+        }
+        if key_lower == b"style" || is_css_presentation_attribute(&key_lower) {
+            if !safe_css_value(value) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_internal_fragment(value: &str) -> bool {
+    let value = value.trim();
+    value
+        .strip_prefix('#')
+        .is_some_and(|fragment| !fragment.trim().is_empty())
+}
+
+fn is_css_presentation_attribute(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"fill"
+            | b"stroke"
+            | b"filter"
+            | b"clip-path"
+            | b"mask"
+            | b"cursor"
+            | b"marker"
+            | b"marker-start"
+            | b"marker-mid"
+            | b"marker-end"
+    )
+}
+
+fn safe_css_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("@import")
+        || lower.contains("/*")
+        || lower.contains("*/")
+        || value.contains('\\')
+    {
+        return false;
+    }
+    let mut remaining = lower.as_str();
+    while let Some(index) = remaining.find("url") {
+        remaining = &remaining[index + 3..];
+        let remaining_trimmed = remaining.trim_start();
+        if !remaining_trimmed.starts_with('(') {
+            remaining = remaining_trimmed;
+            continue;
+        }
+        remaining = &remaining_trimmed[1..];
+        let Some(end) = remaining.find(')') else {
+            return false;
+        };
+        let target = remaining[..end]
+            .trim()
+            .trim_matches(|character| character == '\'' || character == '"')
+            .trim();
+        if !is_internal_fragment(target) {
+            return false;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    true
 }
 
 #[cfg(test)]
@@ -284,5 +437,141 @@ mod tests {
         assert!(!safe_svg(
             b"<svg><image href='https://example.test/logo.png'/></svg>"
         ));
+    }
+    #[test]
+    fn parses_svg_and_allows_internal_fragment_resources() {
+        assert!(safe_svg(b"<svg xmlns='http://www.w3.org/2000/svg'><defs><linearGradient id='g'/></defs><path d='M0 0' fill=\"url('#g')\"/><use href='#shape'/></svg>"));
+        assert!(safe_svg(b"<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'><use xlink:href='#shape'/></svg>"));
+    }
+
+    #[test]
+    fn rejects_spaced_remote_and_encoded_resource_references() {
+        assert!(!safe_svg(
+            b"<svg><image href = 'https://example.test/a.png'/></svg>"
+        ));
+        assert!(!safe_svg(b"<svg><image href='logo.png'/></svg>"));
+        assert!(!safe_svg(
+            b"<svg><image href='//example.test/a.png'/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><image href='data:image/png;base64,AAAA'/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><image href='https://example.test/a&amp;b.png'/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><image href=' &#x68;ttps://example.test/a.png '/></svg>"
+        ));
+        assert!(!safe_svg(b"<svg><image href='file:///tmp/a.png'/></svg>"));
+    }
+
+    #[test]
+    fn allows_entity_decoded_internal_fragment_references() {
+        assert!(safe_svg(b"<svg><use href='&#35;shape'/></svg>"));
+        assert!(safe_svg(b"<svg><path fill=\"url( '#paint' )\"/></svg>"));
+    }
+
+    #[test]
+    fn rejects_unsafe_css_mutations_imports_and_escapes() {
+        assert!(!safe_svg(
+            b"<svg><path style=\"fill: url(https://example.test/a)\"/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><path style=\"fill: url(logo.png)\"/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><path style=\"@import 'https://example.test/a.css'\"/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><path style=\"fill: url(\\\\23 paint)\"/></svg>"
+        ));
+        assert!(!safe_svg(b"<svg><path onload='alert(1)'/></svg>"));
+        assert!(!safe_svg(b"<svg xml:base='https://example.test/'/>"));
+        assert!(!safe_svg(
+            b"<svg><animate attributeName='href' to='https://example.test'/></svg>"
+        ));
+        assert!(!safe_svg(
+            b"<svg><style><![CDATA[path { fill: url(https://example.test/a) }]]></style></svg>"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_documents_and_active_markup() {
+        assert!(!safe_svg(b"<html><svg/></html>"));
+        assert!(!safe_svg(b"<svg><path></svg>"));
+        assert!(!safe_svg(b"<svg><script>alert(1)</script></svg>"));
+        assert!(!safe_svg(b"<svg><foreignObject/></svg>"));
+        assert!(!safe_svg(b"<!DOCTYPE svg><svg/>"));
+        assert!(!safe_svg(b"<?xml-stylesheet href='x.css'?><svg/>"));
+    }
+
+    #[test]
+    fn unsafe_logo_falls_through_to_safe_icon_png() {
+        let project = tempdir().unwrap();
+        let assets = project.path().join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(
+            assets.join("logo.svg"),
+            b"<svg><image href=' https://example.test/logo.png'/></svg>",
+        )
+        .unwrap();
+        let safe_icon = b"\x89PNG\r\n\x1a\nsafe-icon";
+        fs::write(assets.join("icon.png"), safe_icon).unwrap();
+        assert_eq!(
+            data_url(project.path()).unwrap(),
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(safe_icon)
+            )
+        );
+    }
+    #[test]
+    fn safe_svg_rejects_spaced_external_double_quoted_href() {
+        assert!(!safe_svg(
+            br#"<svg><a href = "https://example.com"/></svg>"#
+        ));
+    }
+
+    #[test]
+    fn safe_svg_rejects_spaced_css_url_external_target() {
+        assert!(!safe_svg(
+            br#"<svg><rect fill='url( "https://example.com" )'/></svg>"#
+        ));
+    }
+
+    #[test]
+    fn safe_svg_rejects_arbitrary_xlink_namespace_alias_external_href() {
+        assert!(!safe_svg(br#"<svg xmlns:link="http://www.w3.org/1999/xlink"><a link:href="https://example.com"/></svg>"#));
+    }
+
+    #[test]
+    fn safe_svg_accepts_alternate_xml_whitespace_around_root() {
+        assert!(safe_svg(b"\t\r\n<svg/>\r\n\t"));
+    }
+
+    #[test]
+    fn safe_svg_accepts_safe_inline_style_fragment_url() {
+        assert!(safe_svg(br#"<svg><rect style="fill: url('#id')"/></svg>"#));
+    }
+
+    #[test]
+    fn safe_svg_rejects_stray_text_outside_root() {
+        assert!(!safe_svg(b"text<svg/>"));
+        assert!(!safe_svg(b"<svg/>tail"));
+    }
+
+    #[test]
+    fn safe_svg_rejects_multiple_roots() {
+        assert!(!safe_svg(b"<svg/><svg/>"));
+    }
+
+    #[test]
+    fn safe_css_rejects_single_backslash_escape() {
+        assert!(!safe_css_value(r"url(\\68 ttps://example.com)"));
+    }
+
+    #[test]
+    fn safe_css_rejects_comment_obfuscation() {
+        assert!(!safe_css_value("url(/*x*/#safe)"));
     }
 }

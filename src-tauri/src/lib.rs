@@ -26,6 +26,7 @@ pub mod providers;
 mod routing;
 mod runs;
 mod scanner;
+mod storage;
 mod usage;
 
 static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
@@ -142,10 +143,7 @@ fn is_runner_supervisor_operation(operation: runner_core::Operation) -> bool {
 }
 
 fn default_runner_data_root(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map(|path| path.join("runner"))
-        .map_err(|error| format!("Could not resolve the app data directory: {error}"))
+    Ok(storage::data_root(app)?.join("runner"))
 }
 
 fn resolve_worker_executable(app: &AppHandle) -> Result<PathBuf, String> {
@@ -624,19 +622,11 @@ fn replace_settings_file(temporary: NamedTempFile, destination: &Path) -> Result
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let folder = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| format!("Could not locate app settings folder: {error}"))?;
-    Ok(folder.join(SETTINGS_FILE))
+    Ok(storage::config_root(app)?.join(SETTINGS_FILE))
 }
 
 fn project_inventory_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let folder = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| format!("Could not locate project inventory folder: {error}"))?;
-    Ok(folder.join(PROJECT_INVENTORY_FILE))
+    Ok(storage::config_root(app)?.join(PROJECT_INVENTORY_FILE))
 }
 
 #[tauri::command]
@@ -655,6 +645,11 @@ fn get_project_icon(app: AppHandle, project_id: String) -> Result<Option<String>
         .into_iter()
         .find(|project| project.id == project_id)
         .ok_or_else(|| "The selected project is no longer in the local inventory.".to_owned())?;
+    if let Some(icon) =
+        project_icon::override_data_url(&storage::config_root(&app)?, Path::new(&project.path))?
+    {
+        return Ok(Some(icon));
+    }
     Ok(project_icon::data_url(Path::new(&project.path)))
 }
 

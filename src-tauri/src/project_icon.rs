@@ -3,6 +3,76 @@ use std::fs;
 use std::path::Path;
 
 const MAX_ICON_BYTES: u64 = 512 * 1024;
+
+/// Optional private overrides, keyed by project path, with images confined to the data root.
+pub fn override_data_url(data_root: &Path, project_path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Overrides {
+        schema_version: u32,
+        projects: std::collections::HashMap<String, std::path::PathBuf>,
+    }
+    let file = match fs::File::open(data_root.join("logo-overrides.json")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Could not read logo overrides: {error}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 65_536 {
+        return Err("Logo overrides exceed 64 KiB.".into());
+    }
+    let overrides: Overrides =
+        serde_json::from_slice(&bytes).map_err(|e| format!("Invalid logo overrides: {e}"))?;
+    if overrides.schema_version != 1 {
+        return Err("Unsupported logo override schema.".into());
+    }
+    let project = project_path.canonicalize().map_err(|e| e.to_string())?;
+    let mut matching = overrides
+        .projects
+        .iter()
+        .filter(|(path, _)| Path::new(path).canonicalize().ok().as_ref() == Some(&project));
+    let Some((_, relative)) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("Multiple logo overrides match this project.".into());
+    }
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(
+            "Logo paths must be relative to Fabrica's data folder without parent segments.".into(),
+        );
+    }
+    let root = data_root.canonicalize().map_err(|e| e.to_string())?;
+    let path = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|e| format!("Logo is unavailable: {e}"))?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return Err("Logo must be a file inside Fabrica's data folder.".into());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_ICON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ICON_BYTES {
+        return Err("Logo must be nonempty and no larger than 512 KiB.".into());
+    }
+    let mime = image_mime(&bytes).ok_or("Unsupported or unsafe logo image.")?;
+    Ok(Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )))
+}
 const APP_ROOTS: &[&str] = &[
     "",
     "frontend",
@@ -573,5 +643,47 @@ mod tests {
     #[test]
     fn safe_css_rejects_comment_obfuscation() {
         assert!(!safe_css_value("url(/*x*/#safe)"));
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn shared_override_is_external_and_confined_to_data_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(data.path().join("logo.png"), b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let manifest = data.path().join("logo-overrides.json");
+        let write_map = |relative: &str| {
+            let mut projects = std::collections::HashMap::new();
+            projects.insert(first.path().to_string_lossy().to_string(), relative);
+            projects.insert(second.path().to_string_lossy().to_string(), relative);
+            fs::write(
+                &manifest,
+                serde_json::to_vec(&serde_json::json!({"schemaVersion": 1, "projects": projects}))
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        assert_eq!(override_data_url(data.path(), first.path()).unwrap(), None);
+        write_map("logo.png");
+        let icon = override_data_url(data.path(), first.path())
+            .unwrap()
+            .unwrap();
+        assert!(icon.starts_with("data:image/png;base64,"));
+        assert_eq!(
+            override_data_url(data.path(), second.path()).unwrap(),
+            Some(icon)
+        );
+        write_map("../logo.png");
+        assert!(override_data_url(data.path(), first.path()).is_err());
+        write_map("missing.png");
+        assert!(override_data_url(data.path(), first.path()).is_err());
+        fs::write(data.path().join("logo.png"), b"<svg><script/></svg>").unwrap();
+        write_map("logo.png");
+        assert!(override_data_url(data.path(), first.path()).is_err());
     }
 }

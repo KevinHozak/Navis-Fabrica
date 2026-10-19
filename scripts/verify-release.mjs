@@ -15,6 +15,7 @@ const cargoToml = readFileSync(resolve(root, "src-tauri/Cargo.toml"), "utf8");
 const cargoLock = readFileSync(resolve(root, "src-tauri/Cargo.lock"), "utf8");
 const settingsSource = readFileSync(resolve(root, "src-tauri/src/lib.rs"), "utf8");
 const runsSource = readFileSync(resolve(root, "src-tauri/src/runs.rs"), "utf8");
+const storageSource = readFileSync(resolve(root, "src-tauri/src/storage.rs"), "utf8");
 const appCrate = cargoToml.match(/^\[package\]\s+.*?^name\s*=\s*"([^"]+)"/ms);
 const cargoVersion = cargoToml.match(/^\[package\]\s+.*?^version\s*=\s*"([^"]+)"/ms);
 const lockedApp = appCrate
@@ -46,8 +47,10 @@ requireValue(bundle.windows?.certificateThumbprint == null && bundle.windows?.si
 requireValue(/^default\s*=\s*\[[^\]]*"custom-protocol"/m.test(cargoToml) && /^custom-protocol\s*=\s*\[[^\]]*"tauri\/custom-protocol"/m.test(cargoToml), "Release builds must enable Tauri's custom protocol so standalone executables load bundled frontend assets.");
 requireValue(tauri.identifier === "com.navis.fabrica", "Changing the application identifier would change the per-user data namespace.");
 requireValue(tauri.app?.appDirectoriesOverride == null, "Release builds must keep the existing app data/config directory layout.");
-requireValue(/fn settings_path\([\s\S]*?\.app_config_dir\(\)[\s\S]*?SETTINGS_FILE/.test(settingsSource), "Settings must continue to use Tauri's application config directory.");
-requireValue(/fn history_path\([\s\S]*?\.app_data_dir\(\)[\s\S]*?HISTORY_FILE/.test(runsSource), "Run history must continue to use Tauri's application data directory.");
+requireValue(/fn settings_path\([\s\S]*?storage::config_root\(app\)\?[\s\S]*?SETTINGS_FILE/.test(settingsSource), "Settings must use the configured desktop storage root.");
+requireValue(/fn history_path\([\s\S]*?storage::data_root\(app\)\?[\s\S]*?HISTORY_FILE/.test(runsSource), "Run history must use the configured desktop storage root.");
+requireValue(storageSource.includes("storage-location.json") && storageSource.includes("app_config_dir()") && storageSource.includes("app_data_dir()"), "Storage must retain the platform locator and legacy config/data fallbacks.");
+requireValue(/fn default_runner_data_root\([\s\S]*?storage::data_root\(app\)\?\.join\("runner"\)/.test(settingsSource), "Runner state must use the configured desktop storage root.");
 requireValue(/const SETTINGS_FILE: &str = "settings\.json"/.test(settingsSource), "The stable settings filename must remain unchanged.");
 requireValue(/const HISTORY_FILE: &str = "workflow-runs\.sqlite3"/.test(runsSource), "The stable run-history filename must remain unchanged.");
 requireValue(appPackage.scripts?.["release:verify"] === "node scripts/verify-release.mjs", "The release verification command is missing.");

@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 const HISTORY_FILE: &str = "workflow-runs.sqlite3";
 const MAX_RUNS: usize = 100;
@@ -1284,10 +1284,7 @@ fn verify_run_side_effects(app: &AppHandle, path: &Path, run_id: &str) {
 }
 
 pub fn history_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "Could not locate run history storage.".to_string())?;
+    let directory = crate::storage::data_root(app)?;
     fs::create_dir_all(&directory)
         .map_err(|_| "Could not create run history storage.".to_string())?;
     Ok(directory.join(HISTORY_FILE))

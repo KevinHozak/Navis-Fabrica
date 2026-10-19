@@ -4,7 +4,7 @@ Selected implementation phase: FAB-S002. Authorized 2026-10-18.
 
 Home opens maximized to a roomy, searchable collection of explicitly selected projects. Discovery provides candidates only; new clones never join automatically. Settings manages selection, showing names and full paths, with an explicit save and read-back. Existing favorites are reused as the saved collection; hidden/view preferences no longer decide home membership. Empty collections guide setup. Missing saved projects remain selected and visible in Settings for removal.
 
-Verified candidate directories under C:\Projects include DreamCatcher, GP-Grimoire, GP-Dev, Mimir, Navis-Fabrica, Navis-Protocol, Navis-Recon. These are reviewable suggestions, not proof of ownership or automatic selections. Other discovered projects remain unchecked unless the user selects them.
+Verified candidate directories under C:\Projects include Agents, DreamCatcher, GP-Data, GP-Grimoire, GP-Dev, Mimir, Navis-Fabrica, Navis-Protocol, Navis-Recon. These are reviewable suggestions, not proof of ownership or automatic selections. Other discovered projects remain unchecked unless the user selects them.
 
 Cards show name, branch, changed-file count, local issue total and workflow activity or needs-attention state. Unknown/loading/error states remain explicit; never fabricate zero. Changed filenames come from read-only Git porcelain status, including untracked files and renames. Cached scans without file data show unknown until refreshed. Local counts use the project's runner.json and shared issues-page API; missing/invalid configuration reports unavailable without creating files in the project.
 
@@ -16,7 +16,7 @@ Verification: TypeScript/frontend production build; native Rust checks and scann
 
 Folder discovery is manual in Settings. Never rescan the root on startup, timers, or content events. On startup re-inspect saved selected entries only. Content watcher ignores access and metadata-only notifications, coalesces writes for 350 ms with a two-second maximum batch window, and refreshes only affected saved selected entries. No overlap: one active scan and a bounded deduplicated follow-up queue. New clones remain outside the catalog until explicit rediscovery. Saving discovery settings marks data stale and requires rediscovery. Existing issue edits remain mounted while navigating.
 
-Candidate discovery and its cache retain local Git, other-host Git, and detected non-Git coding projects. A GitHub remote is not an ownership gate. Content notifications compare cached size/modified-time/directory stamps before re-inspecting a project, suppressing duplicate notifications as well as read/access events. Activity includes connected local batch state; unknown batch-to-project association is never guessed.
+Candidate discovery and its cache retain local Git repositories, including repositories with no remotes configured, other-host Git repositories, and detected non-Git coding projects. A GitHub remote is not an ownership gate. Content notifications compare cached size/modified-time/directory stamps before re-inspecting a project, suppressing duplicate notifications as well as read/access events. Activity includes connected local batch state; unknown batch-to-project association is never guessed.
 
 ## Verification and delivery
 

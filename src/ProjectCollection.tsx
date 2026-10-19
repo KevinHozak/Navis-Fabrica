@@ -45,7 +45,7 @@ export function ProjectCollection({ projects, manage = false, onSelect }: { proj
 export function ProjectCard({ project, runs, selected, onClick }: { project: ProjectEntry; runs: WorkflowRun[] | null; selected: boolean; onClick: () => void }) {
   const batch = useBatchActivity();
   const [icon, setIcon] = useState<string | null>(null);
-  const [issues, setIssues] = useState<string>("Loading…");
+  const [issues, setIssues] = useState({ epics: "Loading…", stories: "Loading…" });
   const [issueError, setIssueError] = useState("");
   useEffect(() => {
     let alive = true;
@@ -56,15 +56,31 @@ export function ProjectCard({ project, runs, selected, onClick }: { project: Pro
   }, [project.id, project.path]);
   useEffect(() => {
     let alive = true;
-    setIssues("Loading…"); setIssueError("");
-    if (!isDesktopApp()) { setIssues("Desktop required"); return; }
-    issueCommand<IssuePage>("issues-page", project.path, `${project.path}\\runner.json`, { limit: 1, offset: 0 }).then(page => { if (alive) setIssues(String(page.total)); }).catch(e => { if (alive) { setIssues("0"); setIssueError(String(e)); } });
+    setIssues({ epics: "Loading…", stories: "Loading…" }); setIssueError("");
+    if (!isDesktopApp()) { setIssues({ epics: "Desktop required", stories: "Desktop required" }); return; }
+    async function loadCounts() {
+      let epics = 0;
+      let stories = 0;
+      let total = 1;
+      for (let offset = 0; offset < total; offset += 100) {
+        const page = await issueCommand<IssuePage>("issues-page", project.path, `${project.path}\\runner.json`, { limit: 100, offset });
+        if (!alive) return;
+        if (page.total > 5000 || page.items.length > 100 || page.offset !== offset || (offset < page.total && !page.items.length)) throw new Error("Invalid or oversized issue page");
+        total = page.total;
+        for (const issue of page.items) {
+          if (issue.type === "epic") epics += 1;
+          else stories += 1;
+        }
+      }
+      if (alive) setIssues({ epics: String(epics), stories: String(stories) });
+    }
+    void loadCounts().catch(e => { if (alive) { setIssues({ epics: "Unavailable", stories: "Unavailable" }); setIssueError(String(e)); } });
     return () => { alive = false; };
   }, [project]);
   const relevant = runs?.filter(run => sameProjectPath(run.cwd, project.path)) ?? null;
   return <button className={`my-project-card${selected ? " selected" : ""}`} onClick={onClick} aria-pressed={selected}>
     <ProjectCardHeading name={project.name} icon={icon} /><small>{project.git.branch ?? "Branch unavailable"}{project.isWorktree ? " · Worktree" : ""}</small>
-    <dl><div><dt>Changed files</dt><dd>{project.git.changedFiles?.length ?? "Unavailable"}</dd></div><div title={issueError}><dt>Local issues</dt><dd>{issues}</dd></div></dl>
+    <dl><div><dt>Changed files</dt><dd>{project.git.changedFiles?.length ?? "Unavailable"}</dd></div><div title={issueError}><dt>Epics</dt><dd>{issues.epics}</dd></div><div title={issueError}><dt>Stories</dt><dd>{issues.stories}</dd></div></dl>
     <span>{activityLabel(relevant)}{batch?.projectPath && sameProjectPath(batch.projectPath, project.path) ? ` · Batch ${batch.needsAttention ? "needs attention" : batch.state}` : ""}</span>
   </button>;
 }

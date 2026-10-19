@@ -36,6 +36,10 @@ Remove generated artifacts only when they were created by this run and no prior/
 
 Stage explicit scoped paths and inspect the staged diff. Commit conventionally; push the issue branch and create/update its PR after reconciling existing remote state. Missing/failing required checks or acceptance evidence mean **draft**. An existing ready PR becomes draft when this workflow's new change removes its readiness evidence. Partial implementations use `Refs #N`, not an automatic closing keyword, until acceptance is met or the user explicitly authorizes a deferral/closure policy. Attach each created/updated working PR to the current chat. Verify remote branch/head, PR URL/state/draft status, and issue linkage after persistence. An already-merged issue with remaining manual evidence gets an evidence handoff, not duplicate implementation.
 
+### Authorized merge readback
+
+After an authorized merge, perform a separate read-only lookup of the same PR before reporting completion. Confirm its merged state and merge commit SHA; the merge command response alone is not verification. If readback is unavailable or disagrees with the intended PR, report merge verification as pending or blocked, preserve the observed result, and do not repeat the merge or expand scope.
+
 ## Bounded review and repair (dev-work)
 
 After draft publication, inspect review summaries, inline threads, conversations, required checks, and the current diff. If no reviewer result exists, perform a source-level audit yourself and record external review separately as pending/unavailable; do not imply an independent review happened. A new review request/comment is not required by this contract.

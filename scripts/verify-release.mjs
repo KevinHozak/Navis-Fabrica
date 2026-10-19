@@ -43,6 +43,7 @@ requireValue(bundle.windows?.webviewInstallMode?.silent === true, "WebView2 boot
 requireValue(tauri.app?.windows?.some((window) => window.title === `Navis-Fabrica · v${tauri.version}`), "The native window title must match the application release version.");
 requireValue(bundle.createUpdaterArtifacts !== true, "Updater artifacts must remain disabled until the update strategy is separately approved.");
 requireValue(bundle.windows?.certificateThumbprint == null && bundle.windows?.signCommand == null, "Release artifacts must not imply configured code signing.");
+requireValue(/^default\s*=\s*\[[^\]]*"custom-protocol"/m.test(cargoToml) && /^custom-protocol\s*=\s*\[[^\]]*"tauri\/custom-protocol"/m.test(cargoToml), "Release builds must enable Tauri's custom protocol so standalone executables load bundled frontend assets.");
 requireValue(tauri.identifier === "com.navis.fabrica", "Changing the application identifier would change the per-user data namespace.");
 requireValue(tauri.app?.appDirectoriesOverride == null, "Release builds must keep the existing app data/config directory layout.");
 requireValue(/fn settings_path\([\s\S]*?\.app_config_dir\(\)[\s\S]*?SETTINGS_FILE/.test(settingsSource), "Settings must continue to use Tauri's application config directory.");

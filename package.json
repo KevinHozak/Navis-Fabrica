@@ -1,7 +1,7 @@
 {
   "name": "navis-fabrica",
   "private": true,
-  "version": "0.26.38",
+  "version": "0.26.42",
   "type": "module",
   "packageManager": "npm@11.11.1",
   "engines": {
@@ -25,7 +25,9 @@
   "dependencies": {
     "@tauri-apps/api": "^2.12.3",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

@@ -22,7 +22,7 @@ Example opt-in check configuration (paths must be replaced with existing local f
     "--repo",
     ".",
     "--record",
-    "C:/Workflow/runs/FAB-L008.json"
+    "C:/Workflow/runs/FAB-S010.json"
   ],
   "cwd": ".",
   "timeout_ms": 30000,

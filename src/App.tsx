@@ -1,4 +1,4 @@
-import { ActivityEntry, sameProjectPath } from "./Activity";
+import { sameProjectPath } from "./Activity";
 import { mergeRefreshPaths as mergePaths, settleRefreshPaths, withoutRefreshPaths as withoutPaths } from "./projectRefreshState";
 import { ProjectCollection } from "./ProjectCollection";
 import { useEffect, useRef, useState } from "react";
@@ -7,6 +7,9 @@ import { ProvidersPanel } from "./ProvidersPanel";
 import { RunsPanel } from "./RunsPanel";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
 import { BatchRunnerPanel } from "./BatchRunnerPanel";
+import { ProjectView } from "./ProjectView";
+import { BrowserIcon } from "./BrowserIcon";
+import { parseRoute, routeHash, routeKey, routeTitle, type AppRoute } from "./navigation";
 import {
   cancelProjectScan,
   getProjectInventory,
@@ -24,32 +27,39 @@ import {
   startAffectedProjectRefresh,
 } from "./settings";
 
-type Section = "projects" | "local-issues" | "batches" | "runs" | "providers" | "settings";
 type ScanStatus = "idle" | "scanning" | "cancelling" | "complete" | "cancelled" | "error";
 type InventoryFreshness = "loading" | "saved" | "partial" | "refreshing" | "current" | "stale";
 
-const sections: { id: Section; label: string; icon: string }[] = [
-  { id: "projects", label: "My Projects", icon: "◫" },
-  { id: "local-issues", label: "Local issues", icon: "☷" },
-  { id: "batches", label: "Runner batches", icon: "▷" },
-  { id: "runs", label: "Activity", icon: "↗" },
-  { id: "providers", label: "Providers", icon: "◇" },
-  { id: "settings", label: "Settings", icon: "⚙" },
-];
+type AppHistoryState = { fabricaNavigation?: true; index?: number; maxIndex?: number; scrollY?: number; scrollTargets?: Record<string, number> };
 
-function sectionFromHash(): Section {
-  const candidate = window.location.hash.slice(1);
-  return sections.some((section) => section.id === candidate) ? (candidate as Section) : "projects";
+function routeFromHash(hash: string): AppRoute {
+  return parseRoute(hash) ?? { section: "projects" };
+}
+
+function isIssueRoute(route: AppRoute): boolean {
+  return route.section === "epics-stories" || route.section === "local-issues";
+}
+
+function isProjectRoute(route: AppRoute): boolean {
+  return route.section === "project" || route.section === "changes" || route.section === "build";
 }
 
 function App() {
-  const [section, setSection] = useState<Section>(sectionFromHash);
+  const [route, setRoute] = useState<AppRoute>(() => routeFromHash(window.location.hash));
+  const routeRef = useRef(route);
+  const [mountedIssueRoutes, setMountedIssueRoutes] = useState<AppRoute[]>(() => isIssueRoute(route) ? [route] : []);
+  const [visitedProjectIds, setVisitedProjectIds] = useState<string[]>(() => isProjectRoute(route) && route.projectId ? [route.projectId] : []);
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+  const dirtyEditors = useRef(new Map<string, boolean>());
+  const historyIndex = useRef(0);
+  const maxHistoryIndex = useRef(0);
+  const ignoreNextPop = useRef(false);
   const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
   const [scanListenersReady, setScanListenersReady] = useState(false);
   const [scanId, setScanId] = useState("");
   const [progress, setProgress] = useState<ProjectScanProgress | null>(null);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
   const [scanDurationMs, setScanDurationMs] = useState<number | null>(null);
   const [firstProjectMs, setFirstProjectMs] = useState<number | null>(null);
@@ -72,6 +82,61 @@ function App() {
   const beginScanRef = useRef<(forceRefresh: boolean, maxDirectories?: number) => void>(() => undefined);
   const beginAffectedRefreshRef = useRef<(paths: string[]) => void>(() => undefined);
   const desktop = isDesktopApp();
+  routeRef.current = route;
+
+  function rememberRoute(next: AppRoute) {
+    setRoute(next);
+    routeRef.current = next;
+    if (isIssueRoute(next)) setMountedIssueRoutes(current => current.some(item => routeKey(item) === routeKey(next)) ? current : [...current, next]);
+    if (isProjectRoute(next) && next.projectId) setVisitedProjectIds(current => current.includes(next.projectId!) ? current : [...current, next.projectId!]);
+  }
+
+  function updateNavigationButtons() {
+    setCanGoBack(historyIndex.current > 0);
+    setCanGoForward(historyIndex.current < maxHistoryIndex.current);
+  }
+
+  function hasDirtyIssueEditors() {
+    return [...dirtyEditors.current.values()].some(Boolean);
+  }
+
+  function allowNavigation(): boolean {
+    return !hasDirtyIssueEditors() || window.confirm("You have unsaved issue edits. Continue? Your edits will be kept open.");
+  }
+
+  function navigateToHash(hash: string) {
+    const next = parseRoute(hash);
+    if (!next || hash === window.location.hash || !allowNavigation()) return;
+    const currentIndex = historyIndex.current;
+    const nextIndex = currentIndex + 1;
+    const currentState = window.history.state as AppHistoryState | null;
+    const currentEntry = { ...(currentState ?? {}), fabricaNavigation: true as const, index: currentIndex, maxIndex: nextIndex, scrollY: window.scrollY,
+      scrollTargets: Object.fromEntries([...document.querySelectorAll<HTMLElement>("[data-fabrica-history-scroll]")].map(element => [element.dataset.fabricaHistoryScroll ?? "", element.scrollTop])) };
+    window.history.replaceState(currentEntry, "", window.location.href);
+    window.history.pushState({ fabricaNavigation: true, index: nextIndex, maxIndex: nextIndex, scrollY: 0, scrollTargets: {} }, "", hash);
+    historyIndex.current = nextIndex;
+    maxHistoryIndex.current = nextIndex;
+    window.sessionStorage.setItem("fabrica-history-max-index", String(nextIndex));
+    updateNavigationButtons();
+    rememberRoute(next);
+    window.scrollTo(0, 0);
+  }
+
+  function navigateToRoute(next: AppRoute) { navigateToHash(routeHash(next)); }
+
+  function restoreHistoryScroll(state: AppHistoryState | null) {
+    window.requestAnimationFrame(() => {
+      window.scrollTo(0, state?.scrollY ?? 0);
+      for (const element of document.querySelectorAll<HTMLElement>("[data-fabrica-history-scroll]")) {
+        const key = element.dataset.fabricaHistoryScroll ?? "";
+        const top = state?.scrollTargets?.[key];
+        if (typeof top === "number") element.scrollTop = top;
+      }
+    });
+  }
+
+  function goBack() { if (historyIndex.current > 0) window.history.back(); }
+  function goForward() { if (historyIndex.current < maxHistoryIndex.current) window.history.forward(); }
 
   function failCurrentScan(error: unknown) {
     const failedPaths = mergePaths([...scanPaths.current.values()].flat(), refreshAfterScan.current);
@@ -89,11 +154,83 @@ function App() {
   }
 
   useEffect(() => {
-    const handleNavigation = () => {
-      setSection(sectionFromHash());
+    const existing = window.history.state as AppHistoryState | null;
+    if (existing?.fabricaNavigation && typeof existing.index === "number") {
+      historyIndex.current = existing.index;
+      maxHistoryIndex.current = Math.max(existing.index, Number(window.sessionStorage.getItem("fabrica-history-max-index")) || existing.index, existing.maxIndex ?? existing.index);
+    } else {
+      historyIndex.current = 0;
+      maxHistoryIndex.current = 0;
+      window.sessionStorage.setItem("fabrica-history-max-index", "0");
+      const hash = window.location.hash || "#projects";
+      window.history.replaceState({ fabricaNavigation: true, index: 0, maxIndex: 0, scrollY: window.scrollY, scrollTargets: {} }, "", hash);
+    }
+    updateNavigationButtons();
+    const onPopState = (event: PopStateEvent) => {
+      const state = event.state as AppHistoryState | null;
+      const priorIndex = historyIndex.current;
+      if (ignoreNextPop.current) {
+        ignoreNextPop.current = false;
+        historyIndex.current = state?.index ?? priorIndex;
+        updateNavigationButtons();
+        restoreHistoryScroll(state);
+        return;
+      }
+      const nextIndex = state?.fabricaNavigation ? state.index ?? priorIndex : 0;
+      if (!allowNavigation()) {
+        ignoreNextPop.current = true;
+        window.history.go(priorIndex - nextIndex);
+        return;
+      }
+      historyIndex.current = nextIndex;
+      updateNavigationButtons();
+      rememberRoute(routeFromHash(window.location.hash));
+      restoreHistoryScroll(state);
     };
-    window.addEventListener("hashchange", handleNavigation);
-    return () => window.removeEventListener("hashchange", handleNavigation);
+    window.history.scrollRestoration = "manual";
+    window.addEventListener("popstate", onPopState);
+    return () => { window.removeEventListener("popstate", onPopState); window.history.scrollRestoration = "auto"; };
+  }, []);
+
+  useEffect(() => {
+    let frame = 0;
+    const captureScroll = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        const state = window.history.state as AppHistoryState | null;
+        if (!state?.fabricaNavigation) return;
+        window.history.replaceState({ ...state, scrollY: window.scrollY,
+          scrollTargets: Object.fromEntries([...document.querySelectorAll<HTMLElement>("[data-fabrica-history-scroll]")].map(element => [element.dataset.fabricaHistoryScroll ?? "", element.scrollTop])) }, "", window.location.href);
+      });
+    };
+    window.addEventListener("scroll", captureScroll, { passive: true, capture: true });
+    return () => { window.removeEventListener("scroll", captureScroll, true); if (frame) window.cancelAnimationFrame(frame); };
+  }, []);
+
+  useEffect(() => {
+    const onClick = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const anchor = target.closest<HTMLAnchorElement>('a[href^="#"]');
+      if (!anchor || anchor.target === "_blank" || anchor.hasAttribute("download")) return;
+      if (!parseRoute(anchor.getAttribute("href") ?? "")) return;
+      event.preventDefault();
+      navigateToHash(anchor.getAttribute("href") ?? "");
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, [navigateToHash]);
+
+  useEffect(() => {
+    const onDirty = (event: Event) => {
+      const detail = (event as CustomEvent<{ key: string; dirty: boolean }>).detail;
+      if (!detail || typeof detail.key !== "string") return;
+      dirtyEditors.current.set(detail.key, detail.dirty === true);
+    };
+    window.addEventListener("fabrica-issue-edit-state", onDirty);
+    return () => window.removeEventListener("fabrica-issue-edit-state", onDirty);
   }, []);
 
   useEffect(() => {
@@ -296,9 +433,9 @@ function App() {
     return () => window.removeEventListener("fabrica-collection-saved", refreshCollection);
   }, [desktop]);
 
-  const current = sections.find((item) => item.id === section) ?? sections[0];
-  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const selectedProject = projects.find(project => project.id === route.projectId) ?? null;
   const scanning = scanStatus === "scanning" || scanStatus === "cancelling";
+  const title = routeTitle(route, selectedProject?.name);
   const freshnessLabel = inventoryFreshness === "loading" ? "Loading saved projects…"
     : inventoryFreshness === "saved" ? "Saved project collection"
       : inventoryFreshness === "partial" ? "Saved project list · changed repositories refreshed"
@@ -391,68 +528,50 @@ function App() {
   beginScanRef.current = (forceRefresh, maxDirectories) => { void beginScan(forceRefresh, maxDirectories); };
   beginAffectedRefreshRef.current = (paths) => { void beginAffectedRefresh(paths); };
 
-  return (
-    <div className={`app-shell${section === "runs" ? " activity-shell" : ""}`}>
+  return <div className={`app-shell${route.section === "runs" ? " activity-shell" : ""}`}>
       <a className="skip-link" href="#main-content" onClick={(event) => { event.preventDefault(); document.getElementById("main-content")?.focus(); }}>Skip to content</a>
-      <aside className="sidebar" aria-label="Application navigation">
-        <a className="brand" href="#projects" aria-label="Navis-Fabrica home">
-          <img className="brand-mark" src={new URL("../src-tauri/icons/icon.png", import.meta.url).href} alt="" width={34} height={34} />
-          <span className="brand-copy"><strong>navis</strong><span>FABRICA</span></span>
-        </a>
-
-        <div className="workspace-label">WORKSPACE</div>
-        <nav className="primary-nav" aria-label="Main navigation">
-          {sections.filter(item => ["projects", "runs", "settings"].includes(item.id)).map((item) => (
-            <a key={item.id} className={`nav-link${section === item.id ? " active" : ""}`} href={`#${item.id}`} aria-current={section === item.id ? "page" : undefined}>
-              <span className="nav-icon" aria-hidden="true">{item.icon}</span>{item.label}
-              {section === item.id && <span className="nav-indicator" aria-hidden="true" />}
-            </a>
-          ))}
-        </nav>
-
-        <div className="sidebar-bottom">
-          <div className="local-card">
-            <span className="local-dot" aria-hidden="true" />
-            <div><strong>Local workspace</strong><span>On this device</span></div>
-          </div>
-        </div>
-      </aside>
-
-      <div className="main-column">
-        <header className="toolbar">
-          <div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-slash">/</span><strong>{current.label}</strong></div>
-          <div className="toolbar-actions"><ActivityEntry /></div>
-        </header>
-
-        <main id="main-content" className={`content${section === "projects" ? " content-projects" : section === "runs" ? " content-activity" : ""}`} tabIndex={-1}>
-          {section !== "projects" && <div className="page-heading">
-            <div>
-              <p className="eyebrow">YOUR WORKSPACE</p>
-              <h1>{current.label}</h1>
-              <p className="page-subtitle">{section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : section === "runs" ? "View running and completed work." : "Choose a project to start work."}</p>
-            </div>
-            {section === "settings" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
-              <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Rediscover project folders" : "Discover project folders"}
-            </button>}
-            {section === "settings" && <p role="status">{scanning ? "Discovering folders…" : scanError || freshnessLabel}</p>}{section === "settings" && Boolean(scanResult?.errors.length) && <details><summary>Some folders could not be inspected</summary><ul>{scanResult?.errors.map((error,index) => <li key={index}>{error}</li>)}</ul></details>}
-          </div>}
-
-          <div hidden={section !== "projects"}>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} /></div>
-          <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
-          <div hidden={section !== "batches"}><BatchRunnerPanel /></div>
-          {section === "local-issues" || section === "batches" ? null : section === "settings" ? (
-            <><details className="panel advanced-settings"><summary>My Projects</summary><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} /></details><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
-          ) : section === "providers" ? (
-            <ProvidersPanel />
-          ) : section === "runs" ? desktop ? (
-            <RunsPanel mode="activity" issue={null} />
-          ) : (
-            <section className="panel empty-state"><h2>Activity</h2><p>Run history is available in the desktop app.</p></section>
-          ) : null}
-        </main>
+    <header className="browser-toolbar">
+      <nav className="toolbar-group toolbar-left" aria-label="Browser navigation">
+        <button className="toolbar-icon-button" type="button" title="Back" aria-label="Back" disabled={!canGoBack} onClick={goBack}><BrowserIcon name="back" /></button>
+        <button className="toolbar-icon-button" type="button" title="Forward" aria-label="Forward" disabled={!canGoForward} onClick={goForward}><BrowserIcon name="forward" /></button>
+        <a className="toolbar-icon-button" href="#projects" title="Home" aria-label="Home"><BrowserIcon name="home" /></a>
+      </nav>
+      <div className="toolbar-context" aria-live="polite">{title}</div>
+      <nav className="toolbar-group toolbar-right" aria-label="Workspace tools">
+        <a className="toolbar-icon-button" href={route.projectId ? `#runs?project=${encodeURIComponent(route.projectId)}` : "#runs"} title="Activity" aria-label="Activity"><BrowserIcon name="activity" /></a>
+        <a className="toolbar-icon-button" href="#settings" title="Settings" aria-label="Settings"><BrowserIcon name="settings" /></a>
+      </nav>
+    </header>
+    <main id="main-content" className={`content browser-content${route.section === "runs" ? " content-activity" : ""}`} tabIndex={-1}>
+      <div className="route-layer" hidden={route.section !== "projects"}>
+        {watchError && <p role="status">Automatic content updates are unavailable. Use Settings to refresh.</p>}
+        {!desktop && <p className="scan-notice">Browser preview: native discovery and Git details require the desktop app.</p>}
+        <ProjectCollection projects={projects} onOpenProject={project => navigateToRoute({ section: "project", projectId: project.id })} onOpenChanges={project => navigateToRoute({ section: "changes", projectId: project.id })} onOpenBuild={project => navigateToRoute({ section: "build", projectId: project.id })} onOpenIssues={(project, type) => navigateToRoute({ section: "epics-stories", projectId: project.id, issueType: type })} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} />
       </div>
-    </div>
-  );
+      {visitedProjectIds.map(id => {
+        const project = projects.find(item => item.id === id);
+        if (!project) return null;
+        const active = route.projectId === id && isProjectRoute(route);
+        return <div className="route-layer" hidden={!active} key={`project:${id}`}><ProjectView project={project} section={active ? route.section as "project" | "changes" | "build" : "project"} /></div>;
+      })}
+      {mountedIssueRoutes.map(issueRoute => {
+        const project = projects.find(item => item.id === issueRoute.projectId);
+        const active = isIssueRoute(route) && routeKey(issueRoute) === routeKey(route);
+        return <div className="route-layer" hidden={!active} key={routeKey(issueRoute)}>{issueRoute.section === "epics-stories" && project ? <LocalIssuesPanel defaultPath={project.path} initialType={issueRoute.issueType ?? "epic"} autoLoad title={`${project.name} · Epics & Stories`} navigationKey={routeKey(issueRoute)} /> : issueRoute.section === "local-issues" ? <LocalIssuesPanel defaultPath={project?.path ?? projectRoot} navigationKey={routeKey(issueRoute)} /> : <section className="panel"><p>Select a project to browse epics and stories.</p><a href="#projects">Home</a></section>}</div>;
+      })}
+      <div className="route-layer" hidden={route.section !== "batches"}><BatchRunnerPanel /></div>
+      <div className={`route-layer${route.section === "runs" ? " activity-workspace" : ""}`} hidden={route.section !== "runs"}>{desktop ? <RunsPanel mode="activity" issue={null} project={selectedProject ?? undefined} /> : <section className="panel empty-state"><h2>Activity</h2><p>Run history is available in the desktop app.</p></section>}</div>
+      <div className="route-layer settings-page" hidden={route.section !== "settings"}>
+        <div className="settings-page-heading"><div><p className="eyebrow">WORKSPACE</p><h1>Settings</h1></div><button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>{scanning ? "Cancel scan" : projects.length ? "Refresh projects" : "Discover projects"}</button></div>
+        <p role="status">{scanning ? "Discovering folders…" : scanError || freshnessLabel}</p>
+        {Boolean(scanResult?.errors.length) && <details className="panel"><summary>Folders with inspection errors</summary><ul>{scanResult?.errors.map((error, index) => <li key={index}>{error}</li>)}</ul></details>}
+        <details className="settings-section" open><summary>Projects</summary><ProjectCollection projects={projects} manage onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} /></details>
+        <details className="settings-section"><summary>Providers</summary><ProvidersPanel /></details>
+        <details className="settings-section"><summary>Workspace</summary><SettingsPanel /></details>
+      </div>
+      <div className="route-layer" hidden={route.section !== "providers"}><ProvidersPanel /></div>
+    </main>
+  </div>;
 }
 
 export default App;

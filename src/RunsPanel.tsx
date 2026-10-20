@@ -119,7 +119,7 @@ export function RunsPanel({ defaultCwd = "", project, issue, mode = "actions" }:
       : "No configured provider/model route is selected.");
   }).catch(() => { setSelectedProviderKind(null); setSelectedProviderId(null); setRouteConfirmation("The saved provider route could not be loaded."); }); }, []);
   useEffect(() => { if (mode !== "actions") return; discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
-  const visibleRuns = useMemo(() => [...(mode === "activity" ? runs : runs.filter(run => sameProjectPath(run.cwd, defaultCwd)))].sort((a, b) => b.startedAtMs - a.startedAtMs), [runs, mode, defaultCwd]);
+  const visibleRuns = useMemo(() => [...(mode === "activity" && !project ? runs : runs.filter(run => sameProjectPath(run.cwd, project?.path ?? defaultCwd)))].sort((a, b) => b.startedAtMs - a.startedAtMs), [runs, mode, defaultCwd, project?.path]);
   const selected = useMemo(() => visibleRuns.find((run) => run.id === selectedId) ?? visibleRuns[0] ?? null, [visibleRuns, selectedId]);
 
   useEffect(() => {
@@ -458,13 +458,13 @@ export function RunsPanel({ defaultCwd = "", project, issue, mode = "actions" }:
         <div className="run-history-actions"><button className="button button-secondary" type="button" disabled={historyBusy} onClick={() => { void exportDiagnostics(); }}>{historyBusy ? "Working…" : "Export redacted diagnostics"}</button><button className="button button-secondary" type="button" disabled={historyBusy || visibleRuns.every((run) => activeStates.has(run.state))} onClick={() => deleteHistoryDialog.current?.showModal()}>Delete completed history</button></div>
         {historyMessage && <p className="run-history-feedback" role="status" aria-live="polite">{historyMessage}</p>}
         <div className="panel-rule" />
-        <div className="run-history-list" tabIndex={0} role="region" aria-label="Run history">
+        <div className="run-history-list" data-fabrica-history-scroll="activity-list" tabIndex={0} role="region" aria-label="Run history">
         {visibleRuns.length ? visibleRuns.map((run) => <button key={run.id} type="button" className={`run-list-item${selected?.id === run.id ? " selected" : ""}`} onClick={() => { setSelectedId(run.id); setOutputRequest({ runId: run.id }); }}>
           <strong>{run.workflow?.action ?? run.executable.split(/[\\/]/).pop()}</strong><span>{run.state}{run.mutating ? " · mutating" : " · read only"}</span><small>{displayDirectoryPath(run.cwd)}</small>
         </button>) : <p className="registry-context-note">No runs yet.</p>}
         </div>
       </section>
-      <section ref={detailRef} tabIndex={0} className="panel run-detail-panel" aria-labelledby="run-detail-title">
+      <section ref={detailRef} data-fabrica-history-scroll="activity-detail" tabIndex={0} className="panel run-detail-panel" aria-labelledby="run-detail-title">
         <div className="panel-heading"><div><h2 id="run-detail-title">{selected?.workflow?.action ?? (selected ? selected.executable : "Run output")}</h2><p>{selected ? `${selected.state} · ${displayDirectoryPath(selected.cwd)}` : "Select a run to view its output and results."}</p></div>
           {selected && activeStates.has(selected.state) && <button className="button button-secondary" type="button" onClick={() => { void cancel(selected.id); }}>Cancel run</button>}
         </div><div className="panel-rule" />

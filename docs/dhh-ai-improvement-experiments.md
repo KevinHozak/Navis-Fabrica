@@ -20,7 +20,7 @@ Reduce the effort of finding decisions and evaluating outcomes before increasing
 | Curated defaults | [Product plan](product-plan.md) defines project-aware workflow recipes and useful unsupported-action explanations. This does not prove every stack/action is supported. | Walk through work, push and build on representative projects. Record choice points and prerequisite/scope confusion. Change presentation only where observed friction warrants it, preserving effect scope and capability checks. |
 | Responsiveness | `src/App.tsx` records first-project and full-scan duration. [Architecture](architecture.md) has provisional performance targets. | Record five cold and five warm observations on a documented Windows setup from project selection to first useful result. Keep this distinct from scan timing. Report samples and median/range; identify the dominant delay before choosing an optimization. |
 
-Inspection establishes source coverage, not fresh native UI or performance acceptance. [Issue status](../issues/status.md) retains FAB-L011.4 intervention accounting as partial and GP-109 manual acceptance as open. Extend that evidence rather than duplicate its work. [FAB-S001](../issues/FAB-S001.md) already requests runtime-bound model evaluation, latency and usage evidence; this proposal adds no shortlist.
+Inspection establishes source coverage, not fresh native UI or performance acceptance. [Issue status](../issues/status.md) retains FAB-S013.4 intervention accounting as partial and GP-109 manual acceptance as open. Extend that evidence rather than duplicate its work. [FAB-S001](../issues/FAB-S001.md) already requests runtime-bound model evaluation, latency and usage evidence; this proposal adds no shortlist.
 
 ## Evaluation and reusable prompt
 

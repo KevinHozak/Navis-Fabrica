@@ -388,14 +388,19 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 
 /* Calm collection home */
 .my-projects { padding: 20px; }
-.my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 22px; margin: 24px 0; }
-.my-project-card { position: relative; container-type: inline-size; width: 100%; min-width: 0; text-align: left; padding: 20px; min-height: 220px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; }
+.my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); grid-auto-rows: 1fr; align-items: stretch; gap: 22px; margin: 24px 0; }
+.my-project-grid > [role="listitem"] { min-width: 0; height: 100%; }
+.my-project-card { position: relative; display: grid; grid-template-rows: 42px 20px 30px 78px 20px 40px; align-content: space-between; gap: 8px; width: 100%; height: 100%; min-width: 0; min-height: 320px; text-align: left; padding: 16px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; }
 .my-project-card:hover, .my-project-card.selected { border-color: #75b9ed; background: #1a2a3a; }
-.project-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.project-card-open { flex: 1 1 150px; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.project-card-heading-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+.project-card-open { flex: 1 1 auto; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .project-card-open:focus-visible { outline: 2px solid #8cc5fa; outline-offset: 4px; border-radius: 4px; }
-.project-card-version { display: block; width: fit-content; margin-top: 4px; color: #d6e9fb !important; font-variant-numeric: tabular-nums; }
-.project-card-quick-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }
+.project-card-meta { display: grid; flex: 0 0 100px; grid-template-rows: 20px 20px; align-content: center; min-width: 0; color: #c7d8e9; text-align: right; font-size: 11px; line-height: 20px; font-variant-numeric: tabular-nums; }
+.project-card-meta > span { display: block; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.project-card-version { color: #d6e9fb !important; }
+.project-card-version.is-empty { visibility: hidden; }
+.project-card-branch { min-width: 0; overflow: hidden; color: #abb9c9; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; line-height: 20px; }
+.project-card-quick-actions { display: flex; width: 100%; align-items: center; gap: 6px; }
 .project-quick { width: 30px; height: 30px; padding: 0; color: #b7c6d7; cursor: pointer; }
 .project-quick:not(:disabled) { border-color: #568dbe; color: #d4ebff; box-shadow: 0 0 5px #4da8f044; text-shadow: 0 0 5px #73bdff66; }
 .project-quick:hover:not(:disabled), .project-quick:focus-visible:not(:disabled) { border-color: #8bcaff; background: #25405a; color: #f0f8ff; box-shadow: 0 0 8px #62b6ff88; text-shadow: 0 0 7px #8bcaffaa; }
@@ -415,15 +420,13 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .project-card-menu-pop button, .project-card-menu-pop a { padding: 8px; border: 0; background: transparent; color: #dce8f5; text-align: left; text-decoration: none; font: inherit; font-size: 12px; cursor: pointer; }
 .project-card-menu-pop button:hover, .project-card-menu-pop a:hover { background: #24384c; }
 .project-card-menu-pop button:disabled { opacity: .5; cursor: pointer; }
-.project-card-action-status { display: block; margin-top: 6px; color: #a9d9ff; overflow-wrap: anywhere; font-size: 11px; }
-.project-card-refresh-error { display: block; margin-top: 6px; color: #f0bbc0; overflow-wrap: anywhere; font-size: 11px; }
-@container (max-width: 370px) {
-  .project-card-top { flex-wrap: wrap; }
-  .project-card-open { flex-basis: 100%; }
-  .project-card-quick-actions { width: 100%; justify-content: flex-end; }
-}
-.my-project-card h3 { font-size: 1.3rem; margin: 0 0 12px; }
-.project-card-open h3 { overflow-wrap: anywhere; }
+.project-card-activity, .project-card-action-status, .project-card-refresh-error { display: block; min-width: 0; overflow: hidden; font-size: 11px; line-height: 20px; white-space: nowrap; text-overflow: ellipsis; }
+.project-card-activity { color: #abb9c9; }
+.project-card-action-status, .project-card-refresh-error { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-height: 19px; white-space: normal; overflow-wrap: anywhere; }
+.project-card-action-status { color: #a9d9ff; }
+.project-card-refresh-error { color: #f0bbc0; }
+.my-project-card h3 { font-size: 1.2rem; margin: 0; }
+.project-card-open h3 { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
 @media (prefers-reduced-motion: reduce) {
   .project-card-refresh svg.is-refreshing { animation: none !important; transform: rotate(45deg); }
@@ -432,10 +435,10 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .my-project-card-heading h3 { margin: 0; }
 .my-project-icon { width: 36px; height: 36px; flex: 0 0 36px; border-radius: 8px; object-fit: contain; }
 .my-project-card small, .my-project-card dt { color: #abb9c9; }
-.my-project-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 24px 0; }
-.my-project-card dl > div { min-width: 0; padding: 12px 8px; border: 1px solid #34465b; border-radius: 9px; background: #101923; text-align: center; }
+.my-project-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; width: 100%; height: 78px; margin: 0; }
+.my-project-card dl > div { min-width: 0; padding: 10px 6px; border: 1px solid #34465b; border-radius: 9px; background: #101923; text-align: center; }
 .my-project-card dt { font-size: .7rem; line-height: 1.3; white-space: nowrap; }
-.my-project-card dd { margin: 6px 0 0; font-size: 1.6rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.my-project-card dd { margin: 6px 0 0; overflow: hidden; font-size: 1.5rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; white-space: nowrap; text-overflow: ellipsis; }
 .collection-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 20px 0; }
 .collection-options label { display: flex; gap: 12px; padding: 16px; background: #151e29; border-radius: 10px; align-items: center; }
 .collection-options small { display: block; overflow-wrap: anywhere; color: #abb9c9; margin-top: 6px; }
@@ -463,3 +466,51 @@ fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
 .my-project-card dd.count-changes { color: #f1c27c; }
 .my-project-card dd.count-epics { color: #c4acfa; }
 .my-project-card dd.count-stories { color: #8cc5fa; }
+
+.commit-review-dialog { width: min(560px, calc(100vw - 32px)); max-height: min(90vh, 760px); overflow: auto; padding: 22px; border: 1px solid #46627e; border-radius: 14px; background: #111a25; color: #e5edf7; box-shadow: 0 20px 70px #000a; }
+.commit-review-dialog::backdrop { background: #050a10bb; backdrop-filter: blur(2px); }
+.commit-review-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+.commit-review-heading h2 { margin: 0; }
+.commit-review-dialog label { display: grid; gap: 7px; margin: 16px 0; color: #c8d7e8; font-size: 13px; }
+.commit-review-dialog input, .commit-review-dialog textarea { width: 100%; padding: 10px 12px; border: 1px solid #3a4d62; border-radius: 8px; background: #0b121b; color: #edf5ff; font: inherit; }
+.commit-review-dialog textarea { resize: vertical; }
+.commit-review-paths { display: flex; flex-wrap: wrap; gap: 6px; max-height: 90px; overflow: auto; }
+.commit-review-paths code { padding: 3px 6px; border-radius: 5px; background: #202d3a; color: #bed5ea; overflow-wrap: anywhere; font-size: 11px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+
+.commit-review-workflow { width: min(900px, calc(100vw - 32px)); height: min(880px, calc(100dvh - 32px)); max-height: none; }
+.commit-review-workflow[open] { display: flex; flex-direction: column; }
+.commit-review-workflow .commit-review-heading { flex: 0 0 auto; }
+.commit-review-content { flex: 0 0 auto; }
+.commit-review-summary { min-height: 26px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.commit-review-loading, .commit-review-progress-heading > span { display: inline-flex; align-items: center; gap: 8px; color: #acc5df; font-size: 12px; }
+.commit-review-workflow .commit-review-paths { height: 72px; flex-shrink: 0; align-content: flex-start; margin-top: 8px; }
+.commit-review-workflow textarea { resize: none; }
+.commit-review-progress { display: flex; flex: 1 0 180px; flex-direction: column; min-height: 180px; margin-top: 12px; }
+.commit-review-progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.commit-review-progress h3 { margin: 0; font-size: 13px; }
+.commit-review-progress pre { flex: 1; min-height: 120px; max-height: 280px; overflow: auto; padding: 12px; border: 1px solid #3a4d62; border-radius: 8px; background: #0b121b; color: #c8d7e8; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 ui-monospace, monospace; }
+.commit-review-workflow .dialog-actions { flex-shrink: 0; margin-top: 12px; }
+.commit-review-spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid #3a4d62; border-top-color: #8fcaff; border-radius: 50%; animation: commit-review-spin .8s linear infinite; }
+.commit-review-skeleton { display: inline-block; width: 72%; min-height: 18px; border-radius: 5px; background: #202d3a; animation: commit-review-pulse 1.4s ease-in-out infinite; }
+.commit-review-summary .commit-review-skeleton { width: 180px; font-size: 12px; }
+.commit-review-paths .commit-review-skeleton:nth-child(2) { width: 86%; }
+.commit-review-paths .commit-review-skeleton:nth-child(3) { width: 60%; }
+.commit-review-pending { animation: commit-review-pulse 1.4s ease-in-out infinite; }
+@keyframes commit-review-spin { to { transform: rotate(360deg); } }
+@keyframes commit-review-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .commit-review-spinner, .commit-review-skeleton, .commit-review-pending { animation: none; } }
+
+.build-progress-steps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px; padding: 0; margin: 22px 0; list-style: none; }
+.build-progress-steps li { display: flex; align-items: center; gap: 10px; color: #8598ad; font-size: 13px; }
+.build-progress-steps li > span { display: grid; place-items: center; width: 26px; height: 26px; flex-shrink: 0; border: 1px solid #3a4d62; border-radius: 50%; }
+.build-progress-steps .is-current { color: #c5e3ff; }
+.build-progress-steps .is-current > span { border-color: #8fcaff; background: #203b52; }
+.build-progress-steps .is-complete { color: #9dd8bd; }
+.build-progress-dialog .commit-review-progress { min-height: 240px; }
+.build-progress-dialog .commit-review-progress pre { max-height: none; }
+.build-progress-artifact { display: grid; gap: 6px; font-size: 12px; }
+.build-progress-artifact code { overflow-wrap: anywhere; }
+@media (max-width: 560px) { .build-progress-steps { grid-template-columns: 1fr; gap: 7px; } }
+
+.commit-review-policy { color: #acc5df; font-size: 12px; }

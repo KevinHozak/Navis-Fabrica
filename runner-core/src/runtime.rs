@@ -2280,6 +2280,7 @@ fn run_codex_with_startup_timeout(
             prompt,
             None,
             output_schema,
+            read_only,
         ),
     )?;
     let mut final_state = None;
@@ -2665,12 +2666,11 @@ mod codex_launch_tests {
 }
 
 fn codex_thread_start(request_id: u64, cwd: &str, model_id: &str, read_only: bool) -> Value {
-    let mut message = providers::app_server_thread_start(request_id, cwd, model_id);
     if read_only {
-        message["params"]["sandbox"] = Value::String("read-only".into());
-        message["params"]["ephemeral"] = Value::Bool(true);
+        providers::app_server_read_only_thread_start(request_id, cwd, model_id)
+    } else {
+        providers::app_server_thread_start(request_id, cwd, model_id)
     }
-    message
 }
 
 struct OwnedProcess {
@@ -3603,6 +3603,52 @@ mod review_adapter_tests {
         let message = codex_thread_start(1, "C:/Projects/sample", "model", true);
         assert_eq!(message["params"]["sandbox"], "read-only");
         assert_eq!(message["params"]["ephemeral"], true);
+        assert_eq!(message["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            message["params"]["runtimeWorkspaceRoots"],
+            serde_json::json!([])
+        );
+        assert_eq!(message["params"]["dynamicTools"], serde_json::json!([]));
+        assert_eq!(
+            message["params"]["config"]["apps"]["_default"]["enabled"],
+            false
+        );
+        assert_eq!(
+            message["params"]["config"]["tools"]["web_search"]["enabled"],
+            false
+        );
+        assert!(message["params"]["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        let turn = providers::app_server_turn_start_with_output_schema(
+            2,
+            "review-thread",
+            "C:/temporary",
+            "model",
+            None,
+            "draft",
+            None,
+            None,
+            true,
+        );
+        assert_eq!(turn["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            turn["params"]["runtimeWorkspaceRoots"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            turn["params"]["config"]["apps"]["_default"]["enabled"],
+            false
+        );
+        assert_eq!(
+            turn["params"]["config"]["tools"]["web_search"]["enabled"],
+            false
+        );
+        assert!(turn["params"]["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .is_empty());
         let implementation = codex_thread_start(1, "C:/Projects/sample", "model", false);
         assert_eq!(implementation["params"]["sandbox"], "workspace-write");
     }

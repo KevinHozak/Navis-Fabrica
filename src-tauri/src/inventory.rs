@@ -127,11 +127,13 @@ fn is_valid_project(project: &ProjectEntry) -> bool {
             .branch
             .as_ref()
             .is_none_or(|branch| branch.len() <= 1_024)
-        && project
-            .git
-            .latest_commit
-            .as_ref()
-            .is_none_or(|commit| commit.short_hash.len() <= 64 && commit.subject.len() <= 1_024)
+        && project.git.latest_commit.as_ref().is_none_or(|commit| {
+            commit.short_hash.len() <= 64
+                && commit.subject.len() <= 1_024
+                && commit.committed_at.as_deref().is_none_or(|timestamp| {
+                    timestamp.len() <= 35 && crate::scanner::is_git_iso8601_timestamp(timestamp)
+                })
+        })
         && project.git.remotes.iter().all(|remote| {
             remote.name.len() <= 128
                 && remote.url.as_ref().is_none_or(|url| {
@@ -247,6 +249,8 @@ mod tests {
                     status: "noUpstream".into(),
                     ahead: None,
                     behind: None,
+                    remote: None,
+                    branch: None,
                 },
             },
             workflow_prerequisites: Vec::new(),
@@ -265,6 +269,23 @@ mod tests {
             }),
         });
         project
+    }
+
+    #[test]
+    fn latest_commit_timestamp_is_bounded_and_validated() {
+        let mut candidate = project("timestamp", "Timestamp", r"C:\Projects\timestamp");
+        candidate.git.latest_commit = Some(crate::scanner::LatestCommit {
+            short_hash: "0123456789ab".into(),
+            subject: "commit".into(),
+            committed_at: Some("2026-10-19T12:30:00-05:00".into()),
+        });
+        assert!(is_valid_project(&candidate));
+
+        candidate.git.latest_commit.as_mut().unwrap().committed_at = Some("not-a-date".into());
+        assert!(!is_valid_project(&candidate));
+
+        candidate.git.latest_commit.as_mut().unwrap().committed_at = Some("x".repeat(36));
+        assert!(!is_valid_project(&candidate));
     }
 
     #[test]

@@ -94,6 +94,338 @@ pub struct WorkflowRunMetadata {
     pub side_effects: Option<WorkflowSideEffects>,
     #[serde(default)]
     pub build_artifact: Option<BuildArtifact>,
+    #[serde(default)]
+    pub expected_head: Option<String>,
+    #[serde(default)]
+    pub expected_push_remote: Option<String>,
+    #[serde(default)]
+    pub expected_push_branch: Option<String>,
+    #[serde(default)]
+    pub commit_subject: Option<String>,
+    #[serde(default)]
+    pub commit_body: Option<String>,
+    #[serde(default)]
+    pub draft_snapshot_fingerprint: Option<String>,
+    #[serde(default)]
+    pub auto_merge_pull_request: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitDraftContext {
+    pub mode: String,
+    pub snapshot_fingerprint: String,
+    pub head: Option<String>,
+    pub branch: String,
+    pub paths: Vec<String>,
+    pub remote: Option<String>,
+    pub upstream_branch: Option<String>,
+    pub ahead: u64,
+    #[serde(skip_serializing)]
+    pub diff_context: String,
+}
+
+pub fn capture_commit_draft_context(cwd: &Path) -> Result<CommitDraftContext, String> {
+    let snapshot =
+        git_worktree_snapshot(cwd)?.ok_or("The selected folder is not a Git worktree.")?;
+    let root = &snapshot.root;
+    let git = |args: &[&str]| -> Result<String, String> {
+        let output = git_output(root, args)?;
+        if !output.status.success() {
+            return Err("Could not inspect the selected Git worktree.".into());
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| "Git returned unreadable repository details.".into())
+    };
+    for operation in [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ] {
+        let path = git(&["rev-parse", "--git-path", operation])?;
+        if root.join(path.trim()).exists() {
+            return Err("A Git operation is already in progress. Resolve or abort it before reviewing changes.".into());
+        }
+    }
+    let branch = git(&["branch", "--show-current"])?;
+    let branch = branch.trim().to_owned();
+    if branch.is_empty() {
+        return Err("Check out an attached branch before reviewing changes.".into());
+    }
+    let status = git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let dirty = !status.is_empty();
+    let head = git(&["rev-parse", "--verify", "HEAD"])
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut remote = None;
+    let mut upstream_branch = None;
+    let mut ahead = 0;
+    let mode = if dirty {
+        if snapshot.changed_paths.is_empty() {
+            return Err("Git reports changes, but the changed-file list is unavailable.".into());
+        }
+        let remotes = git(&["remote"])?;
+        if remotes.trim().is_empty() {
+            "commit"
+        } else {
+            let origin = git(&["remote", "get-url", "origin"]).ok();
+            if origin
+                .as_deref()
+                .is_none_or(|url| github_repository_from_remote(url.trim()).is_none())
+            {
+                return Err("A configured remote is not supported for Commit & Push; review it separately or remove it before a local commit.".into());
+            }
+            remote = Some("origin".to_owned());
+            upstream_branch = Some(branch.clone());
+            "commitPush"
+        }
+    } else {
+        let (current_head, upstream_remote, branch_name) = capture_push_target(root, true)?;
+        let counts = git(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])?;
+        let mut counts = counts.split_whitespace();
+        ahead = counts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if ahead == 0 {
+            return Err("There are no changes to commit or commits to push.".into());
+        }
+        remote = Some(upstream_remote);
+        upstream_branch = Some(branch_name);
+        let fingerprint = commit_draft_fingerprint(
+            root,
+            &snapshot.fingerprint,
+            &head,
+            &branch,
+            remote.as_deref(),
+            upstream_branch.as_deref(),
+        )?;
+        return Ok(CommitDraftContext {
+            mode: "pushOnly".into(),
+            snapshot_fingerprint: fingerprint,
+            head: Some(current_head),
+            branch,
+            paths: Vec::new(),
+            remote,
+            upstream_branch,
+            ahead,
+            diff_context: git(&["log", "--format=%s", "@{upstream}..HEAD"])?,
+        });
+    };
+
+    let untracked_output = git_output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if !untracked_output.status.success() {
+        return Err("Could not inspect untracked changes.".into());
+    }
+    let untracked = untracked_output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|path| !path.is_empty())
+        .map(|path| path.replace('\\', "/"))
+        .collect::<HashSet<_>>();
+    let mut context = String::new();
+    for path in snapshot.changed_paths.iter().take(40) {
+        if !safe_commit_context_path(path) {
+            context.push_str(&format!(
+                "\n[content omitted for sensitive or non-source path: {}]\n",
+                safe_path_label(path)
+            ));
+            continue;
+        }
+        let file = root.join(path);
+        let metadata_len = fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0);
+        if metadata_len > 32 * 1024 {
+            context.push_str(&format!("\n[content omitted for large file: {path}]\n"));
+            continue;
+        }
+        if untracked.contains(path) {
+            let bytes = fs::read(&file)
+                .map_err(|_| "Could not read a changed text file for its draft.".to_string())?;
+            if bytes.contains(&0) || bytes.len() > 32 * 1024 {
+                context.push_str(&format!(
+                    "\n[content omitted for binary or large file: {path}]\n"
+                ));
+                continue;
+            }
+            let text = String::from_utf8(bytes)
+                .map_err(|_| "Changed files must be UTF-8 text for AI drafting.".to_string())?;
+            append_bounded_diff(
+                &mut context,
+                path,
+                &format!("+++ {path} (new file) +++\n{text}"),
+            );
+        } else {
+            let staged = git_output(
+                root,
+                &[
+                    "diff",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--unified=2",
+                    "--",
+                    path,
+                ],
+            )?;
+            let unstaged = git_output(
+                root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--unified=2",
+                    "--",
+                    path,
+                ],
+            )?;
+            if !staged.status.success() || !unstaged.status.success() {
+                return Err("Could not read the selected text changes.".into());
+            }
+            let mut text = String::from_utf8_lossy(&staged.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&unstaged.stdout));
+            append_bounded_diff(&mut context, path, &text);
+        }
+        if context.len() >= 48 * 1024 {
+            break;
+        }
+    }
+    let fingerprint = commit_draft_fingerprint(
+        root,
+        &snapshot.fingerprint,
+        &head,
+        &branch,
+        remote.as_deref(),
+        upstream_branch.as_deref(),
+    )?;
+    Ok(CommitDraftContext {
+        mode: mode.into(),
+        snapshot_fingerprint: fingerprint,
+        head,
+        branch,
+        paths: snapshot.changed_paths,
+        remote,
+        upstream_branch,
+        ahead,
+        diff_context: context,
+    })
+}
+
+fn commit_draft_fingerprint(
+    root: &Path,
+    worktree: &str,
+    head: &Option<String>,
+    branch: &str,
+    remote: Option<&str>,
+    upstream_branch: Option<&str>,
+) -> Result<String, String> {
+    let remote_url = remote
+        .and_then(|name| git_output(root, &["remote", "get-url", name]).ok())
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let upstream = git_output(root, &["rev-parse", "--symbolic-full-name", "@{upstream}"])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let upstream_head = git_output(root, &["rev-parse", "--verify", "@{upstream}"])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let metadata = format!(
+        "{worktree}\0{}\0{branch}\0{}\0{}\0{remote_url}\0{upstream}\0{upstream_head}",
+        head.as_deref().unwrap_or("unborn"),
+        remote.unwrap_or(""),
+        upstream_branch.unwrap_or("")
+    );
+    let mut child = crate::process::command("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| "Could not fingerprint the reviewed Git state.".to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or("Could not fingerprint the reviewed Git state.")?
+        .write_all(metadata.as_bytes())
+        .map_err(|_| "Could not fingerprint the reviewed Git state.".to_string())?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "Could not fingerprint the reviewed Git state.".to_string())?;
+    if !output.status.success() {
+        return Err("Could not fingerprint the reviewed Git state.".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub fn safe_commit_context_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    !file.starts_with(".env")
+        && ![
+            "secret",
+            "credential",
+            "token",
+            "password",
+            "id_rsa",
+            "id_ed25519",
+        ]
+        .iter()
+        .any(|part| file.contains(part))
+        && ![
+            ".pem",
+            ".key",
+            ".p12",
+            ".pfx",
+            ".jks",
+            ".keystore",
+            ".db",
+            ".sqlite",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".pdf",
+            ".zip",
+            ".exe",
+            ".dll",
+        ]
+        .iter()
+        .any(|suffix| file.ends_with(suffix))
+}
+
+fn safe_path_label(path: &str) -> &str {
+    if safe_commit_context_path(path) {
+        path
+    } else {
+        "[sensitive path]"
+    }
+}
+
+fn append_bounded_diff(context: &mut String, path: &str, diff: &str) {
+    let remaining = (48 * 1024usize).saturating_sub(context.len());
+    if remaining == 0 {
+        return;
+    }
+    context.push_str(&format!("\n--- {path} ---\n"));
+    let remaining = (48 * 1024usize).saturating_sub(context.len());
+    let end = diff
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= remaining)
+        .last()
+        .unwrap_or(0);
+    context.push_str(&diff[..end]);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +505,7 @@ fn verify_build_artifact_with(
 ) -> Option<BuildArtifact> {
     let json = text
         .lines()
+        .rev()
         .find_map(|line| line.trim().strip_prefix("NAVIS_BUILD_ARTIFACT:"))?;
     let value = serde_json::from_str::<serde_json::Value>(json.trim()).ok()?;
     let profile = value.get("profile")?.as_str()?.to_owned();
@@ -654,6 +987,13 @@ pub fn reserve_external_mutation(
             requested_effects: Vec::new(),
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         }),
         handoff: None,
     };
@@ -910,7 +1250,7 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), Stri
             .operation_key
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
-        || workflow.scope_paths.len() > 200
+        || workflow.scope_paths.len() > 10_000
         || workflow.requested_effects.len() > 3
     {
         return Err("The workflow action or operation identity is invalid.".into());
@@ -927,6 +1267,35 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), Stri
     if workflow.action != "dev-build" && workflow.build_profile.is_some() {
         return Err("Build profiles are valid only for dev-build actions.".into());
     }
+    if workflow.commit_subject.is_some() != workflow.commit_body.is_some()
+        || workflow.commit_subject.as_ref().is_some_and(|subject| {
+            subject.trim().is_empty()
+                || subject.len() > 200
+                || subject.chars().any(char::is_control)
+        })
+        || workflow
+            .commit_body
+            .as_ref()
+            .is_some_and(|body| body.len() > 4_000 || body.contains('\0'))
+        || workflow
+            .draft_snapshot_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| {
+                !(40..=64).contains(&fingerprint.len())
+                    || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    {
+        return Err("The approved commit message or draft snapshot is invalid.".into());
+    }
+    if workflow.commit_subject.is_some()
+        && (workflow.action != "dev-push"
+            || !workflow
+                .requested_effects
+                .iter()
+                .any(|effect| effect == "commit"))
+    {
+        return Err("Approved commit messages require an explicitly permitted commit.".into());
+    }
     if workflow.intent.trim().is_empty()
         || workflow.intent.len() > 8_000
         || workflow.intent.contains('\0')
@@ -940,8 +1309,23 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), Stri
     {
         return Err("Issue context must use a GitHub.com HTTPS issue URL.".into());
     }
-    if workflow.action == "dev-push" && workflow.scope_paths.is_empty() {
+    if workflow.action == "dev-push"
+        && workflow.scope_paths.is_empty()
+        && !is_push_only_workflow(workflow)
+    {
         return Err("Push changes requires at least one selected changed file.".into());
+    }
+    if workflow.auto_merge_pull_request
+        && (workflow.action != "dev-push"
+            || !workflow
+                .requested_effects
+                .iter()
+                .any(|effect| effect == "createPullRequest"))
+    {
+        return Err(
+            "Automatic merging requires an explicitly permitted reviewed pull request workflow."
+                .into(),
+        );
     }
     let mut paths = HashSet::new();
     let mut scope_bytes = 0usize;
@@ -950,7 +1334,7 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), Stri
         scope_bytes = scope_bytes.saturating_add(path.len());
         if path.trim().is_empty()
             || path.len() > 500
-            || scope_bytes > 10_000
+            || scope_bytes > 2 * 1024 * 1024
             || path.chars().any(char::is_control)
             || parsed.is_absolute()
             || parsed.components().any(|part| {
@@ -979,6 +1363,33 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), Stri
         return Err("Creating a pull request requires explicit permission to push.".into());
     }
     Ok(())
+}
+
+fn is_push_only_workflow(workflow: &WorkflowRunMetadata) -> bool {
+    workflow.action == "dev-push"
+        && workflow
+            .requested_effects
+            .iter()
+            .any(|effect| effect == "push")
+        && !workflow
+            .requested_effects
+            .iter()
+            .any(|effect| effect == "commit")
+        && workflow.scope_paths.is_empty()
+}
+
+fn verify_push_listing(listing: &str, branch: &str, expected_head: &str) -> Result<String, String> {
+    let mut parts = listing.split_whitespace();
+    let sha = parts
+        .next()
+        .ok_or("The configured upstream branch was not found.")?;
+    let reference = parts
+        .next()
+        .ok_or("The configured upstream branch was not found.")?;
+    if reference != format!("refs/heads/{branch}") || !sha.eq_ignore_ascii_case(expected_head) {
+        return Err("The remote branch does not point to the expected commit.".into());
+    }
+    Ok(sha.to_owned())
 }
 
 fn workflow_key_recorded(records: &[RunRecord], operation_key: &str) -> bool {
@@ -1061,6 +1472,67 @@ fn verify_workflow_repository(cwd: &Path, workflow: &WorkflowRunMetadata) -> Res
     Ok(())
 }
 
+fn capture_push_only_target(cwd: &Path) -> Result<(String, String, String), String> {
+    capture_push_target(cwd, false)
+}
+
+fn capture_push_target(cwd: &Path, allow_rebase: bool) -> Result<(String, String, String), String> {
+    let git = |args: &[&str]| {
+        let mut command_args = vec!["-C".to_owned(), cwd.to_string_lossy().into_owned()];
+        command_args.extend(args.iter().map(|arg| (*arg).to_owned()));
+        command_output(cwd, "git", &command_args)
+    };
+    let branch = git(&["branch", "--show-current"])?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("Push-only requires an attached branch.".into());
+    }
+    let head = git(&["rev-parse", "--verify", "HEAD"])?;
+    let head = head.trim();
+    if head.is_empty() || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Could not verify the current commit for push-only.".into());
+    }
+    let upstream = git(&["rev-parse", "--symbolic-full-name", "@{upstream}"])?;
+    let upstream = upstream.trim();
+    let upstream = upstream
+        .strip_prefix("refs/remotes/")
+        .ok_or("Push-only requires a configured remote-tracking upstream.")?;
+    let (remote, upstream_branch) = upstream
+        .split_once('/')
+        .ok_or("Could not resolve the configured upstream branch.")?;
+    if remote.is_empty() || remote == "." || upstream_branch.is_empty() {
+        return Err("Push-only requires the current branch's configured remote upstream.".into());
+    }
+    let remote_url = git(&["remote", "get-url", remote])?;
+    if github_repository_from_remote(remote_url.trim()).is_none() {
+        return Err("Push-only requires a supported GitHub upstream.".into());
+    }
+    let counts = git(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])?;
+    let mut counts = counts.split_whitespace();
+    let ahead = counts
+        .next()
+        .and_then(|count| count.parse::<u64>().ok())
+        .ok_or("Could not verify commits ahead of upstream.")?;
+    let behind = counts
+        .next()
+        .and_then(|count| count.parse::<u64>().ok())
+        .ok_or("Could not verify commits behind upstream.")?;
+    if ahead == 0 || (behind > 0 && !allow_rebase) {
+        return Err("Push-only requires commits ahead of an upstream with no divergence.".into());
+    }
+    if !git(&["status", "--porcelain", "--untracked-files=all"])?
+        .trim()
+        .is_empty()
+    {
+        return Err("Push-only requires a clean working tree.".into());
+    }
+    Ok((
+        head.to_owned(),
+        remote.to_owned(),
+        upstream_branch.to_owned(),
+    ))
+}
+
 fn command_for(
     executable: &Path,
     cwd: &Path,
@@ -1120,11 +1592,21 @@ fn run_readonly_command(
     args: &[String],
     failure_message: &str,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    run_bounded_command(executable, cwd, args, failure_message, 10)
+}
+
+fn run_bounded_command(
+    executable: &Path,
+    cwd: &Path,
+    args: &[String],
+    failure_message: &str,
+    timeout_seconds: u64,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     let request = StartRequest {
         executable: executable.to_string_lossy().into_owned(),
         arguments: args.to_vec(),
         cwd: cwd.to_string_lossy().into_owned(),
-        timeout_seconds: 10,
+        timeout_seconds,
         mutating: false,
     };
     let (executable, cwd, host) = validate_request(&request)?;
@@ -1141,7 +1623,7 @@ fn run_readonly_command(
         let _ = stdout.by_ref().take(64 * 1024).read_to_end(&mut output);
         output
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1152,13 +1634,13 @@ fn run_readonly_command(
                 thread::sleep(Duration::from_millis(50));
             }
             Ok(None) => {
-                let _ = child.kill();
+                terminate_process_tree(&mut child);
                 let _ = child.wait();
                 let _ = reader.join();
                 return Err(failure_message.to_owned());
             }
             Err(_) => {
-                let _ = child.kill();
+                terminate_process_tree(&mut child);
                 let _ = child.wait();
                 let _ = reader.join();
                 return Err(failure_message.to_owned());
@@ -1233,6 +1715,7 @@ fn verify_reported_side_effects(
     effects: &WorkflowSideEffects,
 ) -> Result<(), String> {
     let permits = |effect: &str| workflow.requested_effects.iter().any(|item| item == effect);
+    let push_only = is_push_only_workflow(workflow);
     if effects.commit_sha.is_some() && !permits("commit") {
         return Err("The run reported a commit that was not explicitly permitted.".into());
     }
@@ -1244,6 +1727,62 @@ fn verify_reported_side_effects(
     }
     if permits("commit") && effects.commit_sha.is_none() {
         return Err("The run requested a commit but did not report its commit SHA.".into());
+    }
+
+    if push_only {
+        let expected_head = workflow
+            .expected_head
+            .as_deref()
+            .ok_or("The verified push target is missing its expected commit.")?;
+        let expected_branch = workflow
+            .expected_push_branch
+            .as_deref()
+            .ok_or("The verified push target is missing its upstream branch.")?;
+        let current_head = command_output(
+            cwd,
+            "git",
+            &[
+                "-C".into(),
+                cwd.to_string_lossy().into_owned(),
+                "rev-parse".into(),
+                "--verify".into(),
+                "HEAD".into(),
+            ],
+        )?;
+        if !current_head.trim().eq_ignore_ascii_case(expected_head) {
+            return Err(
+                "The current commit changed while the push-only workflow was running.".into(),
+            );
+        }
+        let status = command_output(
+            cwd,
+            "git",
+            &[
+                "-C".into(),
+                cwd.to_string_lossy().into_owned(),
+                "status".into(),
+                "--porcelain".into(),
+                "--untracked-files=all".into(),
+            ],
+        )?;
+        if !status.trim().is_empty() {
+            return Err(
+                "The push-only workflow changed files; review them separately before pushing."
+                    .into(),
+            );
+        }
+        if effects.remote_branch.as_deref() != Some(expected_branch) {
+            return Err(
+                "The reported pushed branch does not match the configured upstream.".into(),
+            );
+        }
+    }
+    if workflow
+        .expected_push_branch
+        .as_deref()
+        .is_some_and(|expected| effects.remote_branch.as_deref() != Some(expected))
+    {
+        return Err("The reported pushed branch does not match the reviewed branch.".into());
     }
 
     if let Some(commit_sha) = effects.commit_sha.as_deref() {
@@ -1258,11 +1797,48 @@ fn verify_reported_side_effects(
                 format!("{commit_sha}^{{commit}}"),
             ],
         )?;
+        if let Some(subject) = workflow.commit_subject.as_deref() {
+            let actual_subject = command_output(
+                cwd,
+                "git",
+                &[
+                    "-C".into(),
+                    cwd.to_string_lossy().into_owned(),
+                    "show".into(),
+                    "-s".into(),
+                    "--format=%s".into(),
+                    commit_sha.into(),
+                ],
+            )?;
+            let actual_body = command_output(
+                cwd,
+                "git",
+                &[
+                    "-C".into(),
+                    cwd.to_string_lossy().into_owned(),
+                    "show".into(),
+                    "-s".into(),
+                    "--format=%b".into(),
+                    commit_sha.into(),
+                ],
+            )?;
+            if actual_subject.trim_end_matches(['\r', '\n']) != subject
+                || actual_body.trim_end_matches(['\r', '\n'])
+                    != workflow
+                        .commit_body
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_end_matches(['\r', '\n'])
+            {
+                return Err("The created commit message differs from the approved message.".into());
+            }
+        }
     }
 
     let mut remote_sha = None;
     let mut repository = None;
     if permits("push") || permits("createPullRequest") || effects.remote_branch.is_some() {
+        let remote_name = workflow.expected_push_remote.as_deref().unwrap_or("origin");
         let remote = command_output(
             cwd,
             "git",
@@ -1271,7 +1847,7 @@ fn verify_reported_side_effects(
                 cwd.to_string_lossy().into_owned(),
                 "remote".into(),
                 "get-url".into(),
-                "origin".into(),
+                remote_name.into(),
             ],
         )?;
         repository = github_repository_from_remote(remote.trim());
@@ -1285,10 +1861,17 @@ fn verify_reported_side_effects(
             .remote_branch
             .as_deref()
             .ok_or("The run requested a push but did not report its remote branch.")?;
-        let commit_sha = effects
-            .commit_sha
-            .as_deref()
-            .ok_or("The run requested a push but did not report its commit SHA.")?;
+        let commit_sha = if push_only {
+            workflow
+                .expected_head
+                .as_deref()
+                .ok_or("The verified push target is missing its expected commit.")?
+        } else {
+            effects
+                .commit_sha
+                .as_deref()
+                .ok_or("The run requested a push but did not report its commit SHA.")?
+        };
         command_output(
             cwd,
             "git",
@@ -1308,20 +1891,15 @@ fn verify_reported_side_effects(
                 cwd.to_string_lossy().into_owned(),
                 "ls-remote".into(),
                 "--exit-code".into(),
-                "origin".into(),
+                workflow
+                    .expected_push_remote
+                    .as_deref()
+                    .unwrap_or("origin")
+                    .into(),
                 format!("refs/heads/{branch}"),
             ],
         )?;
-        let (sha, reference) = listing
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .split_first()
-            .and_then(|(sha, rest)| rest.first().map(|reference| (*sha, *reference)))
-            .ok_or("The reported remote branch was not found.")?;
-        if reference != format!("refs/heads/{branch}") || !sha.eq_ignore_ascii_case(commit_sha) {
-            return Err("The remote branch does not point to the reported commit.".into());
-        }
-        remote_sha = Some(sha.to_owned());
+        remote_sha = Some(verify_push_listing(&listing, branch, commit_sha)?);
     }
 
     if permits("createPullRequest") {
@@ -1608,7 +2186,26 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
     if !store.records.iter().any(|record| record.id == id) {
         return;
     }
-    let uses_output_budget = output_budget_applies(kind);
+    // Keep the bounded script's phase/receipt lines even when compiler logs
+    // exhaust the ordinary output allowance.
+    let build_control = kind == "stdout"
+        && text.len() <= MAX_OUTPUT_CHUNK
+        && (text.starts_with("BUILD_STEP:") || text.starts_with("NAVIS_BUILD_ARTIFACT:"))
+        && store
+            .records
+            .iter()
+            .any(|record| record.id == id && record.provider.as_deref() == Some("build-script"));
+    let git_control = kind == "stdout"
+        && text.len() <= MAX_OUTPUT_CHUNK
+        && (text.starts_with("GIT_STEP:")
+            || text.starts_with("NAVIS_SIDE_EFFECTS:")
+            || text.starts_with("NAVIS_PR_MERGE:")
+            || text.starts_with("NAVIS_LOCAL_SYNC:"))
+        && store
+            .records
+            .iter()
+            .any(|record| record.id == id && record.provider.as_deref() == Some("git"));
+    let uses_output_budget = output_budget_applies(kind) && !build_control && !git_control;
     if uses_output_budget && *store.output_bytes.get(id).unwrap_or(&0) >= MAX_OUTPUT_BYTES {
         return;
     }
@@ -1630,7 +2227,13 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
     let event = RunEvent {
         sequence: record.next_sequence,
         timestamp_ms: now_ms(),
-        kind: kind.to_owned(),
+        kind: if build_control && text.starts_with("BUILD_STEP:") {
+            "buildProgress".into()
+        } else if git_control && text.starts_with("GIT_STEP:") {
+            "gitProgress".into()
+        } else {
+            kind.to_owned()
+        },
         text,
     };
     record.events.push(event.clone());
@@ -1647,10 +2250,12 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
         .filter(|entry| matches!(entry.kind.as_str(), "output" | "finalOutput"))
         .map(|entry| entry.text.as_str())
         .collect::<String>();
-    if let (Some(effects), Some(workflow)) = (
-        parse_side_effect_marker(&combined_output),
-        record.workflow.as_mut(),
-    ) {
+    let effects = if record.provider.as_deref() == Some("git") && kind == "stdout" {
+        parse_side_effect_marker(&event.text)
+    } else {
+        parse_side_effect_marker(&combined_output)
+    };
+    if let (Some(effects), Some(workflow)) = (effects, record.workflow.as_mut()) {
         workflow.side_effects = Some(effects);
     }
     record.next_sequence += 1;
@@ -1668,12 +2273,27 @@ fn emit_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
         });
         record.next_sequence += 1;
     }
-    if record.events.len() > MAX_EVENTS {
-        let remove = record.events.len() - MAX_EVENTS;
-        record.events.drain(0..remove);
-    }
+    trim_run_events(&mut record.events);
     let _ = persist_records(path, &store.records);
     let _ = app.emit("workflow-run-event", (run_id, event));
+}
+
+fn trim_run_events(events: &mut Vec<RunEvent>) {
+    if events.len() <= MAX_EVENTS {
+        return;
+    }
+    let phase = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.kind.as_str(), "buildProgress" | "gitProgress"))
+        .cloned();
+    events.drain(0..events.len() - MAX_EVENTS);
+    if let Some(phase) = phase {
+        if !events.iter().any(|event| event.sequence == phase.sequence) {
+            events.remove(0);
+            events.insert(0, phase);
+        }
+    }
 }
 
 fn emit_control_event(app: &AppHandle, path: &Path, id: &str, kind: &str, text: &str) {
@@ -2464,11 +3084,355 @@ pub fn start_workflow_run(app: AppHandle, request: StartRequest) -> Result<RunRe
     start_run(app, request, None, None, None, None, None, None, Vec::new())
 }
 
+fn script_version_state(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = crate::storage::data_root(app)?;
+    let versions = std::env::var_os("FABRICA_VERSION_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if root.file_name().is_some_and(|name| name == "desktop") {
+                root.parent().unwrap_or(&root).join("versions")
+            } else {
+                root.join("version-preparation")
+            }
+        });
+    Ok(versions)
+}
+
+fn install_version_helpers(inputs: &Path) -> Result<(), String> {
+    for (name, content) in [
+        (
+            "prepare_version.py",
+            include_str!("../../scripts/dev-version/prepare_version.py"),
+        ),
+        (
+            "set_version.py",
+            include_str!("../../scripts/dev-version/set_version.py"),
+        ),
+        (
+            "version_workflow.py",
+            include_str!("../scripts/version_workflow.py"),
+        ),
+    ] {
+        fs::write(inputs.join(name), content)
+            .map_err(|_| "Could not prepare the shared version helpers.".to_string())?;
+    }
+    Ok(())
+}
+
+pub fn prepare_commit_review(app: &AppHandle, cwd: &Path) -> Result<CommitDraftContext, String> {
+    let context = capture_commit_draft_context(cwd)?;
+    if context.mode == "pushOnly" || !cwd.join("src-tauri/tauri.conf.json").is_file() {
+        return Ok(context);
+    }
+    let mut guard = reserve_external_mutation(app, cwd, "prepare-version")?;
+    let result = (|| {
+        let python =
+            crate::providers::find_executable("python", std::env::var_os("PATH").as_deref())
+                .ok_or("Python 3.11+ is required for Tauri version preparation.")?;
+        preflight_command(
+            &python,
+            cwd,
+            &[
+                "-c".into(),
+                "import sys; assert sys.version_info >= (3, 11)".into(),
+            ],
+            "Python 3.11+ is required for Tauri version preparation.",
+        )?;
+        let inputs = history_path(app)?
+            .parent()
+            .ok_or("The version helper folder is unavailable.")?
+            .join(format!(
+                "version-review-{}-{}",
+                now_ms(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&inputs)
+            .map_err(|_| "Could not prepare the version helper folder.".to_string())?;
+        install_version_helpers(&inputs)?;
+        let (status, output) = run_bounded_command(
+            &python,
+            cwd,
+            &[
+                inputs
+                    .join("version_workflow.py")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--repo".into(),
+                cwd.to_string_lossy().into_owned(),
+                "--state-dir".into(),
+                script_version_state(app)?.to_string_lossy().into_owned(),
+                "--action".into(),
+                "prepare".into(),
+            ],
+            "Version preparation did not complete.",
+            60,
+        )?;
+        let message = String::from_utf8_lossy(&output).trim().to_owned();
+        if !status.success() {
+            return Err(format!("Version preparation failed: {message}"));
+        }
+        let value: serde_json::Value = serde_json::from_str(&message)
+            .map_err(|_| "Could not read version preparation result.".to_string())?;
+        let refreshed = capture_commit_draft_context(cwd)?;
+        Ok((
+            refreshed,
+            format!(
+                "Version {}: {}.",
+                value["version"].as_str().unwrap_or("unknown"),
+                value["action"].as_str().unwrap_or("prepared")
+            ),
+        ))
+    })();
+    match result {
+        Ok((context, message)) => {
+            guard.finish(true, &message)?;
+            Ok(context)
+        }
+        Err(error) => {
+            let _ = guard.finish(false, &error);
+            Err(error)
+        }
+    }
+}
+
+pub fn start_script_build_run(
+    app: AppHandle,
+    cwd: &Path,
+    workflow: WorkflowRunMetadata,
+) -> Result<RunRecord, String> {
+    validate_workflow_metadata(&workflow)?;
+    if workflow.action != "dev-build"
+        || !workflow.scope_paths.is_empty()
+        || workflow.issue_url.is_some()
+        || workflow.draft_snapshot_fingerprint.is_some()
+    {
+        return Err("This command accepts only a Tauri build profile.".into());
+    }
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|_| "The project folder could not be resolved.".to_string())?;
+    if !cwd.join("src-tauri/tauri.conf.json").is_file() || !cwd.join("package.json").is_file() {
+        return Err("The scripted build supports Tauri projects with package.json.".into());
+    }
+    let python = crate::providers::find_executable("python", std::env::var_os("PATH").as_deref())
+        .ok_or("Python 3.11 or newer is required by the bundled version/build helper.")?;
+    preflight_command(
+        &python,
+        &cwd,
+        &[
+            "-c".into(),
+            "import sys; assert sys.version_info >= (3, 11)".into(),
+        ],
+        "Python 3.11 or newer is required by the bundled version/build helper.",
+    )?;
+    let versions = script_version_state(&app)?;
+    let inputs = history_path(&app)?
+        .parent()
+        .ok_or("The build input folder is unavailable.")?
+        .join(format!(
+            "script-build-{}-{}",
+            now_ms(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::create_dir_all(&inputs)
+        .map_err(|_| "Could not prepare the build helper folder.".to_string())?;
+    install_version_helpers(&inputs)?;
+    fs::write(
+        inputs.join("build_project.py"),
+        include_str!("../scripts/build_project.py"),
+    )
+    .map_err(|_| "Could not prepare the bundled build helper.".to_string())?;
+    let profile = workflow
+        .build_profile
+        .as_deref()
+        .ok_or("Choose a build profile.")?;
+    let request = StartRequest {
+        executable: python.to_string_lossy().into_owned(),
+        arguments: vec![
+            "-u".into(),
+            inputs
+                .join("build_project.py")
+                .to_string_lossy()
+                .into_owned(),
+            "--repo".into(),
+            cwd.to_string_lossy().into_owned(),
+            "--profile".into(),
+            profile.into(),
+            "--state-dir".into(),
+            versions.to_string_lossy().into_owned(),
+        ],
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds: 3600,
+        mutating: true,
+    };
+    start_run_with_workflow(
+        app,
+        request,
+        None,
+        Some("build-script"),
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Some(workflow),
+    )
+}
+
+pub fn start_reviewed_git_run(
+    app: AppHandle,
+    cwd: &Path,
+    mut workflow: WorkflowRunMetadata,
+) -> Result<RunRecord, String> {
+    validate_workflow_metadata(&workflow)?;
+    if workflow.action != "dev-push"
+        || workflow.issue_url.is_some()
+        || workflow
+            .requested_effects
+            .iter()
+            .any(|effect| !matches!(effect.as_str(), "commit" | "push" | "createPullRequest"))
+    {
+        return Err(
+            "This operation supports only reviewed commit, push and pull request effects.".into(),
+        );
+    }
+    let context = capture_commit_draft_context(cwd)?;
+    let mut expected_effects = match context.mode.as_str() {
+        "commit" => vec!["commit"],
+        "commitPush" => vec!["commit", "push"],
+        "pushOnly" => vec!["push"],
+        _ => return Err("The reviewed Git action is unsupported.".into()),
+    };
+    let allow_pull_request = workflow
+        .requested_effects
+        .iter()
+        .any(|effect| effect == "createPullRequest");
+    if allow_pull_request && context.mode != "commit" {
+        expected_effects.push("createPullRequest");
+    }
+    if workflow.draft_snapshot_fingerprint.as_deref() != Some(context.snapshot_fingerprint.as_str())
+        || workflow.scope_paths != context.paths
+        || workflow.requested_effects != expected_effects
+        || (context.mode != "pushOnly" && workflow.commit_subject.is_none())
+    {
+        return Err("The reviewed Git scope changed. Refresh the dialog.".into());
+    }
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|_| "Could not resolve the repository.".to_string())?;
+    verify_workflow_repository(&cwd, &workflow)?;
+    let read = |args: &[&str]| -> Result<String, String> {
+        let output = git_output(&cwd, args)?;
+        if !output.status.success() {
+            return Err("Could not capture the reviewed Git state.".into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end_matches(['\r', '\n'])
+            .to_string())
+    };
+    let status = read(&["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let index = read(&["ls-files", "--stage"])?;
+    let mut files = Vec::new();
+    for path in &context.paths {
+        let file = cwd.join(path);
+        if file.is_dir() {
+            return Err("Directory and submodule changes require separate review.".into());
+        }
+        let hash = if file.is_file() {
+            read(&["hash-object", "--no-filters", "--", path])?
+        } else {
+            String::new()
+        };
+        files.push(serde_json::json!({"path":path,"hash":hash}));
+    }
+    let remote_url = context
+        .remote
+        .as_deref()
+        .map(|remote| read(&["remote", "get-url", remote]))
+        .transpose()?;
+    // Recheck after reading all per-file state; never bless a mixed snapshot.
+    if capture_commit_draft_context(&cwd)?.snapshot_fingerprint != context.snapshot_fingerprint {
+        return Err("Repository changes shifted during preflight. Refresh the dialog.".into());
+    }
+    workflow.expected_head = context.head.clone();
+    workflow.expected_push_remote = context.remote.clone();
+    workflow.expected_push_branch = context.upstream_branch.clone();
+    let inputs = history_path(&app)?
+        .parent()
+        .ok_or("The run input folder is unavailable.")?
+        .join(format!(
+            "reviewed-git-{}-{}",
+            now_ms(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::create_dir_all(&inputs)
+        .map_err(|_| "Could not create the Git operation inputs.".to_string())?;
+    let script = inputs.join("commit-reviewed.ps1");
+    let input = inputs.join("request.json");
+    fs::write(&script, include_str!("../scripts/commit-reviewed.ps1"))
+        .map_err(|_| "Could not prepare the Git script.".to_string())?;
+    let version_helper = if cwd.join("src-tauri/tauri.conf.json").is_file() {
+        install_version_helpers(&inputs)?;
+        Some(inputs.join("version_workflow.py"))
+    } else {
+        None
+    };
+    let python = if version_helper.is_some() {
+        Some(
+            crate::providers::find_executable("python", std::env::var_os("PATH").as_deref())
+                .ok_or("Python 3.11+ is required for Tauri version verification.")?,
+        )
+    } else {
+        None
+    };
+    let version_state = script_version_state(&app)?;
+    let data = serde_json::json!({
+        "cwd":cwd, "head":context.head.unwrap_or_default(), "branch":context.branch,
+        "python":python,"versionHelper":version_helper,"versionStateDir":version_state,
+        "status":status, "index":index, "files":files,
+        "remote":context.remote, "remoteUrl":remote_url, "remoteBranch":context.upstream_branch,
+        "allowPullRequest":allow_pull_request,
+        "autoMergePullRequest":workflow.auto_merge_pull_request,
+        "mergeWaitSeconds":540,
+        "githubRepository":remote_url.as_deref().and_then(github_repository_from_remote),
+        "ghExecutable":crate::providers::find_executable("gh", std::env::var_os("PATH").as_deref()),
+        "commit":expected_effects.contains(&"commit"), "push":expected_effects.contains(&"push"),
+        "subject":workflow.commit_subject, "body":workflow.commit_body,
+    });
+    fs::write(
+        &input,
+        serde_json::to_vec(&data).map_err(|_| "Could not serialize Git inputs.".to_string())?,
+    )
+    .map_err(|_| "Could not save the Git inputs.".to_string())?;
+    let request = StartRequest {
+        executable: script.to_string_lossy().into_owned(),
+        arguments: vec!["-RequestPath".into(), input.to_string_lossy().into_owned()],
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_seconds: 600,
+        mutating: true,
+    };
+    start_run_with_workflow(
+        app,
+        request,
+        None,
+        Some("git"),
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Some(workflow),
+    )
+}
+
 pub fn start_codex_workflow_run(
     app: AppHandle,
     config: CodexRunConfig,
 ) -> Result<RunRecord, String> {
-    let prompt = config
+    let mut prompt = config
         .handoff
         .as_ref()
         .map(|packet| format!("{}{}", config.prompt, format_handoff_prompt(packet)))
@@ -2489,7 +3453,8 @@ pub fn start_codex_workflow_run(
     if !cwd.is_dir() {
         return Err("The selected project must be an existing folder.".into());
     }
-    if let Some(workflow) = &config.workflow {
+    let mut config = config;
+    if let Some(workflow) = &mut config.workflow {
         validate_workflow_metadata(workflow)?;
         if workflow.action == "dev-work" && !workflow.scope_paths.is_empty() {
             return Err("Work on issue uses a clean isolated worktree; do not pass pre-existing changes as scope.".into());
@@ -2502,7 +3467,44 @@ pub fn start_codex_workflow_run(
                 &[]
             },
         )?;
+        if let Some(expected) = workflow.draft_snapshot_fingerprint.as_deref() {
+            let actual = capture_commit_draft_context(&cwd)?;
+            if actual.snapshot_fingerprint != expected {
+                return Err("Repository changes shifted after this draft. Refresh the draft before confirming.".into());
+            }
+        }
         verify_workflow_repository(&cwd, workflow)?;
+        if is_push_only_workflow(workflow) {
+            let (head, remote, branch) = capture_push_only_target(&cwd)?;
+            workflow.expected_head = Some(head);
+            workflow.expected_push_remote = Some(remote);
+            workflow.expected_push_branch = Some(branch);
+        } else if workflow.draft_snapshot_fingerprint.is_some()
+            && workflow
+                .requested_effects
+                .iter()
+                .any(|effect| effect == "push")
+        {
+            let target = capture_commit_draft_context(&cwd)?;
+            if target.mode != "commitPush"
+                || target.snapshot_fingerprint
+                    != workflow
+                        .draft_snapshot_fingerprint
+                        .as_deref()
+                        .unwrap_or_default()
+            {
+                return Err(
+                    "The reviewed GitHub push target changed. Refresh the draft before confirming."
+                        .into(),
+                );
+            }
+            workflow.expected_push_remote = target.remote;
+            workflow.expected_push_branch = target.upstream_branch;
+        } else {
+            workflow.expected_head = None;
+            workflow.expected_push_remote = None;
+            workflow.expected_push_branch = None;
+        }
         let missing = crate::scanner::unavailable_workflow_prerequisites(&cwd)?;
         if !missing.is_empty() {
             return Err(format!(
@@ -2516,7 +3518,14 @@ pub fn start_codex_workflow_run(
     } else {
         ensure_clean_git_worktree(&cwd)?;
     }
-    let mut config = config;
+    if let Some(workflow) = &config.workflow {
+        if let Some(subject) = workflow.commit_subject.as_deref() {
+            let body = workflow.commit_body.as_deref().unwrap_or("");
+            prompt.push_str(&format!(
+                "\n\nUser-approved commit message (use exactly; do not edit):\nSubject: {subject}\nBody:\n{body}\n\nDo not change this message. Do not commit files outside the approved scope."
+            ));
+        }
+    }
     config.prompt = prompt;
     let timeout_seconds = config.timeout_seconds;
     let request = StartRequest {
@@ -3029,6 +4038,41 @@ fn start_run(
     ollama_endpoint: Option<String>,
     provider_environment: Vec<(String, String)>,
 ) -> Result<RunRecord, String> {
+    start_run_with_workflow(
+        app,
+        request,
+        codex,
+        provider,
+        model_id,
+        provider_profile_id,
+        handoff,
+        ollama_endpoint,
+        provider_environment,
+        None,
+    )
+}
+
+fn start_run_with_workflow(
+    app: AppHandle,
+    request: StartRequest,
+    codex: Option<CodexRunConfig>,
+    provider: Option<&'static str>,
+    model_id: Option<String>,
+    provider_profile_id: Option<String>,
+    handoff: Option<ProviderHandoff>,
+    ollama_endpoint: Option<String>,
+    provider_environment: Vec<(String, String)>,
+    script_workflow: Option<WorkflowRunMetadata>,
+) -> Result<RunRecord, String> {
+    if provider != Some("git")
+        && script_workflow
+            .as_ref()
+            .or_else(|| codex.as_ref().and_then(|config| config.workflow.as_ref()))
+            .is_some_and(|value| value.auto_merge_pull_request)
+    {
+        return Err("Automatic PR merging is supported only by the reviewed Git script.".into());
+    }
+
     let codex_run = codex.is_some();
     let (executable, cwd, host) = validate_request(&request)?;
     let canonical_key = mutation_scope(&cwd);
@@ -3082,7 +4126,8 @@ fn start_run(
         exit_code: None,
         next_sequence: 1,
         events: Vec::new(),
-        workflow: codex.as_ref().and_then(|config| config.workflow.clone()),
+        workflow: script_workflow
+            .or_else(|| codex.as_ref().and_then(|config| config.workflow.clone())),
         handoff,
     };
     {
@@ -3111,6 +4156,23 @@ fn start_run(
             return Err(
                 "A mutating workflow is already active for this repository or worktree.".into(),
             );
+        }
+        // Recheck reviewed repository state after reserving this checkout. The
+        // model draft can take time, so the earlier preflight alone cannot
+        // prevent another app operation from changing the approved scope.
+        if let Some(expected) = record
+            .workflow
+            .as_ref()
+            .and_then(|workflow| workflow.draft_snapshot_fingerprint.as_deref())
+        {
+            let current =
+                capture_commit_draft_context(&cwd).map(|context| context.snapshot_fingerprint);
+            if current.as_deref().ok() != Some(expected) {
+                if request.mutating {
+                    state.mutating_paths.remove(&canonical_key);
+                }
+                return Err("Repository changes shifted before the workflow started. Refresh the draft before confirming.".into());
+            }
         }
         state.records.insert(0, record.clone());
         state.records.truncate(MAX_RUNS);
@@ -3668,6 +4730,13 @@ mod tests {
                 requested_effects: vec!["push".into()],
                 side_effects: None,
                 build_artifact: None,
+                expected_head: None,
+                expected_push_remote: None,
+                expected_push_branch: None,
+                commit_subject: None,
+                commit_body: None,
+                draft_snapshot_fingerprint: None,
+                auto_merge_pull_request: false,
             }),
             handoff: None,
         }
@@ -3778,7 +4847,7 @@ mod tests {
         assert_eq!(accepted_total, MAX_OUTPUT_BYTES);
         assert!(reached_limit);
 
-        let (value, accepted, truncated) = budgeted_output("é", MAX_OUTPUT_BYTES - 1);
+        let (value, accepted, truncated) = budgeted_output("ÃƒÆ’Ã‚Â©", MAX_OUTPUT_BYTES - 1);
         assert!(value.is_empty());
         assert_eq!(accepted, 0);
         assert!(truncated);
@@ -3913,6 +4982,13 @@ mod tests {
                     verification_message: None,
                 }),
                 build_artifact: None,
+                expected_head: None,
+                expected_push_remote: None,
+                expected_push_branch: None,
+                commit_subject: None,
+                commit_body: None,
+                draft_snapshot_fingerprint: None,
+                auto_merge_pull_request: false,
             }),
             handoff: Some(ProviderHandoff {
                 version: 1,
@@ -4094,6 +5170,13 @@ mod tests {
             requested_effects: vec!["commit".into()],
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         };
         assert!(validate_workflow_metadata(&workflow).is_ok());
         workflow.requested_effects = vec!["createPullRequest".into()];
@@ -4118,6 +5201,242 @@ mod tests {
     }
 
     #[test]
+    fn push_only_requires_a_clean_ahead_upstream_and_pins_its_target() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "Fixture User"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(fixture.path().join("tracked.txt"), "base").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+        git(&["update-ref", "refs/remotes/origin/main", &base]);
+        git(&["config", "branch.main.remote", "origin"]);
+        git(&["config", "branch.main.merge", "refs/heads/main"]);
+        fs::write(fixture.path().join("tracked.txt"), "ahead").unwrap();
+        git(&["commit", "--quiet", "-am", "ahead"]);
+
+        let mut workflow = WorkflowRunMetadata {
+            action: "dev-push".into(),
+            operation_key: "e".repeat(64),
+            intent: "Push the committed branch to its upstream.".into(),
+            build_profile: None,
+            issue_url: None,
+            scope_paths: vec![],
+            requested_effects: vec!["push".into()],
+            side_effects: None,
+            build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
+        };
+        validate_workflow_metadata(&workflow).unwrap();
+        workflow.requested_effects.push("createPullRequest".into());
+        workflow.auto_merge_pull_request = true;
+        validate_workflow_metadata(&workflow).unwrap();
+        workflow.requested_effects.pop();
+        assert!(validate_workflow_metadata(&workflow).is_err());
+        workflow.auto_merge_pull_request = false;
+        ensure_git_scope(fixture.path(), &[]).unwrap();
+        let (head, remote, branch) = capture_push_only_target(fixture.path()).unwrap();
+        assert_eq!(remote, "origin");
+        assert_eq!(branch, "main");
+        assert_eq!(
+            verify_push_listing(&format!("{head}\trefs/heads/{branch}"), &branch, &head).unwrap(),
+            head
+        );
+        assert!(verify_push_listing(
+            &format!("{}\trefs/heads/{branch}", "f".repeat(40)),
+            &branch,
+            &head
+        )
+        .is_err());
+
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        assert!(capture_push_only_target(fixture.path())
+            .unwrap_err()
+            .contains("commits ahead"));
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let diverged = git(&[
+            "-c",
+            "user.name=Fixture User",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-m",
+            "remote divergence",
+        ]);
+        git(&["update-ref", "refs/remotes/origin/main", &diverged]);
+        assert!(capture_push_only_target(fixture.path())
+            .unwrap_err()
+            .contains("no divergence"));
+        assert!(capture_push_target(fixture.path(), true).is_ok());
+        git(&["update-ref", "refs/remotes/origin/main", &base]);
+
+        workflow.requested_effects = vec!["commit".into(), "push".into()];
+        assert!(validate_workflow_metadata(&workflow).is_err());
+        workflow.requested_effects = vec!["push".into()];
+        fs::write(fixture.path().join("tracked.txt"), "dirty").unwrap();
+        assert!(capture_push_only_target(fixture.path())
+            .unwrap_err()
+            .contains("clean working tree"));
+        fs::write(fixture.path().join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        assert!(capture_commit_draft_context(fixture.path())
+            .unwrap_err()
+            .contains("already in progress"));
+    }
+
+    #[test]
+    fn commit_draft_context_redacts_sensitive_files_and_fingerprints_head_branch_and_remote() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "Fixture User"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(fixture.path().join("tracked.txt"), "base\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+        git(&["update-ref", "refs/remotes/origin/main", &base]);
+        git(&["config", "branch.main.remote", "origin"]);
+        git(&["config", "branch.main.merge", "refs/heads/main"]);
+        fs::write(fixture.path().join("tracked.txt"), "ahead\n").unwrap();
+        git(&["commit", "--quiet", "-am", "ahead change"]);
+
+        let first = capture_commit_draft_context(fixture.path()).unwrap();
+        assert_eq!(first.mode, "pushOnly");
+        let original_fingerprint = first.snapshot_fingerprint.clone();
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "--quiet", "-c", "other"]);
+        git(&["update-ref", "refs/remotes/origin/other", &base]);
+        git(&["config", "branch.other.remote", "origin"]);
+        git(&["config", "branch.other.merge", "refs/heads/other"]);
+        let second = capture_commit_draft_context(fixture.path()).unwrap();
+        assert_eq!(second.head.as_deref(), Some(head.as_str()));
+        assert_ne!(
+            second.snapshot_fingerprint, original_fingerprint,
+            "branch changes invalidate push-only drafts"
+        );
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:other/repo.git",
+        ]);
+        let third = capture_commit_draft_context(fixture.path()).unwrap();
+        assert_ne!(
+            third.snapshot_fingerprint, second.snapshot_fingerprint,
+            "remote changes invalidate push-only drafts"
+        );
+
+        fs::write(fixture.path().join(".env"), "TOKEN=fixture-secret-value\n").unwrap();
+        fs::write(fixture.path().join("safe.txt"), "ordinary change\n").unwrap();
+        let dirty = capture_commit_draft_context(fixture.path()).unwrap();
+        assert_eq!(dirty.mode, "commitPush");
+        assert!(dirty.diff_context.contains("ordinary change"));
+        assert!(!dirty.diff_context.contains("fixture-secret-value"));
+        assert!(!dirty.diff_context.contains(".env"));
+    }
+
+    #[test]
+    fn approved_commit_receipt_must_match_subject_and_body() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "Fixture User"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(fixture.path().join("file.txt"), "content\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&[
+            "commit",
+            "--quiet",
+            "-m",
+            "approved subject",
+            "-m",
+            "approved body",
+        ]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        let mut workflow = WorkflowRunMetadata {
+            action: "dev-push".into(),
+            operation_key: "f".repeat(64),
+            intent: "Approved local commit".into(),
+            build_profile: None,
+            issue_url: None,
+            scope_paths: vec!["file.txt".into()],
+            requested_effects: vec!["commit".into()],
+            side_effects: None,
+            build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: Some("approved subject".into()),
+            commit_body: Some("approved body".into()),
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
+        };
+        let receipt = WorkflowSideEffects {
+            commit_sha: Some(sha),
+            remote_branch: None,
+            pull_request_url: None,
+            verified: false,
+            verification_message: None,
+        };
+        assert!(verify_reported_side_effects(fixture.path(), &workflow, &receipt).is_ok());
+        workflow.commit_subject = Some("different subject".into());
+        assert!(
+            verify_reported_side_effects(fixture.path(), &workflow, &receipt)
+                .unwrap_err()
+                .contains("differs from the approved")
+        );
+    }
+
+    #[test]
     fn fallback_requires_a_verified_receipt_for_requested_side_effects() {
         let mut workflow = WorkflowRunMetadata {
             action: "dev-push".into(),
@@ -4129,6 +5448,13 @@ mod tests {
             requested_effects: vec!["push".into()],
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         };
         assert!(!workflow_effects_reconciled(Some(&workflow)));
 
@@ -4185,6 +5511,13 @@ mod tests {
             requested_effects: vec![],
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         };
         let receipt_data = serde_json::json!({
             "profile": "release",
@@ -4299,6 +5632,13 @@ mod tests {
             requested_effects: vec![],
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         };
         let effects = WorkflowSideEffects {
             commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
@@ -4351,6 +5691,13 @@ mod tests {
             requested_effects: vec!["commit".into()],
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         };
         let effects = WorkflowSideEffects {
             commit_sha: Some(sha),
@@ -4397,6 +5744,13 @@ mod tests {
             requested_effects: vec!["commit".into()],
             side_effects: None,
             build_artifact: None,
+            expected_head: None,
+            expected_push_remote: None,
+            expected_push_branch: None,
+            commit_subject: None,
+            commit_body: None,
+            draft_snapshot_fingerprint: None,
+            auto_merge_pull_request: false,
         };
         validate_workflow_metadata(&commit_only).unwrap();
         ensure_git_scope(fixture.path(), &commit_only.scope_paths).unwrap();
@@ -4547,5 +5901,48 @@ mod tests {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("first arg"), "{text}");
         assert!(text.contains("second arg"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod build_progress_retention_tests {
+    use super::*;
+    #[test]
+    fn long_logs_keep_the_latest_phase_within_the_event_bound() {
+        let mut events = vec![
+            RunEvent {
+                sequence: 1,
+                timestamp_ms: 0,
+                kind: "buildProgress".into(),
+                text: "BUILD_STEP:1/6:Preparing version".into(),
+            },
+            RunEvent {
+                sequence: 2,
+                timestamp_ms: 0,
+                kind: "buildProgress".into(),
+                text: "BUILD_STEP:2/6:Building release artifacts".into(),
+            },
+        ];
+        for sequence in 3..MAX_EVENTS as u64 + 100 {
+            events.push(RunEvent {
+                sequence,
+                timestamp_ms: 0,
+                kind: "stdout".into(),
+                text: "Compiling".into(),
+            });
+        }
+        trim_run_events(&mut events);
+        assert_eq!(events.len(), MAX_EVENTS);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "buildProgress")
+                .count(),
+            1
+        );
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
     }
 }

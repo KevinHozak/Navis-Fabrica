@@ -209,6 +209,13 @@ export type WorkflowRunMetadata = {
   issueUrl: string | null;
   scopePaths: string[];
   requestedEffects: ("commit" | "push" | "createPullRequest")[];
+  expectedHead?: string | null;
+  expectedPushRemote?: string | null;
+  expectedPushBranch?: string | null;
+  commitSubject?: string | null;
+  commitBody?: string | null;
+  draftSnapshotFingerprint?: string | null;
+  autoMergePullRequest?: boolean;
   sideEffects: { commitSha: string | null; remoteBranch: string | null; pullRequestUrl: string | null; verified: boolean; verificationMessage: string | null } | null;
   buildArtifact?: { profile: string; path: string; fileVersion: string; productVersion: string; verified: boolean; verificationMessage: string } | null;
 };
@@ -226,10 +233,23 @@ export type GitFacts = {
   branch: string | null;
   dirty: boolean | null;
   changedFiles?: string[] | null;
-  latestCommit: { shortHash: string; subject: string } | null;
+  latestCommit: { shortHash: string; subject: string; committedAt?: string | null } | null;
   remotes: { name: string; url: string | null; github: { owner: string; repository: string; canonicalUrl: string } | null }[];
-  upstream: { status: "tracking" | "noUpstream" | "unavailable"; ahead: number | null; behind: number | null };
+  upstream: { status: "tracking" | "noUpstream" | "unavailable"; ahead: number | null; behind: number | null; remote?: string | null; branch?: string | null };
 };
+
+export type CommitDraftContext = {
+  mode: "commitPush" | "commit" | "pushOnly";
+  snapshotFingerprint: string;
+  head: string | null;
+  branch: string;
+  paths: string[];
+  remote: string | null;
+  upstreamBranch: string | null;
+  ahead: number;
+  diffContext: string;
+};
+export type CommitMessageDraft = CommitDraftContext & { subject: string; body: string };
 
 export type WorkflowPrerequisite = {
   name: string;
@@ -303,6 +323,9 @@ function validatePreviewSecretReferences(providers: ProviderProfile[]): void {
 export const isDesktopApp = () => isTauri();
 
 export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
+export const getProjectCommitDraftContext = (projectId: string) => invoke<CommitDraftContext>("get_project_commit_draft_context", { projectId });
+export const prepareProjectCommitReview = (projectId: string) => invoke<CommitDraftContext>("prepare_project_commit_review", { projectId });
+export const draftProjectCommitMessage = (projectId: string, expectedFingerprint: string) => invoke<CommitMessageDraft>("draft_project_commit_message", { projectId, expectedFingerprint });
 export const getProjectIcon = (projectId: string) => invoke<string | null>("get_project_icon", { projectId });
 export const getReleaseExecutableVersion = (projectId: string) => invoke<ReleaseExecutableVersion | null>("get_release_executable_version", { projectId });
 export async function runProjectGitAction(projectId: string, action: "pull" | "main" | "refresh"): Promise<ProjectEntry> {
@@ -375,6 +398,10 @@ export const exportWorkflowDiagnostics = () => invoke<string>("export_workflow_d
 export const deleteFinishedWorkflowRuns = () => invoke<number>("delete_finished_workflow_runs");
 export const startWorkflowRun = (request: WorkflowRunRequest) =>
   invoke<WorkflowRun>("start_workflow_run", { request });
+export const startScriptBuildRun = (projectId: string, workflow: NonNullable<CodexStartRequest["workflow"]>) =>
+  invoke<WorkflowRun>("start_script_build_run", { projectId, workflow });
+export const startReviewedGitRun = (projectId: string, workflow: NonNullable<CodexStartRequest["workflow"]>) =>
+  invoke<WorkflowRun>("start_reviewed_git_run", { projectId, workflow });
 export const startCodexWorkflowRun = (request: CodexStartRequest) =>
   invoke<WorkflowRun>("start_codex_workflow_run", { request });
 export const startAntigravityWorkflowRun = (request: AntigravityStartRequest) =>

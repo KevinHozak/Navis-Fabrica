@@ -75,6 +75,8 @@ pub struct GitFacts {
 pub struct LatestCommit {
     pub short_hash: String,
     pub subject: String,
+    #[serde(default)]
+    pub committed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,10 @@ pub struct UpstreamDivergence {
     pub status: String,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -811,6 +817,8 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
                 status: "unavailable".to_owned(),
                 ahead: None,
                 behind: None,
+                remote: None,
+                branch: None,
             },
         };
     }
@@ -854,17 +862,25 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
         Err(status) => return empty_git_facts(&status),
     };
     let dirty = changed_files.as_ref().map(|files| !files.is_empty());
-    let latest_commit = match git_output(path, &["log", "-1", "--format=%H%x00%s"], cancelled) {
-        Ok(Some(value)) => {
-            let (hash, subject) = value.split_once('\0').unwrap_or((&value, ""));
-            Some(LatestCommit {
-                short_hash: hash.chars().take(12).collect(),
-                subject: subject.chars().take(240).collect(),
-            })
-        }
-        Ok(None) => None,
-        Err(status) => return empty_git_facts(&status),
-    };
+    let latest_commit =
+        match git_output(path, &["log", "-1", "--format=%H%x00%s%x00%cI"], cancelled) {
+            Ok(Some(value)) => {
+                let mut fields = value.splitn(3, '\0');
+                let hash = fields.next().unwrap_or("");
+                let subject = fields.next().unwrap_or("");
+                let committed_at = fields
+                    .next()
+                    .filter(|value| is_git_iso8601_timestamp(value))
+                    .map(str::to_owned);
+                Some(LatestCommit {
+                    short_hash: hash.chars().take(12).collect(),
+                    subject: subject.chars().take(240).collect(),
+                    committed_at,
+                })
+            }
+            Ok(None) => None,
+            Err(status) => return empty_git_facts(&status),
+        };
     let remotes = match git_output(path, &["remote"], cancelled) {
         Ok(Some(value)) => value
             .lines()
@@ -895,44 +911,60 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
         ],
         cancelled,
     ) {
-        Ok(Some(_)) => match git_output(
-            path,
-            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-            cancelled,
-        ) {
-            Ok(Some(counts)) => {
-                let mut parts = counts
-                    .split_whitespace()
-                    .filter_map(|part| part.parse::<u64>().ok());
-                match (parts.next(), parts.next()) {
-                    (Some(ahead), Some(behind)) => UpstreamDivergence {
-                        status: "tracking".to_owned(),
-                        ahead: Some(ahead),
-                        behind: Some(behind),
-                    },
-                    _ => UpstreamDivergence {
-                        status: "unavailable".to_owned(),
-                        ahead: None,
-                        behind: None,
-                    },
+        Ok(Some(upstream_ref)) => {
+            let (remote, branch) = upstream_ref
+                .split_once('/')
+                .map(|(remote, branch)| (Some(remote.to_owned()), Some(branch.to_owned())))
+                .unwrap_or((None, None));
+            match git_output(
+                path,
+                &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+                cancelled,
+            ) {
+                Ok(Some(counts)) => {
+                    let mut parts = counts
+                        .split_whitespace()
+                        .filter_map(|part| part.parse::<u64>().ok());
+                    match (parts.next(), parts.next()) {
+                        (Some(ahead), Some(behind)) => UpstreamDivergence {
+                            status: "tracking".to_owned(),
+                            ahead: Some(ahead),
+                            behind: Some(behind),
+                            remote: remote.clone(),
+                            branch: branch.clone(),
+                        },
+                        _ => UpstreamDivergence {
+                            status: "unavailable".to_owned(),
+                            ahead: None,
+                            behind: None,
+                            remote: remote.clone(),
+                            branch: branch.clone(),
+                        },
+                    }
                 }
+                _ => UpstreamDivergence {
+                    status: "unavailable".to_owned(),
+                    ahead: None,
+                    behind: None,
+                    remote: remote.clone(),
+                    branch: branch.clone(),
+                },
             }
-            _ => UpstreamDivergence {
-                status: "unavailable".to_owned(),
-                ahead: None,
-                behind: None,
-            },
-        },
+        }
         Ok(None) => UpstreamDivergence {
             status: "noUpstream".to_owned(),
             ahead: None,
             behind: None,
+            remote: None,
+            branch: None,
         },
         Err(status) if status == "unsafeOwnership" => return empty_git_facts(&status),
         Err(_) => UpstreamDivergence {
             status: "unavailable".to_owned(),
             ahead: None,
             behind: None,
+            remote: None,
+            branch: None,
         },
     };
     GitFacts {
@@ -944,6 +976,21 @@ fn inspect_git(path: &Path, is_repository: bool, cancelled: &AtomicBool) -> GitF
         remotes,
         upstream,
     }
+}
+
+pub(crate) fn is_git_iso8601_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 25
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && matches!(bytes[19], b'+' | b'-')
+        && bytes[22] == b':'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 22) || byte.is_ascii_digit()
+        })
 }
 
 fn empty_git_facts(status: &str) -> GitFacts {
@@ -958,6 +1005,8 @@ fn empty_git_facts(status: &str) -> GitFacts {
             status: "unavailable".to_owned(),
             ahead: None,
             behind: None,
+            remote: None,
+            branch: None,
         },
     }
 }
@@ -1285,6 +1334,13 @@ mod tests {
             facts.latest_commit.as_ref().unwrap().subject,
             "fixture commit"
         );
+        assert!(facts
+            .latest_commit
+            .as_ref()
+            .unwrap()
+            .committed_at
+            .as_deref()
+            .is_some_and(is_git_iso8601_timestamp));
         assert_eq!(facts.upstream.status, "noUpstream");
         assert_eq!(
             facts.remotes[0].url.as_deref(),
@@ -1294,6 +1350,17 @@ mod tests {
 
         run_git(root.path(), &["checkout", "--quiet", "--detach", "HEAD"]);
         assert_eq!(inspect_git_fixture(root.path()).status, "detached");
+    }
+
+    #[test]
+    fn cached_latest_commit_without_timestamp_remains_readable() {
+        let latest: LatestCommit = serde_json::from_value(serde_json::json!({
+            "shortHash": "0123456789ab",
+            "subject": "older cached commit"
+        }))
+        .unwrap();
+        assert_eq!(latest.subject, "older cached commit");
+        assert_eq!(latest.committed_at, None);
     }
 
     #[test]
@@ -1515,6 +1582,8 @@ mod tests {
         assert_eq!(facts.upstream.status, "tracking");
         assert_eq!(facts.upstream.ahead, Some(1));
         assert_eq!(facts.upstream.behind, Some(1));
+        assert_eq!(facts.upstream.remote.as_deref(), Some("origin"));
+        assert_eq!(facts.upstream.branch.as_deref(), Some(branch.as_str()));
     }
 
     #[test]

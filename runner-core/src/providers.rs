@@ -1394,6 +1394,21 @@ pub fn app_server_thread_start(request_id: u64, cwd: &str, model_id: &str) -> Va
     })
 }
 
+pub fn app_server_read_only_thread_start(request_id: u64, cwd: &str, model_id: &str) -> Value {
+    let mut message = app_server_thread_start(request_id, cwd, model_id);
+    message["params"]["runtimeWorkspaceRoots"] = json!([]);
+    message["params"]["approvalPolicy"] = json!("never");
+    message["params"]["sandbox"] = json!("read-only");
+    message["params"]["ephemeral"] = json!(true);
+    message["params"]["dynamicTools"] = json!([]);
+    message["params"]["config"] = json!({
+        "apps": { "_default": { "enabled": false } },
+        "tools": { "web_search": { "enabled": false } },
+        "mcp_servers": {}
+    });
+    message
+}
+
 pub fn app_server_turn_start(
     request_id: u64,
     thread_id: &str,
@@ -1404,7 +1419,7 @@ pub fn app_server_turn_start(
     skill: Option<(&str, &str)>,
 ) -> Value {
     app_server_turn_start_with_output_schema(
-        request_id, thread_id, cwd, model_id, effort, prompt, skill, None,
+        request_id, thread_id, cwd, model_id, effort, prompt, skill, None, false,
     )
 }
 
@@ -1417,6 +1432,7 @@ pub(crate) fn app_server_turn_start_with_output_schema(
     prompt: &str,
     skill: Option<(&str, &str)>,
     output_schema: Option<&Value>,
+    read_only: bool,
 ) -> Value {
     let mut input = Vec::new();
     if let Some((name, path)) = skill {
@@ -1428,7 +1444,7 @@ pub(crate) fn app_server_turn_start_with_output_schema(
         "cwd": cwd,
         "runtimeWorkspaceRoots": [cwd],
         "model": model_id,
-        "approvalPolicy": "on-request",
+        "approvalPolicy": if read_only { "never" } else { "on-request" },
         "input": input
     });
     if let Some(effort) = effort {
@@ -1436,6 +1452,14 @@ pub(crate) fn app_server_turn_start_with_output_schema(
     }
     if let Some(output_schema) = output_schema {
         params["outputSchema"] = output_schema.clone();
+    }
+    if read_only {
+        params["runtimeWorkspaceRoots"] = json!([]);
+        params["config"] = json!({
+            "apps": { "_default": { "enabled": false } },
+            "tools": { "web_search": { "enabled": false } },
+            "mcp_servers": {}
+        });
     }
     json!({ "id": request_id, "method": "turn/start", "params": params })
 }

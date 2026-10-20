@@ -13,7 +13,11 @@ import {
 const activeStates = new Set(["queued", "running", "needsInput", "cancelling"]);
 const maxPendingRunEvents = 2_000;
 
-export function RunsPanel({ defaultCwd, project, issue, quickAction }: { defaultCwd: string; project: ProjectEntry; issue: GitHubIssue | null; quickAction?: { action: "dev-push" | "dev-build"; effects?: ("commit" | "push")[]; nonce: number } | null }) {
+export function RunsPanel({ defaultCwd = "", project, issue, mode = "actions" }: { mode?: "actions" | "activity"; defaultCwd?: string; project?: ProjectEntry; issue: GitHubIssue | null; }) {
+  const [outputRequest, setOutputRequest] = useState<{ runId: string } | null>(null);
+  const detailRef = useRef<HTMLElement>(null);
+  const outputRef = useRef<HTMLPreElement>(null);
+  const openedOutputRequest = useRef<typeof outputRequest>(undefined);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [executable, setExecutable] = useState("");
   const [cwd, setCwd] = useState(defaultCwd);
@@ -102,10 +106,10 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
   }, []);
 
   useEffect(() => setCwd(defaultCwd), [defaultCwd]);
-  useEffect(() => { if (quickAction) { setWorkflowAction(quickAction.action); setWorkflowIntent(""); setBuildProfile("release"); setRequestedEffects(new Set(quickAction.effects ?? [])); } }, [quickAction?.nonce]);
-  const supportsGithubPush = project.git.remotes.some((remote) => Boolean(remote.github));
-  useEffect(() => { if (!supportsGithubPush) setRequestedEffects((prior) => new Set([...prior].filter((effect) => effect === "commit"))); }, [project.id, supportsGithubPush]);
-  useEffect(() => { loadSettings().then((settings) => {
+
+  const supportsGithubPush = project?.git.remotes.some((remote) => Boolean(remote.github)) ?? false;
+  useEffect(() => { if (!supportsGithubPush) setRequestedEffects((prior) => new Set([...prior].filter((effect) => effect === "commit"))); }, [project?.id, supportsGithubPush]);
+  useEffect(() => { if (mode !== "actions") return; loadSettings().then((settings) => {
     const provider = settings.providers.find((item) => item.id === settings.providerSelection.providerId);
     const model = provider?.models.find((item) => item.id === settings.providerSelection.modelId);
     setSelectedProviderKind(provider?.kind ?? null);
@@ -114,8 +118,16 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
       ? `${provider.name} · ${model.name} · ${settings.providerSelection.routeSource ?? "manual"} selection${settings.providerSelection.routeConfidencePercent == null ? "" : ` · ${settings.providerSelection.routeConfidencePercent}% Jev confidence`}${settings.providerSelection.routeExplanation ? ` · ${settings.providerSelection.routeExplanation}` : ""}`
       : "No configured provider/model route is selected.");
   }).catch(() => { setSelectedProviderKind(null); setSelectedProviderId(null); setRouteConfirmation("The saved provider route could not be loaded."); }); }, []);
-  useEffect(() => { discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
-  const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0] ?? null, [runs, selectedId]);
+  useEffect(() => { if (mode !== "actions") return; discoverWorkflowSkills().then(setSkills).catch(() => setSkills([])); }, []);
+  const visibleRuns = useMemo(() => [...(mode === "activity" ? runs : runs.filter(run => sameProjectPath(run.cwd, defaultCwd)))].sort((a, b) => b.startedAtMs - a.startedAtMs), [runs, mode, defaultCwd]);
+  const selected = useMemo(() => visibleRuns.find((run) => run.id === selectedId) ?? visibleRuns[0] ?? null, [visibleRuns, selectedId]);
+
+  useEffect(() => {
+    if (!outputRequest || selected?.id !== outputRequest.runId || openedOutputRequest.current === outputRequest || !detailRef.current) return;
+    openedOutputRequest.current = outputRequest;
+    detailRef.current.scrollTop = 0;
+    if (outputRef.current) outputRef.current.scrollTop = 0;
+  }, [outputRequest, selected?.id]);
 
   async function exportDiagnostics() {
     if (historyBusyLock.current) return;
@@ -261,6 +273,7 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
   async function startAgentWorkflow(event: FormEvent) {
     event.preventDefault();
     setError("");
+    if (!project) return;
     if (workflowAction === "dev-push") { setCommitReviewOpen(true); return; }
     if (workflowAction === "dev-build") {
       if (!project.detectedStacks.includes("Tauri")) { setError("Scripted builds currently support Tauri projects."); return; }
@@ -345,14 +358,14 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
 
   async function retryBuild() {
     if (!selected?.workflow || selected.workflow.action !== "dev-build" || selected.processId !== null || !["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state)) return;
-    if (!sameProjectPath(selected.cwd, project.path)) { setError("Open this build's project before retrying it."); return; }
+    if (!project || !sameProjectPath(selected.cwd, project.path)) { setError("Open this build's project before retrying it."); return; }
     setError("");
     setBuildDialog({ project, profile: selected.workflow.buildProfile ?? "release" });
   }
 
-  return <div className="runs-workspace">
+  return <div className={`runs-workspace${mode === "activity" ? " activity-workspace" : ""}`}>
     {buildDialog && <BuildProgressDialog project={buildDialog.project} profile={buildDialog.profile} onClose={() => setBuildDialog(null)} onStarted={run => { setRuns(items => [run, ...items.filter(item => item.id !== run.id)].slice(0, 100)); setSelectedId(run.id); }} />}
-    {commitReviewOpen && <CommitReviewDialog project={project} onClose={() => setCommitReviewOpen(false)} />}
+    {project && commitReviewOpen && <CommitReviewDialog project={project} onClose={() => setCommitReviewOpen(false)} />}
     <dialog ref={deleteHistoryDialog} className="commit-review-dialog" aria-labelledby="delete-history-title">
       <h2 id="delete-history-title">Delete completed history?</h2>
       <p>Active runs will be kept.</p>
@@ -361,6 +374,7 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
         <button className="button button-secondary" type="button" autoFocus onClick={() => deleteHistoryDialog.current?.close()}>Cancel</button>
       </div>
     </dialog>
+    {mode === "actions" && project && <>
     <section className="panel run-launch-panel" aria-labelledby="agent-workflow-title">
       <div className="panel-heading"><div><h2 id="agent-workflow-title">Project actions</h2></div></div>
       <div className="panel-rule" />
@@ -413,31 +427,12 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
       </form>
       {error && <p className="scan-notice error-notice" role="alert">{error}</p>}
     </section>
-    </details><div className="runs-layout">
-      <section className="panel run-list-panel" aria-labelledby="run-history-title">
-        <div className="panel-heading"><div><h2 id="run-history-title">Recent runs</h2><p>Local history · at most 100 runs, 2,000 events and 512 KiB output per run.</p></div></div>
-        <div className="run-history-actions"><button className="button button-secondary" type="button" disabled={historyBusy} onClick={() => { void exportDiagnostics(); }}>{historyBusy ? "Working…" : "Export redacted diagnostics"}</button><button className="button button-secondary" type="button" disabled={historyBusy || runs.every((run) => activeStates.has(run.state))} onClick={() => deleteHistoryDialog.current?.showModal()}>Delete completed history</button></div>
-        {historyMessage && <p className="run-history-feedback" role="status" aria-live="polite">{historyMessage}</p>}
-        <div className="panel-rule" />
-        {runs.length ? runs.map((run) => <button key={run.id} type="button" className={`run-list-item${selected?.id === run.id ? " selected" : ""}`} onClick={() => setSelectedId(run.id)}>
-          <strong>{run.workflow?.action ?? run.executable.split(/[\\/]/).pop()}</strong><span>{run.state}{run.mutating ? " · mutating" : " · read only"}</span><small>{displayDirectoryPath(run.cwd)}</small>
-        </button>) : <p className="registry-context-note">No runs yet.</p>}
-      </section>
-      <section className="panel run-detail-panel" aria-labelledby="run-detail-title">
-        <div className="panel-heading"><div><h2 id="run-detail-title">{selected?.workflow?.action ?? (selected ? selected.executable : "Run output")}</h2><p>{selected ? `${selected.state} · ${displayDirectoryPath(selected.cwd)}` : "Select a run or start a configured executable."}</p></div>
-          {selected && activeStates.has(selected.state) && <button className="button button-secondary" type="button" onClick={() => { void cancel(selected.id); }}>Cancel run</button>}
-        </div><div className="panel-rule" />
-        {selected ? <>
-          <p className="registry-context-note">Started {new Date(selected.startedAtMs).toLocaleString()}{selected.finishedAtMs !== null ? ` · finished ${new Date(selected.finishedAtMs).toLocaleString()}` : " · in progress"}{selected.latencyMs !== null ? ` · measured latency ${(selected.latencyMs / 1000).toFixed(1)} s` : ""}{selected.provider ? ` · ${selected.provider}` : ""}{selected.modelId ? ` / ${selected.modelId}` : ""}{selected.provider === "ollama" ? ` · hardware-aware timeout ${selected.timeoutSeconds}s` : ""}</p>
-          {selected.workflow && <div className="work-context"><strong>Recorded action scope</strong><p>{selected.workflow.intent}</p>{selected.workflow.issueUrl && <a href={selected.workflow.issueUrl} target="_blank" rel="noreferrer">Issue context ↗</a>}{selected.workflow.scopePaths.length > 0 && <ul>{selected.workflow.scopePaths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>}<small>Requested effects: {selected.workflow.requestedEffects.length ? selected.workflow.requestedEffects.join(", ") : "none"}</small></div>}
-          {latestBuildStep(selected) && <p role="status" className="registry-context-note">{latestBuildStep(selected)}</p>}
-          <pre className="run-output" aria-live="polite">{selected.events.map((item) => `[${item.sequence}] ${item.kind}: ${item.text}`).join("\n") || "Waiting for process output…"}</pre>
-          {selected.workflow?.buildArtifact && <p className="registry-context-note">{selected.workflow.buildArtifact.verified ? "Artifact verified: " : "Artifact receipt unverified: "}{selected.workflow.buildArtifact.profile.toUpperCase()}{selected.workflow.buildArtifact.profile === "debug" ? " (DEBUG BUILD)" : " (RELEASE)"} · FileVersion {selected.workflow.buildArtifact.fileVersion} · ProductVersion {selected.workflow.buildArtifact.productVersion} · <code>{selected.workflow.buildArtifact.path}</code> · {selected.workflow.buildArtifact.verificationMessage}</p>}
-          {selected.workflow?.sideEffects && <p className="registry-context-note">{selected.workflow.sideEffects.verified ? "Verified side effects: " : "Agent-reported side effects, not fully verified: "}{selected.workflow.sideEffects.commitSha ? `commit ${selected.workflow.sideEffects.commitSha} · ` : ""}{selected.workflow.sideEffects.remoteBranch ? `branch ${selected.workflow.sideEffects.remoteBranch} · ` : ""}{selected.workflow.sideEffects.pullRequestUrl ? <a href={selected.workflow.sideEffects.pullRequestUrl} target="_blank" rel="noreferrer">pull request</a> : ""}{selected.workflow.sideEffects.verificationMessage ? ` · ${selected.workflow.sideEffects.verificationMessage}` : ""}</p>}
-          {selected.workflow?.action === "dev-build" && selected.state === "interrupted" && selected.processId !== null && <p className="registry-context-note">The previous build process (PID {selected.processId}) is still running. Retry will appear after it exits.</p>}
+    </details>
+    <a className="button button-secondary" href="#runs">View activity</a>
+    {selected && <details className="advanced-settings"><summary>Continue previous work</summary>
+      <label>Previous run<select value={selected.id} onChange={event => setSelectedId(event.target.value)}>{visibleRuns.map(run => <option key={run.id} value={run.id}>{run.workflow?.action ?? run.provider ?? "Task"} � {run.state} � {new Date(run.startedAtMs).toLocaleString()}</option>)}</select></label>
           {selected.workflow?.action === "dev-build" && selected.processId === null && ["failed", "interrupted", "cancelled", "timedOut"].includes(selected.state) && <button className="button button-secondary" type="button" disabled={busy || buildDialog !== null} onClick={() => { void retryBuild(); }}>Retry build safely</button>}
-          {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
-          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.fallbackDecisions?.map((decision, index) => <p key={`${decision.policyVersion}-${index}`}><strong>Fallback policy v{decision.policyVersion} · {decision.accepted ? "approved" : "not approved"}</strong> · {decision.trigger}{decision.localOnly ? " · local-only" : ""}: {decision.reason}{decision.targetProviderId && ` Target ${decision.targetProviderId}/${decision.targetModelId}.`}</p>)}{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}<div className="run-launch-options"><button className="button button-secondary" type="button" disabled={busy || selectedProviderId !== selected.handoff.targetProviderId} onClick={() => loadSavedHandoff(selected.handoff!)}>Load saved handoff into launch form</button>{selectedProviderId !== selected.handoff.targetProviderId && <small>Select the saved target provider in Providers to continue this handoff.</small>}</div></div>}
+      {selected.handoff && <div className="run-launch-options"><button className="button button-secondary" type="button" disabled={busy || selectedProviderId !== selected.handoff.targetProviderId} onClick={() => loadSavedHandoff(selected.handoff!)}>Load saved handoff into launch form</button>{selectedProviderId !== selected.handoff.targetProviderId && <small>Select the saved target provider in Providers to continue this handoff.</small>}</div>}
           {selected.finishedAtMs !== null && !activeStates.has(selected.state) && <details className="work-context"><summary>Prepare a manual provider handoff</summary><p>Creates a saved checkpoint for the currently selected target provider. The next run starts only when you press Start.</p><form className="run-launch-form" onSubmit={(event) => { void createHandoff(event); }}>
             <label>Goal<input required maxLength={8000} value={handoffGoal} onChange={(event) => setHandoffGoal(event.target.value)} /></label>
             <label>Scope<textarea required rows={2} maxLength={8000} value={handoffScope} onChange={(event) => setHandoffScope(event.target.value)} /></label>
@@ -454,6 +449,36 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
             </>}
             <button className="button button-secondary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save handoff checkpoint"}</button>
           </form></details>}
+    </details>}
+    </>}
+    {mode === "activity" && error && <p role="alert" className="scan-notice error-notice">{error}</p>}
+    {mode === "activity" && <div className="runs-layout">
+      <section className="panel run-list-panel" aria-labelledby="run-history-title">
+        <div className="panel-heading"><div><h2 id="run-history-title">Running &amp; completed work</h2></div></div>
+        <div className="run-history-actions"><button className="button button-secondary" type="button" disabled={historyBusy} onClick={() => { void exportDiagnostics(); }}>{historyBusy ? "Working…" : "Export redacted diagnostics"}</button><button className="button button-secondary" type="button" disabled={historyBusy || visibleRuns.every((run) => activeStates.has(run.state))} onClick={() => deleteHistoryDialog.current?.showModal()}>Delete completed history</button></div>
+        {historyMessage && <p className="run-history-feedback" role="status" aria-live="polite">{historyMessage}</p>}
+        <div className="panel-rule" />
+        <div className="run-history-list" tabIndex={0} role="region" aria-label="Run history">
+        {visibleRuns.length ? visibleRuns.map((run) => <button key={run.id} type="button" className={`run-list-item${selected?.id === run.id ? " selected" : ""}`} onClick={() => { setSelectedId(run.id); setOutputRequest({ runId: run.id }); }}>
+          <strong>{run.workflow?.action ?? run.executable.split(/[\\/]/).pop()}</strong><span>{run.state}{run.mutating ? " · mutating" : " · read only"}</span><small>{displayDirectoryPath(run.cwd)}</small>
+        </button>) : <p className="registry-context-note">No runs yet.</p>}
+        </div>
+      </section>
+      <section ref={detailRef} tabIndex={0} className="panel run-detail-panel" aria-labelledby="run-detail-title">
+        <div className="panel-heading"><div><h2 id="run-detail-title">{selected?.workflow?.action ?? (selected ? selected.executable : "Run output")}</h2><p>{selected ? `${selected.state} · ${displayDirectoryPath(selected.cwd)}` : "Select a run to view its output and results."}</p></div>
+          {selected && activeStates.has(selected.state) && <button className="button button-secondary" type="button" onClick={() => { void cancel(selected.id); }}>Cancel run</button>}
+        </div><div className="panel-rule" />
+        {selected ? <>
+          <p className="registry-context-note">Started {new Date(selected.startedAtMs).toLocaleString()}{selected.finishedAtMs !== null ? ` · finished ${new Date(selected.finishedAtMs).toLocaleString()}` : " · in progress"}{selected.latencyMs !== null ? ` · measured latency ${(selected.latencyMs / 1000).toFixed(1)} s` : ""}{selected.provider ? ` · ${selected.provider}` : ""}{selected.modelId ? ` / ${selected.modelId}` : ""}{selected.provider === "ollama" ? ` · hardware-aware timeout ${selected.timeoutSeconds}s` : ""}</p>
+          {selected.workflow && <div className="work-context"><strong>Recorded action scope</strong><p>{selected.workflow.intent}</p>{selected.workflow.issueUrl && <a href={selected.workflow.issueUrl} target="_blank" rel="noreferrer">Issue context ↗</a>}{selected.workflow.scopePaths.length > 0 && <ul>{selected.workflow.scopePaths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>}<small>Requested effects: {selected.workflow.requestedEffects.length ? selected.workflow.requestedEffects.join(", ") : "none"}</small></div>}
+          {latestBuildStep(selected) && <p role="status" className="registry-context-note">{latestBuildStep(selected)}</p>}
+          <pre ref={outputRef} tabIndex={-1} className="run-output" aria-live="polite">{selected.events.map((item) => `[${item.sequence}] ${item.kind}: ${item.text}`).join("\n") || "Waiting for process output…"}</pre>
+          {selected.workflow?.buildArtifact && <p className="registry-context-note">{selected.workflow.buildArtifact.verified ? "Artifact verified: " : "Artifact receipt unverified: "}{selected.workflow.buildArtifact.profile.toUpperCase()}{selected.workflow.buildArtifact.profile === "debug" ? " (DEBUG BUILD)" : " (RELEASE)"} · FileVersion {selected.workflow.buildArtifact.fileVersion} · ProductVersion {selected.workflow.buildArtifact.productVersion} · <code>{selected.workflow.buildArtifact.path}</code> · {selected.workflow.buildArtifact.verificationMessage}</p>}
+          {selected.workflow?.sideEffects && <p className="registry-context-note">{selected.workflow.sideEffects.verified ? "Verified side effects: " : "Agent-reported side effects, not fully verified: "}{selected.workflow.sideEffects.commitSha ? `commit ${selected.workflow.sideEffects.commitSha} · ` : ""}{selected.workflow.sideEffects.remoteBranch ? `branch ${selected.workflow.sideEffects.remoteBranch} · ` : ""}{selected.workflow.sideEffects.pullRequestUrl ? <a href={selected.workflow.sideEffects.pullRequestUrl} target="_blank" rel="noreferrer">pull request</a> : ""}{selected.workflow.sideEffects.verificationMessage ? ` · ${selected.workflow.sideEffects.verificationMessage}` : ""}</p>}
+          {selected.workflow?.action === "dev-build" && selected.state === "interrupted" && selected.processId !== null && <p className="registry-context-note">The previous build process (PID {selected.processId}) is still running.</p>}
+
+          {selected.workflow && !selected.workflow.sideEffects && selected.finishedAtMs !== null && selected.workflow.requestedEffects.length > 0 && <p className="registry-context-note">This run requested repository side effects but did not record a structured result. Verify the repository and GitHub before retrying; identical retries are blocked.</p>}
+          {selected.handoff && <div className="work-context"><strong>Portable handoff prepared</strong><p>Target provider: {selected.handoff.targetProviderId} · created {new Date(selected.handoff.createdAtMs).toLocaleString()}</p><p>Goal: {selected.handoff.goal}</p><p>Scope: {selected.handoff.scope}</p><p>Checks: {selected.handoff.checks}</p><p>Pending work: {selected.handoff.pendingWork}</p><p>Diff context: {selected.handoff.diff}</p>{selected.handoff.fallbackDecisions?.map((decision, index) => <p key={`${decision.policyVersion}-${index}`}><strong>Fallback policy v{decision.policyVersion} · {decision.accepted ? "approved" : "not approved"}</strong> · {decision.trigger}{decision.localOnly ? " · local-only" : ""}: {decision.reason}{decision.targetProviderId && ` Target ${decision.targetProviderId}/${decision.targetModelId}.`}</p>)}{selected.handoff.completedSideEffects && <small>Recorded side effects are included in the target prompt and marked do not repeat.</small>}</div>}
           {selected.state === "needsInput" && selected.events.filter((item) => item.kind === "approvalRequest" || item.kind === "userInputRequest").map((item) => <CodexRequestCard key={`${item.sequence}-${item.kind}`} runId={selected.id} event={item} onResolved={(requestId) => setRespondedRequests((prior) => new Set(prior).add(requestId))} isResolved={(requestId) => respondedRequests.has(requestId)} />)}
           {selected.state === "needsInput" && selected.provider !== "codex" && selected.provider !== "antigravity" && <form className="run-input-form" onSubmit={(event) => { event.preventDefault(); void sendInput(); }}>
             <label>Send process input (one line)<input value={input} onChange={(event) => setInput(event.target.value)} /></label>
@@ -461,9 +486,9 @@ export function RunsPanel({ defaultCwd, project, issue, quickAction }: { default
           </form>}
           {activeStates.has(selected.state) && selected.state !== "needsInput" && selected.provider !== "codex" && selected.provider !== "antigravity" && <button className="text-button" type="button" onClick={() => { void markNeedsInput(); }}>Mark as waiting for input</button>}
           {selected.exitCode !== null && <p className="registry-context-note">Exit code {selected.exitCode}</p>}
-        </> : <div className="empty-state"><h3>Nothing running yet</h3><p>Start a configured executable to see sequence-numbered output here.</p></div>}
+        </> : <div className="empty-state"><h3>Nothing running yet</h3><p>Work started from your projects appears here.</p></div>}
       </section>
-    </div>
+    </div>}
   </div>;
 }
 

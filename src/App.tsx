@@ -1,4 +1,4 @@
-import { ActivityEntry, ActivityOverview, sameProjectPath } from "./Activity";
+import { ActivityEntry, sameProjectPath } from "./Activity";
 import { mergeRefreshPaths as mergePaths, settleRefreshPaths, withoutRefreshPaths as withoutPaths } from "./projectRefreshState";
 import { ProjectCollection } from "./ProjectCollection";
 import { useEffect, useRef, useState } from "react";
@@ -50,7 +50,6 @@ function App() {
   const [progress, setProgress] = useState<ProjectScanProgress | null>(null);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [quickAction, setQuickAction] = useState<{ action: "dev-push" | "dev-build"; effects?: ("commit" | "push")[]; nonce: number } | null>(null);
   const [scanResult, setScanResult] = useState<ProjectScanFinished | null>(null);
   const [scanDurationMs, setScanDurationMs] = useState<number | null>(null);
   const [firstProjectMs, setFirstProjectMs] = useState<number | null>(null);
@@ -393,7 +392,7 @@ function App() {
   beginAffectedRefreshRef.current = (paths) => { void beginAffectedRefresh(paths); };
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${section === "runs" ? " activity-shell" : ""}`}>
       <a className="skip-link" href="#main-content" onClick={(event) => { event.preventDefault(); document.getElementById("main-content")?.focus(); }}>Skip to content</a>
       <aside className="sidebar" aria-label="Application navigation">
         <a className="brand" href="#projects" aria-label="Navis-Fabrica home">
@@ -425,12 +424,12 @@ function App() {
           <div className="toolbar-actions"><ActivityEntry /></div>
         </header>
 
-        <main id="main-content" className={`content${section === "projects" ? " content-projects" : ""}`} tabIndex={-1}>
+        <main id="main-content" className={`content${section === "projects" ? " content-projects" : section === "runs" ? " content-activity" : ""}`} tabIndex={-1}>
           {section !== "projects" && <div className="page-heading">
             <div>
               <p className="eyebrow">YOUR WORKSPACE</p>
               <h1>{current.label}</h1>
-              <p className="page-subtitle">{section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : "Follow your work and open project actions."}</p>
+              <p className="page-subtitle">{section === "settings" ? "Make this workspace feel like yours." : section === "providers" ? "Configure manual choices and inspect known provider capabilities." : section === "local-issues" ? "Read and edit local Markdown issues." : section === "batches" ? "Preview and manage bounded batches from local issues." : section === "runs" ? "View running and completed work." : "Choose a project to start work."}</p>
             </div>
             {section === "settings" && <button className="button button-primary" type="button" onClick={scanning ? stopScan : () => { void beginScan(); }} disabled={scanStatus === "cancelling"}>
               <span aria-hidden="true">{scanning ? "×" : "↻"}</span> {scanning ? "Cancel scan" : projects.length ? "Rediscover project folders" : "Discover project folders"}
@@ -438,20 +437,17 @@ function App() {
             {section === "settings" && <p role="status">{scanning ? "Discovering folders…" : scanError || freshnessLabel}</p>}{section === "settings" && Boolean(scanResult?.errors.length) && <details><summary>Some folders could not be inspected</summary><ul>{scanResult?.errors.map((error,index) => <li key={index}>{error}</li>)}</ul></details>}
           </div>}
 
-          <div hidden={section !== "projects"}>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} onQuickAction={(id, action, effects) => { setSelectedProjectId(id); setQuickAction({ action, effects, nonce: Date.now() }); window.location.hash = "runs"; }} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} /></div>
-          {section === "runs" && <ActivityOverview projects={projects} onSelect={setSelectedProjectId} />}
+          <div hidden={section !== "projects"}>{watchError && <p role="status">Automatic content updates are unavailable. Reopen the app or use Settings to refresh.</p>}{!desktop && <p className="scan-notice">Browser preview: native discovery, Git details and local issue reads require the desktop app.</p>}<ProjectCollection projects={projects} onSelect={setSelectedProjectId} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} /></div>
           <div hidden={section !== "local-issues"}><LocalIssuesPanel defaultPath={selectedProject?.path ?? projectRoot} /></div>
           <div hidden={section !== "batches"}><BatchRunnerPanel /></div>
           {section === "local-issues" || section === "batches" ? null : section === "settings" ? (
             <><details className="panel advanced-settings"><summary>My Projects</summary><ProjectCollection projects={projects} manage onSelect={setSelectedProjectId} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} /></details><details className="panel advanced-settings"><summary>Provider & model settings</summary><ProvidersPanel /></details><details className="panel advanced-settings"><summary>Discovery & workspace settings</summary><SettingsPanel /></details></>
           ) : section === "providers" ? (
             <ProvidersPanel />
-          ) : section === "runs" ? selectedProject ? isDesktopApp() ? (
-            <><div className="project-actions"><a href="#batches">Local issue batches</a><a href="#local-issues">Local issue workspace</a></div><RunsPanel defaultCwd={selectedProject.path} project={selectedProject} issue={null} quickAction={quickAction} /></>
+          ) : section === "runs" ? desktop ? (
+            <RunsPanel mode="activity" issue={null} />
           ) : (
-            <div className="panel empty-state"><h3>Workflow execution needs the desktop app</h3><p>The browser preview can inspect project context, but it cannot launch local processes.</p></div>
-          ) : (
-            <section className="panel empty-state"><h2>Activity</h2><p>Choose a project from My Projects to open its actions.</p><div className="project-actions"><a href="#projects">My Projects</a><a href="#batches">Local issue batches</a></div></section>
+            <section className="panel empty-state"><h2>Activity</h2><p>Run history is available in the desktop app.</p></section>
           ) : null}
         </main>
       </div>

@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
-import { isDesktopApp, listWorkflowRuns, onWorkflowRunUpdated, onWorkflowRunEvent, type WorkflowRun, type ProjectEntry } from "./settings";
-import { sameProjectPath } from "./projectRefreshState";
-import { latestBuildStep } from "./buildProgress";
+import { isDesktopApp, listWorkflowRuns, onWorkflowRunUpdated, onWorkflowRunEvent, type WorkflowRun } from "./settings";
 export { sameProjectPath } from "./projectRefreshState";
 export type BatchActivity = { batchId: string; projectPath?: string; state: string; needsAttention: boolean };
 let latestBatchActivity: BatchActivity | null = null;
@@ -45,12 +43,4 @@ export function ActivityEntry() {
   const runs = useWorkflowActivity();
   const batch = useBatchActivity();
   return <a className="activity-entry" href="#runs">Activity · {activityLabel(runs)}{batch ? ` · Batch ${batch.needsAttention ? "needs attention" : batch.state}` : ""}</a>;
-}
-export function ActivityOverview({ projects, onSelect }: { projects: ProjectEntry[]; onSelect: (id: string) => void }) {
-  const runs = useWorkflowActivity();
-  const batch = useBatchActivity();
-  return <section className="panel activity-overview"><h2>Recent activity</h2>{batch && <p><a href="#batches">Local batch {batch.batchId}: {batch.needsAttention ? "needs attention" : batch.state}</a></p>}{runs === null ? <p>Activity unavailable outside the desktop app, or the activity read failed.</p> : runs.length ? [...runs].sort((a,b) => b.startedAtMs-a.startedAtMs).slice(0,20).map(run => {
-    const project = projects.find(p => sameProjectPath(p.path,run.cwd));
-    return <div className="activity-row" key={run.id}><span><strong>{project?.name ?? run.cwd}</strong><small>{run.state} · {run.workflow?.action ?? run.provider ?? "Configured task"}{latestBuildStep(run) ? ` · ${latestBuildStep(run)}` : ""}</small></span>{project && <button className="text-button" onClick={() => onSelect(project.id)}>Open actions & output</button>}</div>;
-  }) : <p>No recorded work yet.</p>}<a href="#batches">Open local issue batches</a></section>;
 }

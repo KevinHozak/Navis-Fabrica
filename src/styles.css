@@ -514,3 +514,19 @@ fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
 @media (max-width: 560px) { .build-progress-steps { grid-template-columns: 1fr; gap: 7px; } }
 
 .commit-review-policy { color: #acc5df; font-size: 12px; }
+
+/* Activity keeps history and details within the viewport, with independent scrolling. */
+.activity-shell { height: 100dvh; min-height: 0; overflow: hidden; }
+.activity-shell .main-column { min-height: 0; }
+.activity-shell .toolbar { flex-shrink: 0; }
+.content.content-activity { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.content-activity > .page-heading { flex-shrink: 0; }
+.activity-workspace { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.activity-workspace .runs-layout { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
+.activity-workspace .run-list-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.run-list-panel > :not(.run-history-list) { flex-shrink: 0; }
+.run-history-list { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.activity-workspace .run-detail-panel { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+@media (max-width: 720px) {
+  .activity-workspace .runs-layout { grid-template-rows: minmax(160px, .7fr) minmax(0, 1fr); }
+}

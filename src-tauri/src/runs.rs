@@ -126,6 +126,59 @@ pub struct CommitDraftContext {
 }
 
 pub fn capture_commit_draft_context(cwd: &Path) -> Result<CommitDraftContext, String> {
+    capture_commit_context(cwd, true)
+}
+
+// Validation uses the same fingerprint without rebuilding AI excerpts.
+pub fn capture_commit_review_state(cwd: &Path) -> Result<CommitDraftContext, String> {
+    capture_commit_context(cwd, false)
+}
+
+// Display-only: no diff, content hashing, version preparation or provider work.
+// This result is never accepted as an approved commit snapshot.
+pub fn commit_changed_paths(cwd: &Path) -> Result<Vec<String>, String> {
+    let output = git_output(
+        cwd,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err("Could not list changed files.".into());
+    }
+    let mut entries = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty());
+    let mut paths = Vec::new();
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            return Err("Git returned an unreadable changed-file list.".into());
+        }
+        paths.push(
+            std::str::from_utf8(&entry[3..])
+                .map_err(|_| "Git returned an unreadable file path.")?
+                .replace('\\', "/"),
+        );
+        // Porcelain -z puts the original path after a rename/copy entry.
+        if entry[..2].contains(&b'R') || entry[..2].contains(&b'C') {
+            entries
+                .next()
+                .ok_or("Git returned an incomplete renamed-file entry.")?;
+        }
+    }
+    paths.sort_by_key(|path| path.to_lowercase());
+    Ok(paths)
+}
+
+fn capture_commit_context(
+    cwd: &Path,
+    include_excerpts: bool,
+) -> Result<CommitDraftContext, String> {
     let snapshot =
         git_worktree_snapshot(cwd)?.ok_or("The selected folder is not a Git worktree.")?;
     let root = &snapshot.root;
@@ -216,6 +269,33 @@ pub fn capture_commit_draft_context(cwd: &Path) -> Result<CommitDraftContext, St
         });
     };
 
+    let context = if include_excerpts {
+        commit_diff_context(root, &snapshot.changed_paths)?
+    } else {
+        String::new()
+    };
+    let fingerprint = commit_draft_fingerprint(
+        root,
+        &snapshot.fingerprint,
+        &head,
+        &branch,
+        remote.as_deref(),
+        upstream_branch.as_deref(),
+    )?;
+    Ok(CommitDraftContext {
+        mode: mode.into(),
+        snapshot_fingerprint: fingerprint,
+        head,
+        branch,
+        paths: snapshot.changed_paths,
+        remote,
+        upstream_branch,
+        ahead,
+        diff_context: context,
+    })
+}
+
+fn commit_diff_context(root: &Path, changed_paths: &[String]) -> Result<String, String> {
     let untracked_output = git_output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     if !untracked_output.status.success() {
         return Err("Could not inspect untracked changes.".into());
@@ -228,7 +308,8 @@ pub fn capture_commit_draft_context(cwd: &Path) -> Result<CommitDraftContext, St
         .map(|path| path.replace('\\', "/"))
         .collect::<HashSet<_>>();
     let mut context = String::new();
-    for path in snapshot.changed_paths.iter().take(40) {
+    let mut tracked_paths = Vec::new();
+    for path in changed_paths.iter().take(40) {
         if !safe_commit_context_path(path) {
             context.push_str(&format!(
                 "\n[content omitted for sensitive or non-source path: {}]\n",
@@ -259,61 +340,47 @@ pub fn capture_commit_draft_context(cwd: &Path) -> Result<CommitDraftContext, St
                 &format!("+++ {path} (new file) +++\n{text}"),
             );
         } else {
-            let staged = git_output(
-                root,
-                &[
-                    "diff",
-                    "--cached",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                    "--unified=2",
-                    "--",
-                    path,
-                ],
-            )?;
-            let unstaged = git_output(
-                root,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                    "--unified=2",
-                    "--",
-                    path,
-                ],
-            )?;
-            if !staged.status.success() || !unstaged.status.success() {
-                return Err("Could not read the selected text changes.".into());
-            }
-            let mut text = String::from_utf8_lossy(&staged.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&unstaged.stdout));
-            append_bounded_diff(&mut context, path, &text);
+            tracked_paths.push(path.as_str());
         }
         if context.len() >= 48 * 1024 {
             break;
         }
     }
-    let fingerprint = commit_draft_fingerprint(
-        root,
-        &snapshot.fingerprint,
-        &head,
-        &branch,
-        remote.as_deref(),
-        upstream_branch.as_deref(),
-    )?;
-    Ok(CommitDraftContext {
-        mode: mode.into(),
-        snapshot_fingerprint: fingerprint,
-        head,
-        branch,
-        paths: snapshot.changed_paths,
-        remote,
-        upstream_branch,
-        ahead,
-        diff_context: context,
-    })
+    // Two processes for all eligible tracked files, rather than two per file.
+    // Literal pathspecs prevent a filename containing Git glob syntax from
+    // widening the sensitive-path-filtered selection.
+    if !tracked_paths.is_empty() {
+        for cached in [true, false] {
+            let mut args = vec![
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-color",
+                "--unified=2",
+            ];
+            if cached {
+                args.push("--cached");
+            }
+            args.push("--");
+            args.extend(tracked_paths.iter().copied());
+            let output = git_output(root, &args)?;
+            if !output.status.success() {
+                return Err("Could not read the selected text changes.".into());
+            }
+            append_bounded_diff(
+                &mut context,
+                if cached {
+                    "Staged changes"
+                } else {
+                    "Unstaged changes"
+                },
+                &String::from_utf8_lossy(&output.stdout),
+            );
+        }
+    }
+    Ok(context)
 }
 
 fn commit_draft_fingerprint(
@@ -3120,7 +3187,7 @@ fn install_version_helpers(inputs: &Path) -> Result<(), String> {
 }
 
 pub fn prepare_commit_review(app: &AppHandle, cwd: &Path) -> Result<CommitDraftContext, String> {
-    let context = capture_commit_draft_context(cwd)?;
+    let context = capture_commit_review_state(cwd)?;
     if context.mode == "pushOnly" || !cwd.join("src-tauri/tauri.conf.json").is_file() {
         return Ok(context);
     }
@@ -3173,7 +3240,7 @@ pub fn prepare_commit_review(app: &AppHandle, cwd: &Path) -> Result<CommitDraftC
         }
         let value: serde_json::Value = serde_json::from_str(&message)
             .map_err(|_| "Could not read version preparation result.".to_string())?;
-        let refreshed = capture_commit_draft_context(cwd)?;
+        let refreshed = capture_commit_review_state(cwd)?;
         Ok((
             refreshed,
             format!(
@@ -3296,7 +3363,7 @@ pub fn start_reviewed_git_run(
             "This operation supports only reviewed commit, push and pull request effects.".into(),
         );
     }
-    let context = capture_commit_draft_context(cwd)?;
+    let context = capture_commit_review_state(cwd)?;
     let mut expected_effects = match context.mode.as_str() {
         "commit" => vec!["commit"],
         "commitPush" => vec!["commit", "push"],
@@ -3354,7 +3421,7 @@ pub fn start_reviewed_git_run(
         .map(|remote| read(&["remote", "get-url", remote]))
         .transpose()?;
     // Recheck after reading all per-file state; never bless a mixed snapshot.
-    if capture_commit_draft_context(&cwd)?.snapshot_fingerprint != context.snapshot_fingerprint {
+    if capture_commit_review_state(&cwd)?.snapshot_fingerprint != context.snapshot_fingerprint {
         return Err("Repository changes shifted during preflight. Refresh the dialog.".into());
     }
     workflow.expected_head = context.head.clone();
@@ -3468,7 +3535,7 @@ pub fn start_codex_workflow_run(
             },
         )?;
         if let Some(expected) = workflow.draft_snapshot_fingerprint.as_deref() {
-            let actual = capture_commit_draft_context(&cwd)?;
+            let actual = capture_commit_review_state(&cwd)?;
             if actual.snapshot_fingerprint != expected {
                 return Err("Repository changes shifted after this draft. Refresh the draft before confirming.".into());
             }
@@ -3485,7 +3552,7 @@ pub fn start_codex_workflow_run(
                 .iter()
                 .any(|effect| effect == "push")
         {
-            let target = capture_commit_draft_context(&cwd)?;
+            let target = capture_commit_review_state(&cwd)?;
             if target.mode != "commitPush"
                 || target.snapshot_fingerprint
                     != workflow
@@ -4166,7 +4233,7 @@ fn start_run_with_workflow(
             .and_then(|workflow| workflow.draft_snapshot_fingerprint.as_deref())
         {
             let current =
-                capture_commit_draft_context(&cwd).map(|context| context.snapshot_fingerprint);
+                capture_commit_review_state(&cwd).map(|context| context.snapshot_fingerprint);
             if current.as_deref().ok() != Some(expected) {
                 if request.mutating {
                     state.mutating_paths.remove(&canonical_key);
@@ -5305,6 +5372,83 @@ mod tests {
         assert!(capture_commit_draft_context(fixture.path())
             .unwrap_err()
             .contains("already in progress"));
+    }
+
+    #[test]
+    fn commit_preview_and_batched_excerpts_preserve_review_fingerprints() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        for name in [
+            "a[1].txt",
+            "a-secret.txt",
+            "removed.txt",
+            "renamed.txt",
+            ".env",
+        ] {
+            fs::write(fixture.path().join(name), "baseline\n").unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        fs::write(fixture.path().join("a[1].txt"), "staged text\n").unwrap();
+        git(&["--literal-pathspecs", "add", "--", "a[1].txt"]);
+        fs::write(fixture.path().join("a[1].txt"), "unstaged text\n").unwrap();
+        for name in ["a-secret.txt", ".env"] {
+            fs::write(fixture.path().join(name), "DO-NOT-SEND\n").unwrap();
+        }
+        fs::remove_file(fixture.path().join("removed.txt")).unwrap();
+        fs::write(fixture.path().join("new file.txt"), "untracked text\n").unwrap();
+        let start = Instant::now();
+        let paths = commit_changed_paths(fixture.path()).unwrap();
+        println!("Display-only Git status: {:?}", start.elapsed());
+        assert!(paths.contains(&"new file.txt".into()));
+        assert!(paths.contains(&"removed.txt".into()));
+        let review = capture_commit_review_state(fixture.path()).unwrap();
+        let draft = capture_commit_draft_context(fixture.path()).unwrap();
+        assert_eq!(paths, review.paths);
+        assert_eq!(review.snapshot_fingerprint, draft.snapshot_fingerprint);
+        assert!(review.diff_context.is_empty());
+        for text in [
+            "staged text",
+            "unstaged text",
+            "untracked text",
+            "removed.txt",
+        ] {
+            assert!(draft.diff_context.contains(text), "missing {text}");
+        }
+        assert!(!draft.diff_context.contains("DO-NOT-SEND"));
+        fs::write(
+            fixture.path().join("new file.txt"),
+            "changed after review\n",
+        )
+        .unwrap();
+        assert_ne!(
+            review.snapshot_fingerprint,
+            capture_commit_review_state(fixture.path())
+                .unwrap()
+                .snapshot_fingerprint
+        );
+        git(&["mv", "renamed.txt", "new name.txt"]);
+        assert!(commit_changed_paths(fixture.path())
+            .unwrap()
+            .contains(&"new name.txt".into()));
+        assert!(
+            capture_commit_review_state(fixture.path()).is_err(),
+            "preview must not relax existing rename safety"
+        );
     }
 
     #[test]

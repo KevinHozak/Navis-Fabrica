@@ -51,6 +51,7 @@
     "allow-calibrate-routing",
     "allow-get-project-inventory",
     "allow-get-project-commit-draft-context",
+    "allow-get-project-commit-changed-paths",
     "allow-prepare-project-commit-review",
     "allow-draft-project-commit-message",
     "allow-get-project-icon",

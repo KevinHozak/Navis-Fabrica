@@ -1,6 +1,7 @@
 import { useWorkflowActivity, useBatchActivity, activityLabel, sameProjectPath } from "./Activity";
-import { useEffect, useRef, useState } from "react";
-import { draftProjectCommitMessage, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectFolder, startReviewedGitRun, type CommitDraftContext, type CommitMessageDraft, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
+import { useEffect, useReducer, useRef, useState } from "react";
+import { commitReviewReducer, initialCommitReview, loadCommitReview } from "./commitReviewState";
+import { draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
 import { issueCommand, type IssuePage } from "./runnerClient";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
 
@@ -212,11 +213,10 @@ export function ProjectCard({ project, runs, selected, onClick, onQuickAction, o
 }
 
 export function CommitReviewDialog({ project, onClose }: { project: ProjectEntry; onClose: () => void }) {
-  const [context, setContext] = useState<CommitDraftContext | null>(null);
-  const [subject, setSubject] = useState("");
-  const [body, setBody] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [review, dispatchReview] = useReducer(commitReviewReducer, initialCommitReview);
+  const { context, paths, subject, body, error, phase } = review;
+  const loading = phase !== "ready";
+  const preparing = phase === "files" || phase === "preparing";
   const [busy, setBusy] = useState(false);
   const { run, setRun, running } = useLiveWorkflowRun();
   const started = run !== null;
@@ -232,25 +232,21 @@ export function CommitReviewDialog({ project, onClose }: { project: ProjectEntry
   }, [run?.nextSequence]);
   useEffect(() => {
     let active = true;
-    setLoading(true); setError(""); setContext(null); setSubject(""); setBody("");
-    prepareProjectCommitReview(project.id).then(async value => {
-      if (!active) return;
-      setContext(value);
-      if (value.mode === "pushOnly") return;
-      try {
-        const draft = await draftProjectCommitMessage(project.id, value.snapshotFingerprint);
-        if (active) { setSubject(draft.subject); setBody(draft.body); }
-      } catch (reason) { if (active) setError(reason instanceof Error ? reason.message : String(reason)); }
-    }).catch(reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)); })
-      .finally(() => { if (active) setLoading(false); });
+    dispatchReview({ type: "reset" });
+    void loadCommitReview({
+      paths: () => getProjectCommitChangedPaths(project.id),
+      prepare: () => prepareProjectCommitReview(project.id),
+      draft: fingerprint => draftProjectCommitMessage(project.id, fingerprint),
+    }, dispatchReview, () => active);
     return () => { active = false; };
   }, [project.id, draftRevision]);
   const actionLabel = context?.mode === "pushOnly" ? `Push ${context.ahead} ${context.ahead === 1 ? "commit" : "commits"}`
     : context?.mode === "commit" ? "Commit" : "Commit & Push";
   async function retryDraft() { setDraftRevision(value => value + 1); }
   async function confirm() {
-    if (!context || (context.mode !== "pushOnly" && !subject.trim()) || busy || started) return;
+    if (!context || preparing || (context.mode !== "pushOnly" && !subject.trim()) || busy || started) return;
     setBusy(true); setRunError("");
+    dispatchReview({ type: "freeze" });
     try {
       const requestedEffects: ("commit" | "push" | "createPullRequest")[] = context.mode === "pushOnly" ? ["push", "createPullRequest"]
         : context.mode === "commit" ? ["commit"] : ["commit", "push", "createPullRequest"];
@@ -268,21 +264,21 @@ export function CommitReviewDialog({ project, onClose }: { project: ProjectEntry
         autoMergePullRequest: context.mode !== "commit",
       };
       setRun(await startReviewedGitRun(project.id, workflow));
-    } catch (reason) { setRunError(reason instanceof Error ? reason.message : String(reason)); }
+    } catch (reason) { dispatchReview({ type: "thaw" }); setRunError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
   }
   return <dialog ref={dialogRef} className="commit-review-dialog commit-review-workflow" aria-labelledby="commit-review-title" onCancel={event => { event.preventDefault(); if (!busy) closeDialog(); }}>
     <div className="commit-review-heading"><div><p className="eyebrow">{project.name} · {context?.branch ?? project.git.branch ?? "Git"}</p><h2 id="commit-review-title">Review changes</h2></div><button type="button" className="text-button" aria-label="Close review" disabled={busy} onClick={closeDialog}>×</button></div>
-    <div className="commit-review-content" aria-busy={loading}>
+    <div className="commit-review-content" aria-busy={preparing}>
       <div className="commit-review-summary">
-        {context ? <span>{context.mode === "pushOnly" ? `${context.ahead} existing commits` : `${context.paths.length} changed ${context.paths.length === 1 ? "file" : "files"}`}</span>
+        {paths ? <span>{context?.mode === "pushOnly" ? `${context.ahead} existing commits` : `${paths.length} changed ${paths.length === 1 ? "file" : "files"}`}</span>
           : <span className={loading ? "commit-review-skeleton" : ""}>{loading ? "Preparing changes…" : "Changes unavailable"}</span>}
-        {loading && <span className="commit-review-loading" role="status"><span className="commit-review-spinner" />{context ? "Drafting…" : "Preparing version…"}</span>}
+        {loading && <span className="commit-review-loading" role="status"><span className="commit-review-spinner" />{phase === "drafting" ? "Drafting…" : phase === "files" ? "Finding changes…" : "Preparing review…"}</span>}
       </div>
-      <div className="commit-review-paths">{context ? context.paths.map(path => <code key={path}>{path}</code>)
+      <div className="commit-review-paths">{paths ? paths.map(path => <code key={path}>{path}</code>)
         : loading && <><span className="commit-review-skeleton" /><span className="commit-review-skeleton" /><span className="commit-review-skeleton" /></>}</div>
-      <label>Message<input autoFocus maxLength={200} value={subject} disabled={loading || busy || started || !context || context.mode === "pushOnly"} placeholder={context?.mode === "pushOnly" ? "Existing commit messages are preserved" : loading ? "Drafting message…" : ""} className={loading ? "commit-review-pending" : ""} onChange={event => setSubject(event.target.value)} /></label>
-      <label>Description<textarea rows={4} maxLength={4000} value={body} disabled={loading || busy || started || !context || context.mode === "pushOnly"} placeholder={loading ? "Drafting description…" : ""} className={loading ? "commit-review-pending" : ""} onChange={event => setBody(event.target.value)} /></label>
+      <label>Message<input autoFocus maxLength={200} value={subject} disabled={busy || started || paths === null || context?.mode === "pushOnly"} placeholder={context?.mode === "pushOnly" ? "Existing commit messages are preserved" : phase === "drafting" ? "Drafting message…" : ""} onChange={event => dispatchReview({ type: "subject", value: event.target.value })} /></label>
+      <label>Description<textarea rows={4} maxLength={4000} value={body} disabled={busy || started || paths === null || context?.mode === "pushOnly"} placeholder={phase === "drafting" ? "Drafting description…" : ""} onChange={event => dispatchReview({ type: "body", value: event.target.value })} /></label>
       {context && context.mode !== "commit" && <p className="commit-review-policy">Rebases before pushing. Opens and merges a PR if required, after checks and reviews. Syncs the local base after merge. Stops on conflicts.</p>}
       {error && <p className="project-card-refresh-error" role="alert">{error}</p>}
       {runError && <p className="project-card-refresh-error" role="alert">{runError}</p>}
@@ -295,7 +291,7 @@ export function CommitReviewDialog({ project, onClose }: { project: ProjectEntry
     {run && localSyncStatus(run) && <p className="commit-review-policy" role="status">{localSyncStatus(run)}</p>}
     {run?.workflow?.sideEffects?.pullRequestUrl && <p className="commit-review-policy"><a href={run.workflow.sideEffects.pullRequestUrl} target="_blank" rel="noreferrer">Open pull request and checks ↗</a></p>}
     <div className="dialog-actions">
-      {!started && <button className="button button-primary" type="button" disabled={!context || loading || busy || (context.mode !== "pushOnly" && !subject.trim())} onClick={() => void confirm()}>{busy ? "Starting…" : actionLabel}</button>}
+      {!started && <button className="button button-primary" type="button" disabled={!context || preparing || busy || (context.mode !== "pushOnly" && !subject.trim())} onClick={() => void confirm()}>{busy ? "Starting…" : actionLabel}</button>}
       {!started && (error || runError) && !loading && <button className="button button-secondary" type="button" disabled={busy} onClick={() => { setRunError(""); void retryDraft(); }}>Refresh draft</button>}
       <button className="button button-secondary" type="button" disabled={busy} onClick={closeDialog}>{started ? "Close" : "Cancel"}</button>
     </div>

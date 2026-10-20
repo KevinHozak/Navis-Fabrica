@@ -324,6 +324,7 @@ export const isDesktopApp = () => isTauri();
 
 export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
 export const getProjectCommitDraftContext = (projectId: string) => invoke<CommitDraftContext>("get_project_commit_draft_context", { projectId });
+export const getProjectCommitChangedPaths = (projectId: string) => invoke<string[]>("get_project_commit_changed_paths", { projectId });
 export const prepareProjectCommitReview = (projectId: string) => invoke<CommitDraftContext>("prepare_project_commit_review", { projectId });
 export const draftProjectCommitMessage = (projectId: string, expectedFingerprint: string) => invoke<CommitMessageDraft>("draft_project_commit_message", { projectId, expectedFingerprint });
 export const getProjectIcon = (projectId: string) => invoke<string | null>("get_project_icon", { projectId });

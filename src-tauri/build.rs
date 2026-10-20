@@ -6,6 +6,7 @@ fn main() {
             "get_settings",
             "get_project_inventory",
             "get_project_commit_draft_context",
+            "get_project_commit_changed_paths",
             "prepare_project_commit_review",
             "draft_project_commit_message",
             "start_reviewed_git_run",

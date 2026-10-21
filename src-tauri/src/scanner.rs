@@ -1120,7 +1120,7 @@ fn empty_git_facts(status: &str) -> GitFacts {
     }
 }
 
-fn git_output(
+pub(crate) fn git_output(
     path: &Path,
     args: &[&str],
     cancelled: &AtomicBool,

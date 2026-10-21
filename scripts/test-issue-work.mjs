@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import { build } from 'esbuild';
+import { readFileSync } from 'node:fs';
+const nativeBuild = readFileSync('src-tauri/build.rs', 'utf8');
+const capability = JSON.parse(readFileSync('src-tauri/capabilities/default.json', 'utf8'));
+assert.match(nativeBuild, /"prepare_issue_work"/);
+assert.ok(capability.permissions.includes('allow-prepare-issue-work'));
+import { createRequire } from 'node:module';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+const require = createRequire(import.meta.url);
+async function load(entry) {
+  const result = await build({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', write: false, packages: 'external', jsx: 'automatic' });
+  const mod = { exports: {} };
+  new Function('require', 'module', 'exports', result.outputFiles[0].text)(require, mod, mod.exports);
+  return mod.exports;
+}
+const { previewBlocked, submissionDisposition } = await load('src/issueWorkState.ts');
+// The bundled client owns this Error identity; construct typed errors through it.
+const state = await build({ stdin: { contents: 'export { submissionDisposition } from "./src/issueWorkState"; export { RunnerCommandError } from "./src/batchClient";', resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', write: false, packages: 'external' });
+const mod = { exports: {} };
+new Function('require', 'module', 'exports', state.outputFiles[0].text)(require, mod, mod.exports);
+const { RunnerCommandError } = mod.exports;
+assert.equal(mod.exports.submissionDisposition(new RunnerCommandError('WORKER_LAUNCH_FAILED', 'admitted but not launched')), 'admitted');
+assert.equal(mod.exports.submissionDisposition(new RunnerCommandError('CONFLICT', 'different batch')), 'refused');
+assert.equal(submissionDisposition(new Error('transport lost after submit')), 'unknown');
+assert.equal(previewBlocked({}), true);
+assert.equal(previewBlocked({ issues: [{ tasks: [] }] }), true);
+assert.equal(previewBlocked({ issues: [{ tasks: [{ eligible: true }, { eligible: false }] }] }), true);
+assert.equal(previewBlocked({ issues: [{ tasks: [{ eligible: true }, { eligible: true }] }] }), false);
+const { IssueWorkDialog, issueAcceptance } = await load('src/IssueWorkDialog.tsx');
+assert.equal(issueAcceptance('- [ ] First\r\n- [x] Second\nOther text'), 'First\nSecond');
+globalThis.localStorage = { getItem: () => null };
+const issue = { record: { frontmatter: { id: 'TEST-S001', title: 'Example', status: 'open', type: 'task' }, body: '- [ ] Output exists' }, revision: 'source', unresolvedDependencies: [], unresolvedParents: [] };
+const html = renderToStaticMarkup(React.createElement(IssueWorkDialog, { projectPath: 'C:\\Projects\\Example', configPath: 'C:\\Projects\\Example\\runner.json', issue, onClose() {} }));
+assert.match(html, /Work on issue/);
+assert.match(html, /Advanced/);
+assert.match(html, /Override automatic plan/);
+assert.match(html, /Preparing issue plan/);
+assert.doesNotMatch(html, /Files or folders|Working folder|Start work|GitHub|pull request|Codex skill|Intentional change scope/);
+console.log('Issue work regressions passed: preview gates, admission ambiguity, and focused dialog.');

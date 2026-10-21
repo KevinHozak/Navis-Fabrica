@@ -9,6 +9,7 @@
     "allow-get-settings",
     "allow-runner-core-execute",
     "allow-get-runner-context",
+    "allow-prepare-issue-work",
     "allow-discover-workflow-skills",
     "allow-save-settings",
     "allow-save-project-display-preferences",

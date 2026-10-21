@@ -3,6 +3,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "runner_core_execute",
             "get_runner_context",
+            "prepare_issue_work",
             "get_settings",
             "get_project_inventory",
             "get_project_commit_draft_context",

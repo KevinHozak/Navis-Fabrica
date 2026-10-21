@@ -19,6 +19,8 @@ use tempfile::NamedTempFile;
 
 mod github;
 mod inventory;
+mod issue_work;
+mod issue_work_inference;
 pub use navis_fabrica_runner_core as runner_core;
 pub mod jev;
 mod process;
@@ -854,6 +856,18 @@ fn get_runner_context(app: AppHandle) -> Result<serde_json::Value, String> {
     Ok(
         serde_json::json!({"dataRoot": root, "workerAvailable": resolve_worker_executable(&app).is_ok()}),
     )
+}
+
+#[tauri::command]
+async fn prepare_issue_work(
+    app: AppHandle,
+    input: issue_work::WorkInput,
+) -> Result<runner_core::supervisor::BatchRequest, String> {
+    let settings = settings_path(&app)?;
+    let data = default_runner_data_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || issue_work::prepare(input, &settings, &data))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn is_runner_supervisor_operation(operation: runner_core::Operation) -> bool {
@@ -2874,6 +2888,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             runner_core_execute,
+            prepare_issue_work,
             get_runner_context,
             get_settings,
             get_project_inventory,

@@ -514,6 +514,10 @@ fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
 .build-progress-steps .is-complete { color: #9dd8bd; }
 .build-progress-dialog .commit-review-progress { min-height: 240px; }
 .build-progress-dialog .commit-review-progress pre { max-height: none; }
+.issue-work-dialog > .run-launch-form { min-height: 0; overflow: auto; flex: 1; padding-right: 8px; }
+.issue-work-dialog fieldset { display: grid; gap: 10px; border: 1px solid #354252; border-radius: 8px; }
+.issue-work-dialog fieldset label { display: grid; gap: 6px; font-size: 11px; color: #aab5c3; }
+.issue-work-dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .build-progress-artifact { display: grid; gap: 6px; font-size: 12px; }
 .build-progress-artifact code { overflow-wrap: anywhere; }
 @media (max-width: 560px) { .build-progress-steps { grid-template-columns: 1fr; gap: 7px; } }

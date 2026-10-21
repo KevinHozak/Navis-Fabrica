@@ -9,7 +9,7 @@ function savedConnection(): { dataRoot: string; batchId: string; projectPath?: s
 }
 const money = (micros: number) => `$${(micros / 1000000).toFixed(4)}`;
 export function BatchRunnerPanel() {
-  const [saved] = useState(savedConnection);
+  const [saved, setSaved] = useState(savedConnection);
   const [dataRoot, setDataRoot] = useState(saved.dataRoot);
   const [batchId, setBatchId] = useState(saved.batchId);
   const [planPath, setPlanPath] = useState("");
@@ -31,6 +31,15 @@ export function BatchRunnerPanel() {
   const scope = useRef({ dataRoot, batchId });
   scope.current = { dataRoot, batchId };
   const desktop = isDesktopApp();
+  useEffect(() => {
+    function connect(event: Event) {
+      const value = (event as CustomEvent<{ dataRoot: string; batchId: string; projectPath?: string }>).detail;
+      if (!value || typeof value.dataRoot !== "string" || typeof value.batchId !== "string" || !value.dataRoot || !value.batchId) return;
+      setSaved(value); setPreview(null); changeScope(value.dataRoot, value.batchId); setConnected(true);
+    }
+    window.addEventListener("fabrica-runner-connect", connect);
+    return () => window.removeEventListener("fabrica-runner-connect", connect);
+  }, []);
   const invalidAssignments = preview?.plan.issues?.some(issue => issue.tasks?.some(task => !task.eligible)) ?? false;
   useEffect(() => {
     if (!desktop || saved.dataRoot) return;

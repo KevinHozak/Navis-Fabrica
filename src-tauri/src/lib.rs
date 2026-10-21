@@ -1562,16 +1562,46 @@ struct CommitDraftFields {
 fn parse_commit_draft(text: &str) -> Result<(String, String), String> {
     let draft: CommitDraftFields = serde_json::from_str(text.trim())
         .map_err(|_| "Gemini did not return the required JSON commit draft. Retry or enter a message manually.".to_owned())?;
-    let subject = draft.subject.trim().to_owned();
-    let body = draft.body.trim().to_owned();
-    if subject.is_empty()
-        || subject.chars().count() > 72
-        || subject.chars().any(char::is_control)
-        || body.len() > 4_000
-        || body.contains('\0')
-    {
+    let mut subject = draft.subject.trim().to_owned();
+    let mut body = draft.body.trim().to_owned();
+    if subject.is_empty() {
+        return Err("Gemini returned an empty commit message. Retry or enter it manually.".into());
+    }
+    if subject.chars().any(char::is_control) || body.contains('\0') {
         return Err(
-            "Gemini returned an invalid commit message. Retry or enter it manually.".into(),
+            "Gemini returned unsupported control characters. Retry or enter the message manually."
+                .into(),
+        );
+    }
+    if subject.chars().count() > 72 {
+        // Preserve the complete generated wording in the editable description;
+        // keep the subject on a word boundary without another inference call.
+        let full_subject = subject.clone();
+        let limit = subject
+            .char_indices()
+            .nth(72)
+            .map(|(index, _)| index)
+            .unwrap();
+        let prefix = &subject[..limit];
+        let boundary = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, _)| index)
+            .filter(|index| *index > 0)
+            .unwrap_or(limit);
+        subject.truncate(boundary);
+        subject = subject.trim_end().to_owned();
+        body = if body.is_empty() {
+            full_subject
+        } else {
+            format!("{full_subject}\n\n{body}")
+        };
+    }
+    if body.len() > 4_000 {
+        return Err(
+            "Gemini returned a description exceeding 4,000 bytes. Retry or enter it manually."
+                .into(),
         );
     }
     Ok((subject, body))
@@ -4032,7 +4062,6 @@ mod gemini_commit_draft_tests {
             r#"{"subject":"Add labels","body":"","extra":"no"}"#,
             r#"{"subject":7,"body":""}"#,
             r#"{"subject":"","body":""}"#,
-            r#"{"subject":"This subject exceeds seventy-two characters by enough to fail the message limit","body":""}"#,
         ] {
             assert!(parse_commit_draft(invalid).is_err(), "accepted: {invalid}");
         }
@@ -4047,6 +4076,20 @@ mod gemini_commit_draft_tests {
         assert!(!gemini_api_key_is_valid("  "));
         assert!(!gemini_api_key_is_valid("AIza\nExample"));
         assert!(!gemini_api_key_is_valid(&"x".repeat(4097)));
+    }
+
+    #[test]
+    fn preserves_long_subjects_in_the_description_without_splitting_unicode() {
+        for original in ["Add dashboard usage statistics with provider breakdowns and accurate elapsed time reporting".to_owned(), "界".repeat(90)] {
+            let raw = serde_json::json!({"subject": original, "body":"Existing details."});
+            let (subject, body) = parse_commit_draft(&raw.to_string()).unwrap();
+            assert!(subject.chars().count() <= 72);
+            assert!(original.starts_with(&subject));
+            assert_eq!(body, format!("{original}\n\nExisting details."));
+        }
+        assert!(parse_commit_draft(r#"{"subject":"Add\nlabels","body":""}"#)
+            .unwrap_err()
+            .contains("control characters"));
     }
 
     #[test]

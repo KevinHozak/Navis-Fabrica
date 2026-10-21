@@ -41,7 +41,12 @@ def metadata(path):
 
 
 def run_build(command, repo):
-    subprocess.run(command, cwd=repo, check=True)
+    env = os.environ.copy()
+    cargo_home = Path(env.get('CARGO_HOME') or Path.home() / '.cargo')
+    cargo_bin = cargo_home / 'bin'
+    if cargo_bin.is_dir():
+        env['PATH'] = env.get('PATH', '') + os.pathsep + str(cargo_bin)
+    subprocess.run(command, cwd=repo, env=env, check=True)
 
 
 def smoke(path):
@@ -75,6 +80,8 @@ def build(repo, profile, state_dir):
     repo = Path(native_path(repo)).resolve(strict=True)
     if profile not in ('release', 'debug'):
         raise ValueError('Choose release or debug.')
+    ctx = versions.context(repo, native_path(state_dir))
+    repo = ctx['app']
     config_path = repo / 'src-tauri' / 'tauri.conf.json'
     config = json.loads(config_path.read_text(encoding='utf-8'))
     package = json.loads((repo / 'package.json').read_text(encoding='utf-8'))
@@ -86,7 +93,6 @@ def build(repo, profile, state_dir):
     # HEAD is inspected locally by the shared protocol on first use; existing
     # preparations and source profiles always take precedence. No Git sync.
     phase(1, 'Preparing version')
-    ctx = versions.context(repo, native_path(state_dir))
     prepared = versions.prepare(ctx, base='HEAD')
     version = prepared['version']
     print(f'Version {version}: {prepared["action"]}.', flush=True)

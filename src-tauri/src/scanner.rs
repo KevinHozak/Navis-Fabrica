@@ -581,7 +581,8 @@ fn detect_stacks(path: &Path, names: &HashSet<String>) -> Vec<String> {
             stacks.push(stack.trim().to_owned());
         }
     }
-    if names.contains("tauri.conf.json")
+    if tauri_app_directory(path).is_ok()
+        || names.contains("tauri.conf.json")
         || path.join("src-tauri/tauri.conf.json").is_file()
         || path.join("src-tauri/tauri.conf.json5").is_file()
     {
@@ -649,20 +650,32 @@ fn workflow_prerequisites(
     tool_availability: &mut HashMap<String, bool>,
 ) -> Vec<WorkflowPrerequisite> {
     let mut required: Vec<(&str, Vec<&str>)> = Vec::new();
+    let tauri_app = tauri_app_directory(path).ok();
     if is_git_repository {
         required.push(("git", vec!["Git workflows"]));
     }
-    if names.contains("package.json") {
+    if names.contains("package.json") || tauri_app.is_some() {
         required.push(("node", vec!["Node.js", "Tauri", "Expo", "React Native"]));
-        if names.contains("pnpm-lock.yaml") {
+        if names.contains("pnpm-lock.yaml")
+            || tauri_app
+                .as_ref()
+                .is_some_and(|app| app.join("pnpm-lock.yaml").is_file())
+        {
             required.push(("pnpm", vec!["Node.js", "Tauri", "Expo", "React Native"]));
-        } else if names.contains("yarn.lock") {
+        } else if names.contains("yarn.lock")
+            || tauri_app
+                .as_ref()
+                .is_some_and(|app| app.join("yarn.lock").is_file())
+        {
             required.push(("yarn", vec!["Node.js", "Tauri", "Expo", "React Native"]));
         } else {
             required.push(("npm", vec!["Node.js", "Tauri", "Expo", "React Native"]));
         }
     }
-    if names.contains("cargo.toml") || path.join("src-tauri/Cargo.toml").is_file() {
+    if names.contains("cargo.toml")
+        || tauri_app.is_some()
+        || path.join("src-tauri/Cargo.toml").is_file()
+    {
         required.push(("cargo", vec!["Rust", "Tauri"]));
         required.push(("rustc", vec!["Rust", "Tauri"]));
     }
@@ -756,15 +769,111 @@ pub fn unavailable_workflow_prerequisites(path: &Path) -> Result<Vec<String>, St
     )
 }
 
+#[cfg(test)]
+mod tauri_layout_tests {
+    use super::*;
+
+    fn app(path: &Path) {
+        fs::create_dir_all(path.join("src-tauri")).unwrap();
+        fs::write(path.join("src-tauri/tauri.conf.json"), "{}").unwrap();
+        fs::write(path.join("src-tauri/Cargo.toml"), "").unwrap();
+        fs::write(path.join("package.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn nested_tauri_layout_and_prerequisites_are_detected() {
+        let root = tempfile::tempdir().unwrap();
+        app(&root.path().join("frontend"));
+        app(&root.path().join("node_modules/ignored"));
+        assert_eq!(
+            tauri_app_directory(root.path()).unwrap(),
+            root.path().join("frontend").canonicalize().unwrap()
+        );
+        let required =
+            workflow_prerequisites(root.path(), &HashSet::new(), true, &mut HashMap::new());
+        assert!(required.iter().any(|tool| tool.name == "cargo"));
+        app(&root.path().join("second"));
+        assert!(tauri_app_directory(root.path())
+            .unwrap_err()
+            .contains("found 2"));
+    }
+}
+
+pub fn tauri_app_directory(root: &Path) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| "Project folder is unavailable.".to_string())?;
+    let mut queue = VecDeque::from([(root.clone(), 0)]);
+    let mut found = Vec::new();
+    let mut visited = 0;
+    while let Some((directory, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > 512 {
+            return Err("Tauri discovery exceeded its directory limit.".into());
+        }
+        if directory.join("src-tauri/tauri.conf.json").is_file()
+            && directory.join("src-tauri/Cargo.toml").is_file()
+            && directory.join("package.json").is_file()
+        {
+            found.push(directory.clone());
+        }
+        if depth >= 4 {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.')
+                || matches!(
+                    name.as_ref(),
+                    "node_modules" | "target" | "src-tauri" | "dist" | "build" | "venv"
+                )
+            {
+                continue;
+            }
+            if !entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+            {
+                continue;
+            }
+            if let Ok(child) = entry.path().canonicalize() {
+                if child.starts_with(&root) {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+        }
+    }
+    if found.len() == 1 {
+        Ok(found.remove(0))
+    } else {
+        Err(format!(
+            "Expected one Tauri app; found {}. Select the app folder for multi-app repositories.",
+            found.len()
+        ))
+    }
+}
+
 fn executable_available(name: &str, cache: &mut HashMap<String, bool>) -> bool {
     if let Some(available) = cache.get(name) {
         return *available;
     }
-    let Some(path) = std::env::var_os("PATH") else {
-        cache.insert(name.to_owned(), false);
-        return false;
-    };
-    let available = std::env::split_paths(&path).any(|folder| {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut folders: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    if matches!(name, "cargo" | "rustc") {
+        if let Some(home) = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".cargo"))
+            })
+        {
+            folders.push(home.join("bin"));
+        }
+    }
+    let available = folders.into_iter().any(|folder| {
         #[cfg(windows)]
         let candidates = [
             format!("{name}.exe"),

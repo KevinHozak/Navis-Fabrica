@@ -55,6 +55,27 @@ class BuildTests(unittest.TestCase):
         version = json.loads((self.repo / 'src-tauri' / 'tauri.conf.json').read_text())['version']
         return dict(fileVersion=version, productVersion=version)
 
+    def test_nested_app_builds_from_frontend_and_keeps_version_identity(self):
+        root = self.repo
+        app = root / 'frontend'
+        app.mkdir()
+        for name in ('src-tauri', 'src', 'package.json', 'package-lock.json'):
+            (root / name).rename(app / name)
+        self.git('add', '.')
+        self.git('commit', '-m', 'Move app into frontend')
+        self.repo = app
+        with patch.object(helper, 'run_build', self.fake_build), patch.object(helper, 'metadata', self.version), patch.object(helper, 'smoke'):
+            artifact = helper.build(root, 'release', self.state)
+        self.assertEqual(artifact, app / 'src-tauri' / 'target' / 'release' / 'fixture.exe')
+        self.assertEqual(helper.versions.context(root, self.state)['identity'], helper.versions.context(app, self.state)['identity'])
+
+    def test_build_adds_cargo_home_to_inherited_path(self):
+        cargo = self.root / 'cargo home'
+        (cargo / 'bin').mkdir(parents=True)
+        with patch.dict(helper.os.environ, {'CARGO_HOME': str(cargo), 'PATH': 'existing-tools'}), patch.object(helper.subprocess, 'run') as run:
+            helper.run_build(['npm.cmd', 'run', 'desktop:build'], self.repo)
+        self.assertEqual(run.call_args.kwargs['env']['PATH'], 'existing-tools' + helper.os.pathsep + str(cargo / 'bin'))
+
     def test_release_preserves_local_work_and_reuses_preparation(self):
         with patch.object(helper, 'run_build', self.fake_build), patch.object(helper, 'metadata', self.version), patch.object(helper, 'smoke') as smoke:
             artifact = helper.build(self.repo, 'release', self.state)

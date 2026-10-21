@@ -369,10 +369,12 @@ fn cargo_manifest_directory(project_root: &Path) -> Option<PathBuf> {
     if conventional.join("Cargo.toml").is_file() {
         return Some(conventional);
     }
-    project_root
-        .join("Cargo.toml")
-        .is_file()
-        .then(|| project_root.to_path_buf())
+    if project_root.join("Cargo.toml").is_file() {
+        return Some(project_root.to_path_buf());
+    }
+    scanner::tauri_app_directory(project_root)
+        .ok()
+        .map(|app| app.join("src-tauri"))
 }
 
 fn safe_binary_name(value: &str) -> Option<&str> {
@@ -625,6 +627,7 @@ mod release_executable_tests {
         )
         .unwrap();
         fs::write(root.join("src-tauri/tauri.conf.json"), "{}\n").unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
         (temp, root)
     }
 
@@ -679,6 +682,33 @@ mod release_executable_tests {
             resolve_release_executable(&root).unwrap(),
             Some(artifact.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn nested_tauri_release_lookup_uses_app_config_and_rejects_ambiguous_apps() {
+        let (_temp, root) = project();
+        let app = root.join("frontend");
+        fs::create_dir(&app).unwrap();
+        fs::rename(root.join("src-tauri"), app.join("src-tauri")).unwrap();
+        fs::rename(root.join("package.json"), app.join("package.json")).unwrap();
+        fs::write(
+            app.join("src-tauri/tauri.conf.json"),
+            r#"{"mainBinaryName":"Dream Desktop"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(app.join("src-tauri/target/release")).unwrap();
+        let artifact = app.join("src-tauri/target/release/Dream Desktop.exe");
+        fs::write(&artifact, b"release exe").unwrap();
+        assert_eq!(
+            resolve_release_executable(&root).unwrap(),
+            Some(artifact.canonicalize().unwrap())
+        );
+        let second = root.join("second");
+        fs::create_dir_all(second.join("src-tauri")).unwrap();
+        fs::write(second.join("src-tauri/tauri.conf.json"), "{}").unwrap();
+        fs::write(second.join("src-tauri/Cargo.toml"), "").unwrap();
+        fs::write(second.join("package.json"), "{}").unwrap();
+        assert_eq!(resolve_release_executable(&root).unwrap(), None);
     }
 
     #[test]

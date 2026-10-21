@@ -581,7 +581,7 @@ fn verify_build_artifact_with(
     let product_version = value.get("productVersion")?.as_str()?.to_owned();
     let expected_profile = workflow.build_profile.as_deref()?;
     let resolved = Path::new(path).canonicalize().ok()?;
-    let root = cwd.canonicalize().ok()?;
+    let root = crate::scanner::tauri_app_directory(cwd).ok()?;
     let declared_version = serde_json::from_slice::<serde_json::Value>(
         &fs::read(root.join("src-tauri/tauri.conf.json")).ok()?,
     )
@@ -3278,9 +3278,7 @@ pub fn start_script_build_run(
     let cwd = cwd
         .canonicalize()
         .map_err(|_| "The project folder could not be resolved.".to_string())?;
-    if !cwd.join("src-tauri/tauri.conf.json").is_file() || !cwd.join("package.json").is_file() {
-        return Err("The scripted build supports Tauri projects with package.json.".into());
-    }
+    let app_directory = crate::scanner::tauri_app_directory(&cwd)?;
     let python = crate::providers::find_executable("python", std::env::var_os("PATH").as_deref())
         .ok_or("Python 3.11 or newer is required by the bundled version/build helper.")?;
     preflight_command(
@@ -3322,7 +3320,7 @@ pub fn start_script_build_run(
                 .to_string_lossy()
                 .into_owned(),
             "--repo".into(),
-            cwd.to_string_lossy().into_owned(),
+            app_directory.to_string_lossy().into_owned(),
             "--profile".into(),
             profile.into(),
             "--state-dir".into(),
@@ -5637,6 +5635,8 @@ mod tests {
     fn build_artifact_receipt_checks_profile_project_path_and_declared_version() {
         let fixture = tempfile::tempdir().unwrap();
         fs::create_dir_all(fixture.path().join("src-tauri")).unwrap();
+        fs::write(fixture.path().join("package.json"), "{}").unwrap();
+        fs::write(fixture.path().join("src-tauri/Cargo.toml"), "").unwrap();
         fs::write(
             fixture.path().join("src-tauri/tauri.conf.json"),
             r#"{"version":"1.2.3"}"#,
@@ -5719,6 +5719,31 @@ mod tests {
             &artifact_path.canonicalize().unwrap(),
             "debug"
         ));
+        let app = fixture.path().join("frontend");
+        fs::create_dir(&app).unwrap();
+        fs::rename(fixture.path().join("src-tauri"), app.join("src-tauri")).unwrap();
+        fs::rename(
+            fixture.path().join("package.json"),
+            app.join("package.json"),
+        )
+        .unwrap();
+        let nested_marker = format!(
+            "NAVIS_BUILD_ARTIFACT:{}",
+            serde_json::json!({
+                "profile": "release", "path": app.join("src-tauri/target/release/app.exe"),
+                "fileVersion": "1.2.3", "productVersion": "1.2.3"
+            })
+        );
+        assert!(
+            verify_build_artifact_with(fixture.path(), &workflow, &nested_marker, |_| {
+                Some(ArtifactVersionInfo {
+                    file_version: "1.2.3".into(),
+                    product_version: "1.2.3".into(),
+                })
+            })
+            .unwrap()
+            .verified
+        );
     }
 
     #[test]

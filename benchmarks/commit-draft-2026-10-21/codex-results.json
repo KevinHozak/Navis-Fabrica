@@ -1,0 +1,104 @@
+[
+  {
+    "provider": "codex-app-server",
+    "model": "gpt-6-luna-low",
+    "case": "small",
+    "iteration": 1,
+    "launch_ms": 704.9,
+    "thread_ms": 520,
+    "startup_ms": 1224.9,
+    "generation_ms": 7297,
+    "total_ms": 8522,
+    "output": "{\"subject\":\"Add accessible save status text\",\"body\":\"Label the save button as “Save changes” and add a status message that says “Changes saved”.\"}",
+    "parsed": {
+      "subject": "Add accessible save status text",
+      "body": "Label the save button as “Save changes” and add a status message that says “Changes saved”."
+    },
+    "ok": true
+  },
+  {
+    "provider": "codex-app-server",
+    "model": "gpt-6-luna-low",
+    "case": "small",
+    "iteration": 2,
+    "launch_ms": 745.9,
+    "thread_ms": 550.8,
+    "startup_ms": 1296.6,
+    "generation_ms": 7658.8,
+    "total_ms": 8955.4,
+    "output": "{\"subject\":\"Add accessible save status messaging\",\"body\":\"Label the save button as \\\"Save changes\\\" and announce \\\"Changes saved\\\" through a status element.\"}",
+    "parsed": {
+      "subject": "Add accessible save status messaging",
+      "body": "Label the save button as \"Save changes\" and announce \"Changes saved\" through a status element."
+    },
+    "ok": true
+  },
+  {
+    "provider": "codex-app-server",
+    "model": "gpt-6-luna-low",
+    "case": "small",
+    "iteration": 3,
+    "launch_ms": 720.8,
+    "thread_ms": 537.5,
+    "startup_ms": 1258.3,
+    "generation_ms": 7978.9,
+    "total_ms": 9237.2,
+    "output": "{\"subject\":\"Add accessible save status text\",\"body\":\"Label the save button for assistive technology and announce when changes are saved.\"}",
+    "parsed": {
+      "subject": "Add accessible save status text",
+      "body": "Label the save button for assistive technology and announce when changes are saved."
+    },
+    "ok": true
+  },
+  {
+    "provider": "codex-app-server",
+    "model": "gpt-6-luna-low",
+    "case": "medium",
+    "iteration": 1,
+    "launch_ms": 1025.2,
+    "thread_ms": 812.7,
+    "startup_ms": 1837.8,
+    "generation_ms": 8171.7,
+    "total_ms": 10009.6,
+    "output": "{\"subject\":\"Add commit description and message validation\",\"body\":\"Add a description field and a Draft message button to the commit dialog, with drafting state and an alert for draft errors. Add commit message validation to reject blank messages and messages longer than 200 bytes, with a test for blank input.\"}",
+    "parsed": {
+      "subject": "Add commit description and message validation",
+      "body": "Add a description field and a Draft message button to the commit dialog, with drafting state and an alert for draft errors. Add commit message validation to reject blank messages and messages longer than 200 bytes, with a test for blank input."
+    },
+    "ok": true
+  },
+  {
+    "provider": "codex-app-server",
+    "model": "gpt-6-luna-low",
+    "case": "medium",
+    "iteration": 2,
+    "launch_ms": 794.7,
+    "thread_ms": 601.9,
+    "startup_ms": 1396.6,
+    "generation_ms": 8056.9,
+    "total_ms": 9453.5,
+    "output": "{\"subject\":\"Add commit description and message validation\",\"body\":\"Add a description field and a Draft message button to the commit dialog, with drafting state and an alert for draft errors. Add validation that rejects blank commit messages and messages over 200 bytes, with a test for blank input.\"}",
+    "parsed": {
+      "subject": "Add commit description and message validation",
+      "body": "Add a description field and a Draft message button to the commit dialog, with drafting state and an alert for draft errors. Add validation that rejects blank commit messages and messages over 200 bytes, with a test for blank input."
+    },
+    "ok": true
+  },
+  {
+    "provider": "codex-app-server",
+    "model": "gpt-6-luna-low",
+    "case": "medium",
+    "iteration": 3,
+    "launch_ms": 493.7,
+    "thread_ms": 513.8,
+    "startup_ms": 1007.5,
+    "generation_ms": 7336.7,
+    "total_ms": 8344.2,
+    "output": "{\"subject\":\"Add commit message drafting fields and validation\",\"body\":\"Add a description field and a draft-message button with drafting state and accessible error output to the commit dialog. Add validation that rejects blank commit messages and messages over 200 bytes, with a test for blank input.\"}",
+    "parsed": {
+      "subject": "Add commit message drafting fields and validation",
+      "body": "Add a description field and a draft-message button with drafting state and accessible error output to the commit dialog. Add validation that rejects blank commit messages and messages over 200 bytes, with a test for blank input."
+    },
+    "ok": true
+  }
+]

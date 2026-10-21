@@ -1,0 +1,98 @@
+[
+  {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "case": "small",
+    "iteration": 1,
+    "request_to_response_ms": 28101.3,
+    "total_ms": 28104,
+    "load_ms": 15280.4759,
+    "prompt_eval_ms": 7867.775,
+    "generation_ms": 4864.265,
+    "output": {
+      "subject": "Add accessibility label and status indicator to SaveButton",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "case": "small",
+    "iteration": 2,
+    "request_to_response_ms": 5452.9,
+    "total_ms": 5453.4,
+    "load_ms": 23.058,
+    "prompt_eval_ms": 324.648,
+    "generation_ms": 5088.807,
+    "output": {
+      "subject": "Add accessibility label and status indicator to SaveButton",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "case": "small",
+    "iteration": 3,
+    "request_to_response_ms": 5345.3,
+    "total_ms": 5345.7,
+    "load_ms": 11.3391,
+    "prompt_eval_ms": 272.027,
+    "generation_ms": 5043.6,
+    "output": {
+      "subject": "Add accessibility label and status indicator to SaveButton",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "case": "medium",
+    "iteration": 1,
+    "request_to_response_ms": 19714.6,
+    "total_ms": 19715,
+    "load_ms": 8.5315,
+    "prompt_eval_ms": 15376.023,
+    "generation_ms": 4313.919,
+    "output": {
+      "subject": "Add commit description and draft functionality",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "case": "medium",
+    "iteration": 2,
+    "request_to_response_ms": 4901.2,
+    "total_ms": 4901.7,
+    "load_ms": 9.1367,
+    "prompt_eval_ms": 284.45,
+    "generation_ms": 4593.133,
+    "output": {
+      "subject": "Add commit description and draft functionality",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "case": "medium",
+    "iteration": 3,
+    "request_to_response_ms": 5128.5,
+    "total_ms": 5129,
+    "load_ms": 9.3136,
+    "prompt_eval_ms": 289.492,
+    "generation_ms": 4808.521,
+    "output": {
+      "subject": "Add commit description and draft functionality",
+      "body": ""
+    },
+    "valid": true
+  }
+]

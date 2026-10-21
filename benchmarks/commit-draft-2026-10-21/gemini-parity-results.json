@@ -1,0 +1,86 @@
+[
+  {
+    "provider": "gemini-api",
+    "model": "gemini-3.5-flash-lite",
+    "case": "small",
+    "iteration": 1,
+    "headers_ms": 866,
+    "first_text_ms": 867.6,
+    "total_ms": 939.4,
+    "output": {
+      "subject": "Add accessibility attributes and status message to SaveButton",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "gemini-api",
+    "model": "gemini-3.5-flash-lite",
+    "case": "small",
+    "iteration": 2,
+    "headers_ms": 957.1,
+    "first_text_ms": 957.7,
+    "total_ms": 1020.6,
+    "output": {
+      "subject": "Add accessibility attributes and status message to SaveButton",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "gemini-api",
+    "model": "gemini-3.5-flash-lite",
+    "case": "small",
+    "iteration": 3,
+    "headers_ms": 894.8,
+    "first_text_ms": 895.2,
+    "total_ms": 976.3,
+    "output": {
+      "subject": "Add accessibility attributes and status message to SaveButton",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "gemini-api",
+    "model": "gemini-3.5-flash-lite",
+    "case": "medium",
+    "iteration": 1,
+    "headers_ms": 806.1,
+    "first_text_ms": 806.4,
+    "total_ms": 874.5,
+    "output": {
+      "subject": "Add commit description input and message validation",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "gemini-api",
+    "model": "gemini-3.5-flash-lite",
+    "case": "medium",
+    "iteration": 2,
+    "headers_ms": 641,
+    "first_text_ms": 641.3,
+    "total_ms": 741.3,
+    "output": {
+      "subject": "Add commit description, drafting, and message validation",
+      "body": ""
+    },
+    "valid": true
+  },
+  {
+    "provider": "gemini-api",
+    "model": "gemini-3.5-flash-lite",
+    "case": "medium",
+    "iteration": 3,
+    "headers_ms": 698.2,
+    "first_text_ms": 698.3,
+    "total_ms": 812.8,
+    "output": {
+      "subject": "Add commit description input and message validation",
+      "body": "Add description input, draft functionality, error handling, and commit message validation logic with tests."
+    },
+    "valid": true
+  }
+]

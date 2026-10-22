@@ -341,7 +341,7 @@ function Check-Files {
         if (Test-Path -LiteralPath $file.path -PathType Leaf) {
             $hash = Git -Arguments @('hash-object', '--no-filters', '--', $file.path)
         } elseif (Test-Path -LiteralPath $file.path) { throw 'Directory and submodule changes require separate review.' }
-        if ($hash -cne $file.hash) { throw "Reviewed file changed: $($file.path). Refresh the dialog." }
+        if ($hash -cne $file.hash) { throw "Reviewed file changed: $($file.path). Click Push to retry." }
     }
 }
 function Check-Target {
@@ -363,9 +363,18 @@ try {
     Step 'review' 'Checking reviewed repository state'
     Check-Operation
     Check-Target
-    if ((Head) -cne $request.head) { throw 'HEAD changed. Refresh the dialog.' }
-    if ((Git -Arguments @('status', '--porcelain=v1', '--untracked-files=all')) -cne $request.status) { throw 'Repository changes shifted. Refresh the dialog.' }
-    if ((Git -Arguments @('ls-files', '--stage')) -cne $request.index) { throw 'The Git index changed. Refresh the dialog.' }
+    if ((Head) -cne $request.head) { throw 'HEAD changed. Click Push to retry.' }
+    $currentStatus = [string](Git -Arguments @('status', '--porcelain=v1', '--untracked-files=all'))
+    if ($currentStatus -cne [string]$request.status) {
+        $before = @(([string]$request.status -split "`n") | Where-Object { $_ })
+        $after = @(($currentStatus -split "`n") | Where-Object { $_ })
+        # Show bounded path/status differences, never file contents or credentials.
+        $changed = @($before | Where-Object { $after -cnotcontains $_ }) + @($after | Where-Object { $before -cnotcontains $_ })
+        $details = (@($changed | Select-Object -First 8) -join '; ')
+        if (-not $details) { $details = 'Git status formatting changed' }
+        throw "Repository changed before commit: $details. Wait for edits to finish, then click Push again."
+    }
+    if ((Git -Arguments @('ls-files', '--stage')) -cne $request.index) { throw 'The Git index changed. Click Push to retry.' }
     Check-Files
     $preparedVersion = $null
     if ($request.versionHelper) {

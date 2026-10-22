@@ -49,6 +49,17 @@ class ReviewedGitTests(unittest.TestCase):
         return subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('\\\\?\\' + str(SCRIPT)) if getattr(self, 'extended_paths', False) else str(SCRIPT), '-RequestPath', ('\\\\?\\' + str(path)) if getattr(self, 'extended_paths', False) else str(path)],
             capture_output=True, text=True, encoding='utf-8', env=env, timeout=120)
 
+    def test_status_drift_reports_the_changed_path_before_commit(self):
+        (self.repo / 'file.txt').write_text('after\n')
+        request = self.request(['file.txt'])
+        (self.repo / 'new-after-review.txt').write_text('late edit\n')
+        result = self.run_script(request)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('new-after-review.txt', result.stdout + result.stderr)
+        self.assertIn('click Push again', result.stdout + result.stderr)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), request['head'])
+        self.assertTrue((self.repo / 'new-after-review.txt').exists())
+
     def test_exact_message_and_large_path_scope(self):
         paths = ['file.txt']
         (self.repo / 'file.txt').write_text('after\n')

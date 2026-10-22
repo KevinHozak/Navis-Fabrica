@@ -6,6 +6,7 @@ import { issueCommand, type IssuePage } from "./runnerClient";
 import { RunsPanel } from "./RunsPanel";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
 
+import { automaticallyPush } from "./automaticPush";
 import { BuildProgressDialog } from "./BuildProgressDialog";
 import { useLiveWorkflowRun } from "./useLiveWorkflowRun";
 import { latestGitStep, gitOutputText, pullRequestMergeStatus, localSyncStatus } from "./gitProgress";
@@ -114,7 +115,29 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   const [releaseExecutable, setReleaseExecutable] = useState<ReleaseExecutableVersion | null>(null);
   const [releaseRefresh, setReleaseRefresh] = useState(0);
   const [current, setCurrent] = useState(project);
-  const [commitReviewOpen, setCommitReviewOpen] = useState(false);
+  const pushLock = useRef(false);
+  const [pushError, setPushError] = useState(false);
+  const { run: pushRun, setRun: setPushRun, running: pushRunning } = useLiveWorkflowRun();
+  async function pushChanges() {
+    if (pushLock.current || pushRunning || !isDesktopApp()) return;
+    pushLock.current = true;
+    setPushRun(null); setPushError(false); setGitMessage(""); setGitBusy("Preparing changes…");
+    try {
+      setPushRun(await automaticallyPush({
+        prepare: () => prepareProjectCommitReview(project.id),
+        draft: fingerprint => draftProjectCommitMessage(project.id, fingerprint),
+        start: (context, subject, body) => launchPreparedCommit(project.id, context, subject, body),
+      }, setGitBusy));
+    } catch (error) {
+      setPushError(true); setGitMessage(error instanceof Error ? error.message : String(error));
+    } finally { pushLock.current = false; setGitBusy(""); }
+  }
+  useEffect(() => {
+    if (pushRun && !pushRunning) {
+      onRefreshProject?.(project.path);
+      setReleaseRefresh(value => value + 1);
+    }
+  }, [pushRun?.id, pushRunning]);
   const [buildDialog, setBuildDialog] = useState<{ run?: WorkflowRun } | null>(null);
   useEffect(() => setCurrent(project), [project]);
   const latestCompletedBuild = runs?.filter(run => sameProjectPath(run.cwd, current.path) && run.workflow?.action === "dev-build" && run.state === "completed" && run.finishedAtMs !== null)
@@ -129,7 +152,7 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   }, [current.id, current.path, buildRefreshKey, releaseRefresh, refreshVersion]);
   async function gitAction(action: "pull" | "main") {
     if (gitBusy || !isDesktopApp()) return;
-    setGitBusy(action); setGitMessage("");
+    setPushRun(null); setPushError(false); setGitBusy(action); setGitMessage("");
     try { setCurrent(await runProjectGitAction(project.id, action)); setReleaseRefresh(value => value + 1); setGitMessage(action === "pull" ? "Pulled" : "Switched to main"); }
     catch (error) { setGitMessage(error instanceof Error ? error.message : String(error)); }
     finally { setGitBusy(""); }
@@ -172,7 +195,7 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   const projectBusy = relevant?.some(run => ["queued", "running", "needsInput", "cancelling"].includes(run.state)) ?? false;
   const matchingBatch = Boolean(batch?.projectPath && sameProjectPath(batch.projectPath, current.path));
   const batchBusy = matchingBatch && ["queued", "running", "cancelling", "unavailable"].includes(batch?.state ?? "");
-  const mutationBusy = projectBusy || batchBusy;
+  const mutationBusy = projectBusy || batchBusy || pushRunning;
   const actionOptions = { desktop: isDesktopApp(), busy: mutationBusy, gitBusy: Boolean(gitBusy), hasHandler: true };
   const pullReason = quickActionReason("pull", current, actionOptions);
   const pushReason = quickActionReason("push", current, actionOptions);
@@ -198,24 +221,46 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   const commitDate = latestCommit?.committedAt?.slice(0, 10) ?? (current.git.status === "unborn" ? "No commits" : "Date unavailable");
   const metadataTitle = [latestCommit ? `${latestCommit.subject} · ${latestCommit.shortHash}` : "Last commit date unavailable", latestCommit?.committedAt, releaseExecutable?.version ? `Release executable: ${releaseExecutable.path}` : null].filter(Boolean).join("\n");
   const versionLabel = releaseExecutable?.version ? `v${releaseExecutable.version.replace(/^v/i, "")}` : "";
-  const statusMessage = refreshing ? "Refreshing project details…" : refreshError ? "Refresh incomplete · showing last known details" : gitBusy ? `${gitBusy === "pull" ? "Pulling" : "Switching branch"}…` : gitMessage;
+  const pushProblem = pushError || Boolean(pushRun && !pushRunning && pushRun.state !== "completed");
+  const pushStatus = pushRun ? pushRunning ? latestGitStep(pushRun) ?? "Committing and pushing…"
+    : pushRun.state === "completed" ? localSyncStatus(pushRun) ?? pullRequestMergeStatus(pushRun) ?? "Completed"
+    : `Push ${pushRun.state} · ${gitOutputText(pushRun).split("\n").filter(Boolean).slice(-1)[0] ?? "See Activity for details"}` : "";
+  const statusMessage = gitBusy && gitBusy !== "pull" && gitBusy !== "main" ? gitBusy : pushStatus || (refreshing ? "Refreshing project details…" : refreshError ? "Refresh incomplete · showing last known details" : gitBusy ? `${gitBusy === "pull" ? "Pulling" : "Switching branch"}…` : gitMessage);
   return <article className={`my-project-card${selected ? " selected" : ""}`} aria-label={`${current.name} project`}>
     <div className="project-card-heading-row"><button className="project-card-open" title={current.name} onClick={onClick} aria-pressed={selected}><ProjectCardHeading name={current.name} icon={icon} /></button><div className="project-card-meta" title={metadataTitle}><span>{commitDate}</span>{versionLabel ? <button type="button" className="project-card-version" aria-label={`Build details for ${current.name}`} title={`Build details for ${current.name}`} onClick={onOpenBuild}>{versionLabel}</button> : <span className="project-card-version is-empty"> </span>}</div></div>
     <div className="project-card-branch" title={branchLabel}>{branchLabel}{current.isWorktree ? " · Worktree" : ""}</div>
     <div className="project-card-quick-actions" aria-label={`${current.name} quick actions`}>
         <button className="icon-button project-quick" type="button" title={unavailableTitle("Pull", pullReason)} aria-label={pullReason ? `Pull ${current.name} unavailable: ${pullReason}` : `Pull ${current.name}`} disabled={Boolean(pullReason)} onClick={() => void gitAction("pull")}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9m-3-3 3 3 3-3M2 12v2h12v-2" /></svg></button>
-        <button className="icon-button project-quick" type="button" title={unavailableTitle(pushActionLabel, pushReason)} aria-label={pushReason ? `${pushActionLabel} ${current.name} unavailable: ${pushReason}` : `${pushActionLabel} ${current.name}`} disabled={Boolean(pushReason)} onClick={() => setCommitReviewOpen(true)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 15V6m-3 3 3-3 3 3M2 4l3-3m-3 3 3 3M14 4l-3-3m3 3-3 3" /></svg></button>
+        <button className="icon-button project-quick" type="button" title={unavailableTitle(pushActionLabel, pushReason)} aria-label={pushReason ? `${pushActionLabel} ${current.name} unavailable: ${pushReason}` : `${pushActionLabel} ${current.name}`} disabled={Boolean(pushReason)} onClick={() => void pushChanges()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 15V6m-3 3 3-3 3 3M2 4l3-3m-3 3 3 3M14 4l-3-3m3 3-3 3" /></svg></button>
         <button className="icon-button project-quick" type="button" title={unavailableTitle("Build", buildReason)} aria-label={buildReason ? `Build ${current.name} unavailable: ${buildReason}` : `Build ${current.name}`} disabled={Boolean(buildReason)} onClick={() => setBuildDialog({ run: activeBuild })}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 10 6-10 6z" /></svg></button>
         <button className="icon-button project-quick project-main" type="button" title={unavailableTitle("Main", mainReason)} aria-label={mainReason ? `Switch ${current.name} to main unavailable: ${mainReason}` : `Switch ${current.name} to main`} disabled={Boolean(mainReason)} onClick={() => void gitAction("main")}>M</button>
         <details className="project-card-menu"><summary className="icon-button project-quick" title="More" aria-label={`More actions for ${current.name}`}>⋯</summary><div className="project-card-menu-pop"><button type="button" onClick={onClick}>Project actions</button><button type="button" title={unavailableTitle("Open folder", openFolderReason)} aria-label={openFolderReason ? `Open ${current.name} folder unavailable: ${openFolderReason}` : `Open ${current.name} folder`} disabled={Boolean(openFolderReason)} onClick={() => void openFolder()}>Open folder</button>{remoteUrl && <a href={remoteUrl} target="_blank" rel="noreferrer">GitHub ↗</a>}</div></details>
         <button className="icon-button project-quick project-card-refresh" type="button" title={refreshTitle} aria-label={refreshing ? `Refreshing ${current.name}` : `Refresh ${current.name}`} aria-busy={refreshing} disabled={refreshing || Boolean(refreshReason)} onClick={() => onRefreshProject?.(current.path)}><svg className={refreshing ? "is-refreshing" : undefined} viewBox="0 0 16 16" aria-hidden="true"><path d="M13.7 6A5.9 5.9 0 0 0 3.3 4.1L2 5.5" /><path d="M2 2v3.5h3.5M2.3 10a5.9 5.9 0 0 0 10.4 1.9l1.3-1.4M14 14v-3.5h-3.5" /></svg></button>
     </div>
     {buildDialog && <BuildProgressDialog project={current} profile={buildDialog.run?.workflow?.buildProfile ?? "release"} initialRun={buildDialog.run} onClose={() => setBuildDialog(null)} />}
-    {commitReviewOpen && <CommitReviewDialog project={current} onClose={() => setCommitReviewOpen(false)} />}
     <dl><div><dt>Changes</dt><dd title={changesTitle} className={changesClass}><button type="button" className="project-count-link" aria-label={`View ${current.name} changes`} onClick={onOpenChanges}>{changesCount}</button></dd></div><div title={issueError}><dt>Epics</dt><dd title={issues.epics} className={Number(issues.epics) > 0 ? "count-epics" : undefined}><button type="button" className="project-count-link" aria-label={`View ${current.name} epics`} onClick={() => onOpenIssues?.("epic")}>{issues.epics}</button></dd></div><div title={issueError}><dt>Stories</dt><dd title={issues.stories} className={Number(issues.stories) > 0 ? "count-stories" : undefined}><button type="button" className="project-count-link" aria-label={`View ${current.name} stories`} onClick={() => onOpenIssues?.("story")}>{issues.stories}</button></dd></div></dl>
     <span className="project-card-activity" title={activityLabel(relevant)}>{activityLabel(relevant)}{matchingBatch ? ` · Batch ${batch?.needsAttention ? "needs attention" : batch?.state}` : ""}</span>
-    <span className={refreshing || gitBusy ? "project-card-action-status" : refreshError ? "project-card-refresh-error" : "project-card-action-status"} title={statusMessage} role={statusMessage ? "status" : undefined}>{statusMessage || " "}</span>
+    <span className={pushProblem ? "project-card-refresh-error" : refreshing || gitBusy ? "project-card-action-status" : refreshError ? "project-card-refresh-error" : "project-card-action-status"} title={statusMessage} role={statusMessage ? "status" : undefined}>{statusMessage || " "}</span>
   </article>;
+}
+
+async function launchPreparedCommit(projectId: string, context: import("./settings").CommitDraftContext, subject: string, body: string) {
+      const requestedEffects: ("commit" | "push" | "createPullRequest")[] = context.mode === "pushOnly" ? ["push", "createPullRequest"]
+        : context.mode === "commit" ? ["commit"] : ["commit", "push", "createPullRequest"];
+      const commit = requestedEffects.includes("commit");
+      const operationData = JSON.stringify([projectId, context.snapshotFingerprint, context.head, context.mode, subject.trim(), body.trim(), crypto.randomUUID()]);
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(operationData));
+      const operationKey = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+      const intent = commit ? `${subject.trim()}${body.trim() ? `\n\n${body.trim()}` : ""}` : "Rebase existing commits onto upstream and push";
+      const workflow = {
+        action: "dev-push" as const, operationKey, intent, issueUrl: null,
+        scopePaths: commit ? context.paths : [], requestedEffects, sideEffects: null,
+        commitSubject: commit ? subject.trim() : null,
+        commitBody: commit ? body.trim() : null,
+        draftSnapshotFingerprint: context.snapshotFingerprint,
+        autoMergePullRequest: context.mode !== "commit",
+      };
+      return startReviewedGitRun(projectId, workflow);
 }
 
 export function CommitReviewDialog({ project, onClose }: { project: ProjectEntry; onClose: () => void }) {
@@ -254,22 +299,7 @@ export function CommitReviewDialog({ project, onClose }: { project: ProjectEntry
     setBusy(true); setRunError("");
     dispatchReview({ type: "freeze" });
     try {
-      const requestedEffects: ("commit" | "push" | "createPullRequest")[] = context.mode === "pushOnly" ? ["push", "createPullRequest"]
-        : context.mode === "commit" ? ["commit"] : ["commit", "push", "createPullRequest"];
-      const commit = requestedEffects.includes("commit");
-      const operationData = JSON.stringify([project.id, context.snapshotFingerprint, context.head, context.mode, subject.trim(), body.trim(), crypto.randomUUID()]);
-      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(operationData));
-      const operationKey = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
-      const intent = commit ? `${subject.trim()}${body.trim() ? `\n\n${body.trim()}` : ""}` : "Rebase existing commits onto upstream and push";
-      const workflow = {
-        action: "dev-push" as const, operationKey, intent, issueUrl: null,
-        scopePaths: commit ? context.paths : [], requestedEffects, sideEffects: null,
-        commitSubject: commit ? subject.trim() : null,
-        commitBody: commit ? body.trim() : null,
-        draftSnapshotFingerprint: context.snapshotFingerprint,
-        autoMergePullRequest: context.mode !== "commit",
-      };
-      setRun(await startReviewedGitRun(project.id, workflow));
+      setRun(await launchPreparedCommit(project.id, context, subject, body));
     } catch (reason) { dispatchReview({ type: "thaw" }); setRunError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
   }

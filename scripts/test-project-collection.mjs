@@ -40,3 +40,7 @@ assert.doesNotMatch(heading(null),/<img/);
 const empty = renderToStaticMarkup(React.createElement(ProjectCollection,{projects:[project],onSelect:()=>{}}));
 assert.doesNotMatch(empty,/Owned project/); // Discovery alone cannot include a card.
 console.log('UX regressions passed: collection persistence, unknown/count states, activity states and explicit collection boundary.');
+
+// Catch UTF-8 text accidentally round-tripped through the Windows code page.
+assert.doesNotMatch(card(project), /[\u00c2\u00c3\ufffd]/);
+assert.match(card(project), /aria-label="More actions for Owned project">\u22ef<\/summary>/);

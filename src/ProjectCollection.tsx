@@ -90,6 +90,15 @@ export function ProjectCollection({ projects, manage = false, onSelect, onRefres
   }
   const unique = [...new Map(projects.map(p => [p.id, p])).values()];
   const visible = unique.filter(p => manage || preferences.favoriteProjectIds.includes(p.id));
+  if (!manage) {
+    const committedAt = (project: ProjectEntry) => {
+      const timestamp = Date.parse(project.git.latestCommit?.committedAt ?? "");
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    };
+    visible.sort((left, right) => committedAt(right) - committedAt(left)
+      || left.name.localeCompare(right.name)
+      || left.path.localeCompare(right.path));
+  }
   return <section className="my-projects">
     {message && <p role="status">{message}</p>}
     {!ready ? <p>Loading saved collection…</p> : <>

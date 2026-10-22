@@ -335,6 +335,7 @@ export async function runProjectGitAction(projectId: string, action: "pull" | "m
   return project;
 }
 export const listProjectBranches = (projectId: string) => invoke<string[]>("list_project_branches", { projectId });
+export const openProjectGithub = (projectId: string) => invoke<void>("open_project_github", { projectId });
 export const openProjectFolder = (projectId: string) => invoke<void>("open_project_folder", { projectId });
 
 export const startProjectScan = (scanId: string, forceRefresh: boolean, maxDirectories?: number) =>

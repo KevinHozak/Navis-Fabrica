@@ -395,6 +395,31 @@ async fn run_project_git_action(
 }
 
 #[tauri::command]
+fn open_project_github(app: AppHandle, project_id: String) -> Result<(), String> {
+    let project = project_for_git_action(&app, &project_id)?;
+    let repository = project
+        .git
+        .remotes
+        .iter()
+        .filter_map(|remote| remote.github.as_ref())
+        .find_map(|repository| scanner::parse_github_remote(&repository.canonical_url))
+        .ok_or("This project has no supported GitHub remote.")?;
+    #[cfg(windows)]
+    {
+        process::command("explorer.exe")
+            .arg(repository.canonical_url)
+            .spawn()
+            .map_err(|error| format!("Could not open GitHub in your browser: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = repository;
+        Err("Opening GitHub is supported on Windows.".into())
+    }
+}
+
+#[tauri::command]
 fn open_project_folder(app: AppHandle, project_id: String) -> Result<(), String> {
     let settings = load_settings(&settings_path(&app)?)?;
     let project = inventory::load(&project_inventory_path(&app)?, &settings.project_root)
@@ -1617,8 +1642,9 @@ struct CommitDraftFields {
 }
 
 fn parse_commit_draft(text: &str) -> Result<(String, String), String> {
-    let draft: CommitDraftFields = serde_json::from_str(text.trim())
-        .map_err(|_| "Gemini did not return the required JSON commit draft. Click Push to retry.".to_owned())?;
+    let draft: CommitDraftFields = serde_json::from_str(text.trim()).map_err(|_| {
+        "Gemini did not return the required JSON commit draft. Click Push to retry.".to_owned()
+    })?;
     let mut subject = draft.subject.trim().to_owned();
     let mut body = draft.body.trim().to_owned();
     if subject.is_empty() {
@@ -1654,8 +1680,7 @@ fn parse_commit_draft(text: &str) -> Result<(String, String), String> {
     }
     if body.len() > 4_000 {
         return Err(
-            "Gemini returned a description exceeding 4,000 bytes. Click Push to retry."
-                .into(),
+            "Gemini returned a description exceeding 4,000 bytes. Click Push to retry.".into(),
         );
     }
     Ok((subject, body))
@@ -2993,6 +3018,7 @@ pub fn run() {
             run_project_git_action,
             list_project_branches,
             open_project_folder,
+            open_project_github,
             get_release_executable_version,
             start_affected_project_refresh,
             discover_workflow_skills,

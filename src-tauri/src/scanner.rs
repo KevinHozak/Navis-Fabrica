@@ -1248,7 +1248,7 @@ pub fn sanitize_remote(value: &str) -> String {
         .to_owned()
 }
 
-fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
+pub(crate) fn parse_github_remote(value: &str) -> Option<GitHubRepository> {
     let trimmed = value.trim();
     let (path, domain) = if let Some((scheme, rest)) = trimmed.split_once("://") {
         let (domain, path) = rest.split_once('/')?;

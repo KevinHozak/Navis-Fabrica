@@ -1,7 +1,7 @@
 import { useWorkflowActivity, useBatchActivity, activityLabel, sameProjectPath } from "./Activity";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { commitReviewReducer, initialCommitReview, loadCommitReview } from "./commitReviewState";
-import { listProjectBranches, draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
+import { listProjectBranches, draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectGithub, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
 import { issueCommand, type IssuePage } from "./runnerClient";
 import { RunsPanel } from "./RunsPanel";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
@@ -174,6 +174,11 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
     catch (error) { setGitMessage(error instanceof Error ? error.message : String(error)); }
     finally { setGitBusy(""); }
   }
+  async function openGithub() {
+    setPushRun(null); setGitMessage("");
+    try { await openProjectGithub(project.id); }
+    catch (error) { setGitMessage(error instanceof Error ? error.message : String(error)); }
+  }
   async function openFolder() {
     try { await openProjectFolder(project.id); }
     catch (error) { setGitMessage(error instanceof Error ? error.message : String(error)); }
@@ -258,7 +263,7 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
         <button className="icon-button project-quick" type="button" aria-busy={Boolean(activeBuild)} title={unavailableTitle("Build", buildReason)} aria-label={buildReason ? `Build ${current.name} unavailable: ${buildReason}` : `Build ${current.name}`} disabled={Boolean(buildReason)} onClick={() => setBuildDialog({ run: activeBuild })}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 10 6-10 6z" /></svg></button>
         <button className="icon-button project-quick" type="button" title="Project actions" aria-label={`Project actions for ${current.name}`} onClick={onClick}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" /></svg></button>
         <button className="icon-button project-quick" type="button" title={unavailableTitle("Open folder", openFolderReason)} aria-label={openFolderReason ? `Open ${current.name} folder unavailable: ${openFolderReason}` : `Open ${current.name} folder`} disabled={Boolean(openFolderReason)} onClick={() => void openFolder()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 13V3h5l2 2h6v8zM1.5 6h13" /></svg></button>
-        {remoteUrl && <a className="icon-button project-quick" title="GitHub" aria-label={`Open ${current.name} on GitHub`} href={remoteUrl} target="_blank" rel="noreferrer"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 2h4v4M14 2 7 9M7 3H2v11h11V9" /></svg></a>}
+        {remoteUrl && <button className="icon-button project-quick" type="button" title="GitHub" aria-label={`Open ${current.name} on GitHub`} disabled={!isDesktopApp()} onClick={() => void openGithub()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 2h4v4M14 2 7 9M7 3H2v11h11V9" /></svg></button>}
         <button className="icon-button project-quick project-card-refresh" type="button" title={refreshTitle} aria-label={refreshing ? `Refreshing ${current.name}` : `Refresh ${current.name}`} aria-busy={refreshing} disabled={refreshing || Boolean(refreshReason)} onClick={() => onRefreshProject?.(current.path)}><svg className={refreshing ? "is-refreshing" : undefined} viewBox="0 0 16 16" aria-hidden="true"><path d="M13.7 6A5.9 5.9 0 0 0 3.3 4.1L2 5.5" /><path d="M2 2v3.5h3.5M2.3 10a5.9 5.9 0 0 0 10.4 1.9l1.3-1.4M14 14v-3.5h-3.5" /></svg></button>
     </div>
     {buildDialog && <BuildProgressDialog project={current} profile={buildDialog.run?.workflow?.buildProfile ?? "release"} initialRun={buildDialog.run} onClose={() => setBuildDialog(null)} />}

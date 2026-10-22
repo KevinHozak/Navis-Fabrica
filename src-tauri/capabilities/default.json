@@ -59,6 +59,7 @@
     "allow-run-project-git-action",
     "allow-list-project-branches",
     "allow-open-project-folder",
+    "allow-open-project-github",
     "allow-get-release-executable-version",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

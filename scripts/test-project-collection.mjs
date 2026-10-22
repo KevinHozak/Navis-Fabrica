@@ -43,4 +43,11 @@ console.log('UX regressions passed: collection persistence, unknown/count states
 
 // Catch UTF-8 text accidentally round-tripped through the Windows code page.
 assert.doesNotMatch(card(project), /[\u00c2\u00c3\ufffd]/);
-assert.match(card(project), /aria-label="More actions for Owned project">\u22ef<\/summary>/);
+
+assert.doesNotMatch(card(project), /project-main|>M<\/button>/);
+assert.match(card(project), /aria-label="Switch branch for Owned project"/);
+
+assert.doesNotMatch(card(project), /project-card-menu|More actions/);
+assert.match(card(project), /aria-label="Project actions for Owned project"/);
+assert.match(card(project), /aria-label="Open Owned project folder unavailable:/);
+assert.match(card({...project, git: {...project.git, remotes: [{github: {canonicalUrl: 'https://github.com/example/owned'}}]}}), /aria-label="Open Owned project on GitHub"[^>]*href="https:\/\/github.com\/example\/owned"/);

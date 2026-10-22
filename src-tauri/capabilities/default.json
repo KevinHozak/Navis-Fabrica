@@ -57,6 +57,7 @@
     "allow-draft-project-commit-message",
     "allow-get-project-icon",
     "allow-run-project-git-action",
+    "allow-list-project-branches",
     "allow-open-project-folder",
     "allow-get-release-executable-version",
     "core:event:allow-listen",

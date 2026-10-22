@@ -40,11 +40,12 @@ static WATCH_COMMANDS: OnceLock<Sender<WatchCommand>> = OnceLock::new();
 static GITHUB_ACTIVITY_CACHE: OnceLock<Mutex<HashMap<String, github::GitHubActivity>>> =
     OnceLock::new();
 static APP_STARTUP_MS: AtomicU64 = AtomicU64::new(0);
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum ProjectGitAction {
     Pull,
     Main,
+    Switch(String),
     Refresh,
 }
 
@@ -143,7 +144,11 @@ fn execute_git_action(path: &Path, action: ProjectGitAction) -> Result<(), Strin
             "Could not read the current branch",
         )?
     };
-    if !matches!(action, ProjectGitAction::Refresh) && branch.is_empty() {
+    if !matches!(
+        action,
+        ProjectGitAction::Refresh | ProjectGitAction::Switch(_)
+    ) && branch.is_empty()
+    {
         return Err("Git actions require an attached branch.".into());
     }
     match action {
@@ -189,6 +194,25 @@ fn execute_git_action(path: &Path, action: ProjectGitAction) -> Result<(), Strin
                     "Upstream cannot be applied as a fast-forward",
                 )?;
             }
+        }
+        ProjectGitAction::Switch(target) => {
+            require(
+                &["check-ref-format", "--branch", &target],
+                "Invalid branch name",
+            )?;
+            require(
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{target}"),
+                ],
+                "Local branch is unavailable",
+            )?;
+            require(
+                &["switch", "--no-guess", &target],
+                "Could not switch branch",
+            )?;
         }
         ProjectGitAction::Main => {
             let worktrees = require(
@@ -292,9 +316,10 @@ fn git_action(
     let path = PathBuf::from(&project.path)
         .canonicalize()
         .map_err(|_| "The selected project folder is unavailable.".to_owned())?;
-    let action_name = match action {
+    let action_name = match &action {
         ProjectGitAction::Pull => "git-pull",
         ProjectGitAction::Main => "git-main",
+        ProjectGitAction::Switch(_) => "git-switch",
         ProjectGitAction::Refresh => "git-refresh",
     };
     let mut guard = if matches!(action, ProjectGitAction::Refresh) {
@@ -324,6 +349,38 @@ fn git_action(
         active.finish(true, "Git action completed and project facts refreshed.")?;
     }
     Ok(refreshed)
+}
+
+fn local_branches(path: &Path) -> Result<Vec<String>, String> {
+    let output = scanner::git_output(
+        path,
+        &[
+            "for-each-ref",
+            "--count=501",
+            "--format=%(refname:strip=2)",
+            "refs/heads/",
+        ],
+        &AtomicBool::new(false),
+    )?;
+    let branches: Vec<String> = output
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if branches.len() > 500 {
+        return Err("Too many local branches to display.".into());
+    }
+    Ok(branches)
+}
+
+#[tauri::command]
+async fn list_project_branches(app: AppHandle, project_id: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = project_for_git_action(&app, &project_id)?;
+        local_branches(Path::new(&project.path))
+    })
+    .await
+    .map_err(|error| format!("Branch lookup failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1484,11 +1541,11 @@ fn gemini_api_key_is_valid(key: &str) -> bool {
 
 fn gemini_commit_draft_api_key() -> Result<String, String> {
     let key = std::env::var("GEMINI_API_KEY").map_err(|_| {
-        "Gemini drafting is unavailable because GEMINI_API_KEY is not configured for this user. Enter the message manually.".to_owned()
+        "Gemini drafting is unavailable because GEMINI_API_KEY is not configured for this user. Configure the key, then click Push to retry.".to_owned()
     })?;
     let key = key.trim();
     if !gemini_api_key_is_valid(key) {
-        return Err("Gemini drafting is unavailable because GEMINI_API_KEY is invalid. Enter the message manually.".into());
+        return Err("Gemini drafting is unavailable because GEMINI_API_KEY is invalid. Configure the key, then click Push to retry.".into());
     }
     Ok(key.to_owned())
 }
@@ -1514,7 +1571,7 @@ fn draft_project_commit_message_blocking(
     }
     let context = runs::capture_commit_draft_context(&cwd)?;
     if context.snapshot_fingerprint != expected_fingerprint {
-        return Err("Repository changes shifted. Refresh the draft before continuing.".into());
+        return Err("Repository changes shifted. Click Push to retry.".into());
     }
     if context.diff_context.trim().is_empty() {
         return Err(
@@ -1534,7 +1591,7 @@ fn draft_project_commit_message_blocking(
     let latest = runs::capture_commit_review_state(&cwd)?;
     if latest.snapshot_fingerprint != context.snapshot_fingerprint {
         return Err(
-            "Repository changes shifted while the draft was being prepared. Refresh and retry."
+            "Repository changes shifted while the draft was being prepared. Click Push to retry."
                 .into(),
         );
     }
@@ -1561,17 +1618,14 @@ struct CommitDraftFields {
 
 fn parse_commit_draft(text: &str) -> Result<(String, String), String> {
     let draft: CommitDraftFields = serde_json::from_str(text.trim())
-        .map_err(|_| "Gemini did not return the required JSON commit draft. Retry or enter a message manually.".to_owned())?;
+        .map_err(|_| "Gemini did not return the required JSON commit draft. Click Push to retry.".to_owned())?;
     let mut subject = draft.subject.trim().to_owned();
     let mut body = draft.body.trim().to_owned();
     if subject.is_empty() {
-        return Err("Gemini returned an empty commit message. Retry or enter it manually.".into());
+        return Err("Gemini returned an empty commit message. Click Push to retry.".into());
     }
     if subject.chars().any(char::is_control) || body.contains('\0') {
-        return Err(
-            "Gemini returned unsupported control characters. Retry or enter the message manually."
-                .into(),
-        );
+        return Err("Gemini returned unsupported control characters. Click Push to retry.".into());
     }
     if subject.chars().count() > 72 {
         // Preserve the complete generated wording in the editable description;
@@ -1600,17 +1654,34 @@ fn parse_commit_draft(text: &str) -> Result<(String, String), String> {
     }
     if body.len() > 4_000 {
         return Err(
-            "Gemini returned a description exceeding 4,000 bytes. Retry or enter it manually."
+            "Gemini returned a description exceeding 4,000 bytes. Click Push to retry."
                 .into(),
         );
     }
     Ok((subject, body))
 }
 
+// Retry only the draft request, never commit or push side effects.
+fn retry_gemini_connection<T>(
+    mut request: impl FnMut() -> Result<T, (bool, String)>,
+    mut wait: impl FnMut(Duration),
+) -> Result<T, String> {
+    let delays = [Duration::from_millis(500), Duration::from_millis(1500)];
+    for attempt in 0..=delays.len() {
+        match request() {
+            Ok(value) => return Ok(value),
+            Err((true, _)) if attempt < delays.len() => wait(delays[attempt]),
+            Err((_, message)) => return Err(message),
+        }
+    }
+    unreachable!()
+}
+
 fn infer_gemini_commit_draft(prompt: &str) -> Result<String, String> {
     let api_key = gemini_commit_draft_api_key()?;
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(18))
         .build()
         .map_err(|_| "Gemini drafting could not initialize its network client.".to_owned())?;
     let request = serde_json::json!({
@@ -1630,18 +1701,31 @@ fn infer_gemini_commit_draft(prompt: &str) -> Result<String, String> {
             }
         }
     });
-    let response = client
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_COMMIT_DRAFT_MODEL}:generateContent"
-        ))
-        .header("x-goog-api-key", api_key)
-        .json(&request)
-        .send()
-        .map_err(|_| "Gemini commit drafting failed to connect. Check the network and API key, or enter the message manually.".to_owned())?;
+    let response = retry_gemini_connection(
+        || {
+            client
+            .post(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_COMMIT_DRAFT_MODEL}:generateContent"
+            ))
+            .header("x-goog-api-key", &api_key)
+            .json(&request)
+            .send()
+            .map_err(|error| {
+                let temporary = error.is_connect() || error.is_timeout();
+                let message = if temporary {
+                    "Gemini could not connect after 3 attempts. Check your connection, then click Push to retry."
+                } else {
+                    "Gemini could not send the draft request. Click Push to retry."
+                };
+                (temporary, message.to_owned())
+            })
+        },
+        thread::sleep,
+    )?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!(
-            "Gemini commit drafting failed (HTTP {}). Retry or enter the message manually.",
+            "Gemini commit drafting failed (HTTP {}). Click Push to retry.",
             status.as_u16()
         ));
     }
@@ -1650,38 +1734,31 @@ fn infer_gemini_commit_draft(prompt: &str) -> Result<String, String> {
         .take(MAX_GEMINI_COMMIT_DRAFT_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| {
-            "Gemini returned an unreadable commit draft. Retry or enter the message manually."
-                .to_owned()
+            "Gemini returned an unreadable commit draft. Click Push to retry.".to_owned()
         })?;
     if bytes.len() as u64 > MAX_GEMINI_COMMIT_DRAFT_RESPONSE_BYTES {
-        return Err(
-            "Gemini returned an oversized commit draft. Retry or enter the message manually."
-                .into(),
-        );
+        return Err("Gemini returned an oversized commit draft. Click Push to retry.".into());
     }
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-        "Gemini returned an unreadable commit draft. Retry or enter the message manually."
-            .to_owned()
+        "Gemini returned an unreadable commit draft. Click Push to retry.".to_owned()
     })?;
     let parts = value
         .pointer("/candidates/0/content/parts")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            "Gemini did not return a commit draft. Retry or enter the message manually.".to_owned()
-        })?;
+        .ok_or_else(|| "Gemini did not return a commit draft. Click Push to retry.".to_owned())?;
     let mut text = String::new();
     for part in parts {
         if let Some(value) = part.get("text").and_then(serde_json::Value::as_str) {
             if text.len().saturating_add(value.len()) > 8 * 1024 {
-                return Err("Gemini returned an oversized commit draft. Retry or enter the message manually.".into());
+                return Err(
+                    "Gemini returned an oversized commit draft. Click Push to retry.".into(),
+                );
             }
             text.push_str(value);
         }
     }
     if text.is_empty() {
-        return Err(
-            "Gemini did not return a commit draft. Retry or enter the message manually.".into(),
-        );
+        return Err("Gemini did not return a commit draft. Click Push to retry.".into());
     }
     Ok(text)
 }
@@ -2914,6 +2991,7 @@ pub fn run() {
             draft_project_commit_message,
             get_project_icon,
             run_project_git_action,
+            list_project_branches,
             open_project_folder,
             get_release_executable_version,
             start_affected_project_refresh,
@@ -2983,6 +3061,47 @@ mod git_action_repository_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn branch_picker_lists_and_switches_local_branches() {
+        let fixture = Fixture::new();
+        git(&fixture.repo, &["branch", "topic/local"]);
+        let branches = super::local_branches(&fixture.repo).unwrap();
+        assert!(branches.contains(&"feature/test".to_owned()));
+        assert!(branches.contains(&"topic/local".to_owned()));
+        assert!(!branches.iter().any(|branch| branch.starts_with("origin/")));
+        execute_git_action(
+            &fixture.repo,
+            ProjectGitAction::Switch("topic/local".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            git(&fixture.repo, &["branch", "--show-current"]),
+            "topic/local"
+        );
+    }
+
+    #[test]
+    fn branch_picker_preserves_dirty_files_and_rejects_invalid_targets() {
+        let fixture = Fixture::new();
+        git(&fixture.repo, &["branch", "topic/local"]);
+        fs::write(fixture.repo.join("uncommitted.txt"), "keep me").unwrap();
+        assert!(execute_git_action(
+            &fixture.repo,
+            ProjectGitAction::Switch("topic/local".into())
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        fs::remove_file(fixture.repo.join("uncommitted.txt")).unwrap();
+        for target in ["--detach", "missing", "origin/main"] {
+            assert!(
+                execute_git_action(&fixture.repo, ProjectGitAction::Switch(target.into())).is_err()
+            );
+        }
+    }
 
     struct Fixture {
         root: TempDir,
@@ -4036,6 +4155,46 @@ mod tests {
 #[cfg(test)]
 mod gemini_commit_draft_tests {
     use super::*;
+
+    #[test]
+    fn temporary_connection_failure_retries_then_succeeds() {
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let value = retry_gemini_connection(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err((true, "connection failed".into()))
+                } else {
+                    Ok("draft")
+                }
+            },
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+        assert_eq!(value, "draft");
+        assert_eq!(calls, 3);
+        assert_eq!(
+            waits,
+            vec![Duration::from_millis(500), Duration::from_millis(1500)]
+        );
+    }
+
+    #[test]
+    fn retry_budget_and_non_connection_errors_stop_requests() {
+        for temporary in [false, true] {
+            let mut calls = 0;
+            let result: Result<(), String> = retry_gemini_connection(
+                || {
+                    calls += 1;
+                    Err((temporary, "stopped".into()))
+                },
+                |_| {},
+            );
+            assert_eq!(calls, if temporary { 3 } else { 1 });
+            assert_eq!(result.unwrap_err(), "stopped");
+        }
+    }
 
     #[test]
     fn commit_draft_route_is_pinned_to_measured_gemini_flash_lite() {

@@ -6,6 +6,7 @@ fn main() {
             "prepare_issue_work",
             "get_settings",
             "get_project_inventory",
+            "list_project_branches",
             "get_project_commit_draft_context",
             "get_project_commit_changed_paths",
             "prepare_project_commit_review",

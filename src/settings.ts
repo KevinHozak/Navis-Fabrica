@@ -329,11 +329,12 @@ export const prepareProjectCommitReview = (projectId: string) => invoke<CommitDr
 export const draftProjectCommitMessage = (projectId: string, expectedFingerprint: string) => invoke<CommitMessageDraft>("draft_project_commit_message", { projectId, expectedFingerprint });
 export const getProjectIcon = (projectId: string) => invoke<string | null>("get_project_icon", { projectId });
 export const getReleaseExecutableVersion = (projectId: string) => invoke<ReleaseExecutableVersion | null>("get_release_executable_version", { projectId });
-export async function runProjectGitAction(projectId: string, action: "pull" | "main" | "refresh"): Promise<ProjectEntry> {
+export async function runProjectGitAction(projectId: string, action: "pull" | "main" | "refresh" | { switch: string }): Promise<ProjectEntry> {
   const project = await invoke<ProjectEntry>("run_project_git_action", { projectId, action });
   window.dispatchEvent(new CustomEvent<ProjectEntry>("fabrica-project-updated", { detail: project }));
   return project;
 }
+export const listProjectBranches = (projectId: string) => invoke<string[]>("list_project_branches", { projectId });
 export const openProjectFolder = (projectId: string) => invoke<void>("open_project_folder", { projectId });
 
 export const startProjectScan = (scanId: string, forceRefresh: boolean, maxDirectories?: number) =>

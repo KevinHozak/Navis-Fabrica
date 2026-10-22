@@ -1,7 +1,7 @@
 import { useWorkflowActivity, useBatchActivity, activityLabel, sameProjectPath } from "./Activity";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { commitReviewReducer, initialCommitReview, loadCommitReview } from "./commitReviewState";
-import { draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
+import { listProjectBranches, draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
 import { issueCommand, type IssuePage } from "./runnerClient";
 import { RunsPanel } from "./RunsPanel";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
@@ -112,6 +112,23 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   const [issueError, setIssueError] = useState("");
   const [gitBusy, setGitBusy] = useState("");
   const [gitMessage, setGitMessage] = useState("");
+  const [branches, setBranches] = useState<string[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const branchMenu = useRef<HTMLDetailsElement>(null);
+  async function loadBranches() {
+    setBranchesLoading(true); setBranches([]);
+    try { setBranches(await listProjectBranches(project.id)); }
+    catch (error) { setGitMessage(String(error)); }
+    finally { setBranchesLoading(false); }
+  }
+  async function switchBranch(branch: string) {
+    if (gitBusy || mutationBusy || branch === current.git.branch) return;
+    if (branchMenu.current) branchMenu.current.open = false;
+    setPushRun(null); setPushError(false); setGitBusy("Switching branch…"); setGitMessage("");
+    try { setCurrent(await runProjectGitAction(project.id, { switch: branch })); setReleaseRefresh(value => value + 1); setGitMessage(`Switched to ${branch}`); }
+    catch (error) { setGitMessage(String(error)); }
+    finally { setGitBusy(""); }
+  }
   const [releaseExecutable, setReleaseExecutable] = useState<ReleaseExecutableVersion | null>(null);
   const [releaseRefresh, setReleaseRefresh] = useState(0);
   const [current, setCurrent] = useState(project);
@@ -210,8 +227,11 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   const pushOnly = current.git.dirty === false && (current.git.upstream.ahead ?? 0) > 0;
   const pushActionLabel = pushOnly ? `Push ${current.git.upstream.ahead} ${current.git.upstream.ahead === 1 ? "commit" : "commits"}` : commitActionLabel;
   const activeBuild = relevant?.find(run => run.workflow?.action === "dev-build" && ["queued", "running", "cancelling"].includes(run.state));
+  const pushActive = pushRunning || (Boolean(gitBusy) && gitBusy !== "pull" && !gitBusy.startsWith("Switching"))
+    || Boolean(relevant?.some(run => run.workflow?.action === "dev-push" && ["queued", "running", "needsInput", "cancelling"].includes(run.state)));
   const buildReason = quickActionReason("build", current, { ...actionOptions, busy: activeBuild ? false : mutationBusy, hasHandler: true });
-  const mainReason = quickActionReason("main", current, actionOptions);
+  const branchReason = !isDesktopApp() ? "Requires the desktop app" : !current.isGitRepository ? "Requires a Git repository"
+    : mutationBusy || gitBusy ? "A repository operation is active" : current.git.dirty !== false ? "Commit or move uncommitted changes first" : null;
   const refreshReason = !isDesktopApp() ? "Requires the desktop app" : !onRefreshProject ? "Refresh is unavailable" : null;
   const openFolderReason = isDesktopApp() ? null : "Requires the desktop app";
   const remoteUrl = current.git.remotes.find(remote => remote.github)?.github?.canonicalUrl;
@@ -228,13 +248,17 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
   const statusMessage = gitBusy && gitBusy !== "pull" && gitBusy !== "main" ? gitBusy : pushStatus || (refreshing ? "Refreshing project details…" : refreshError ? "Refresh incomplete · showing last known details" : gitBusy ? `${gitBusy === "pull" ? "Pulling" : "Switching branch"}…` : gitMessage);
   return <article className={`my-project-card${selected ? " selected" : ""}`} aria-label={`${current.name} project`}>
     <div className="project-card-heading-row"><button className="project-card-open" title={current.name} onClick={onClick} aria-pressed={selected}><ProjectCardHeading name={current.name} icon={icon} /></button><div className="project-card-meta" title={metadataTitle}><span>{commitDate}</span>{versionLabel ? <button type="button" className="project-card-version" aria-label={`Build details for ${current.name}`} title={`Build details for ${current.name}`} onClick={onOpenBuild}>{versionLabel}</button> : <span className="project-card-version is-empty"> </span>}</div></div>
-    <div className="project-card-branch" title={branchLabel}>{branchLabel}{current.isWorktree ? " · Worktree" : ""}</div>
+    <details ref={branchMenu} className="project-branch-menu" onToggle={event => { if (event.currentTarget.open && !branchReason) void loadBranches(); }}>
+      <summary className="project-card-branch" title={branchReason ?? "Switch branch"} aria-label={`Switch branch for ${current.name}`} aria-busy={gitBusy.startsWith("Switching")} aria-disabled={Boolean(branchReason)} onClick={event => { if (branchReason) event.preventDefault(); }}>{branchLabel}{current.isWorktree ? " · Worktree" : ""}<span aria-hidden="true"> ▾</span></summary>
+      <div className="project-branch-options" aria-label="Local branches">{branchesLoading ? <span>Loading…</span> : branches.length ? branches.map(branch => <button type="button" key={branch} disabled={Boolean(branchReason) || branch === current.git.branch} onClick={() => void switchBranch(branch)}>{branch}{branch === current.git.branch ? " ✓" : ""}</button>) : <span>No local branches</span>}</div>
+    </details>
     <div className="project-card-quick-actions" aria-label={`${current.name} quick actions`}>
-        <button className="icon-button project-quick" type="button" title={unavailableTitle("Pull", pullReason)} aria-label={pullReason ? `Pull ${current.name} unavailable: ${pullReason}` : `Pull ${current.name}`} disabled={Boolean(pullReason)} onClick={() => void gitAction("pull")}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9m-3-3 3 3 3-3M2 12v2h12v-2" /></svg></button>
-        <button className="icon-button project-quick" type="button" title={unavailableTitle(pushActionLabel, pushReason)} aria-label={pushReason ? `${pushActionLabel} ${current.name} unavailable: ${pushReason}` : `${pushActionLabel} ${current.name}`} disabled={Boolean(pushReason)} onClick={() => void pushChanges()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 15V6m-3 3 3-3 3 3M2 4l3-3m-3 3 3 3M14 4l-3-3m3 3-3 3" /></svg></button>
-        <button className="icon-button project-quick" type="button" title={unavailableTitle("Build", buildReason)} aria-label={buildReason ? `Build ${current.name} unavailable: ${buildReason}` : `Build ${current.name}`} disabled={Boolean(buildReason)} onClick={() => setBuildDialog({ run: activeBuild })}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 10 6-10 6z" /></svg></button>
-        <button className="icon-button project-quick project-main" type="button" title={unavailableTitle("Main", mainReason)} aria-label={mainReason ? `Switch ${current.name} to main unavailable: ${mainReason}` : `Switch ${current.name} to main`} disabled={Boolean(mainReason)} onClick={() => void gitAction("main")}>M</button>
-        <details className="project-card-menu"><summary className="icon-button project-quick" title="More" aria-label={`More actions for ${current.name}`}>⋯</summary><div className="project-card-menu-pop"><button type="button" onClick={onClick}>Project actions</button><button type="button" title={unavailableTitle("Open folder", openFolderReason)} aria-label={openFolderReason ? `Open ${current.name} folder unavailable: ${openFolderReason}` : `Open ${current.name} folder`} disabled={Boolean(openFolderReason)} onClick={() => void openFolder()}>Open folder</button>{remoteUrl && <a href={remoteUrl} target="_blank" rel="noreferrer">GitHub ↗</a>}</div></details>
+        <button className="icon-button project-quick" type="button" aria-busy={gitBusy === "pull"} title={unavailableTitle("Pull", pullReason)} aria-label={pullReason ? `Pull ${current.name} unavailable: ${pullReason}` : `Pull ${current.name}`} disabled={Boolean(pullReason)} onClick={() => void gitAction("pull")}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1v9m-3-3 3 3 3-3M2 12v2h12v-2" /></svg></button>
+        <button className="icon-button project-quick" type="button" aria-busy={pushActive} title={unavailableTitle(pushActionLabel, pushReason)} aria-label={pushReason ? `${pushActionLabel} ${current.name} unavailable: ${pushReason}` : `${pushActionLabel} ${current.name}`} disabled={Boolean(pushReason)} onClick={() => void pushChanges()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 15V6m-3 3 3-3 3 3M2 4l3-3m-3 3 3 3M14 4l-3-3m3 3-3 3" /></svg></button>
+        <button className="icon-button project-quick" type="button" aria-busy={Boolean(activeBuild)} title={unavailableTitle("Build", buildReason)} aria-label={buildReason ? `Build ${current.name} unavailable: ${buildReason}` : `Build ${current.name}`} disabled={Boolean(buildReason)} onClick={() => setBuildDialog({ run: activeBuild })}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 10 6-10 6z" /></svg></button>
+        <button className="icon-button project-quick" type="button" title="Project actions" aria-label={`Project actions for ${current.name}`} onClick={onClick}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" /></svg></button>
+        <button className="icon-button project-quick" type="button" title={unavailableTitle("Open folder", openFolderReason)} aria-label={openFolderReason ? `Open ${current.name} folder unavailable: ${openFolderReason}` : `Open ${current.name} folder`} disabled={Boolean(openFolderReason)} onClick={() => void openFolder()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 13V3h5l2 2h6v8zM1.5 6h13" /></svg></button>
+        {remoteUrl && <a className="icon-button project-quick" title="GitHub" aria-label={`Open ${current.name} on GitHub`} href={remoteUrl} target="_blank" rel="noreferrer"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 2h4v4M14 2 7 9M7 3H2v11h11V9" /></svg></a>}
         <button className="icon-button project-quick project-card-refresh" type="button" title={refreshTitle} aria-label={refreshing ? `Refreshing ${current.name}` : `Refresh ${current.name}`} aria-busy={refreshing} disabled={refreshing || Boolean(refreshReason)} onClick={() => onRefreshProject?.(current.path)}><svg className={refreshing ? "is-refreshing" : undefined} viewBox="0 0 16 16" aria-hidden="true"><path d="M13.7 6A5.9 5.9 0 0 0 3.3 4.1L2 5.5" /><path d="M2 2v3.5h3.5M2.3 10a5.9 5.9 0 0 0 10.4 1.9l1.3-1.4M14 14v-3.5h-3.5" /></svg></button>
     </div>
     {buildDialog && <BuildProgressDialog project={current} profile={buildDialog.run?.workflow?.buildProfile ?? "release"} initialRun={buildDialog.run} onClose={() => setBuildDialog(null)} />}

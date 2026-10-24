@@ -454,8 +454,9 @@ fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
 .content.content-projects { padding-top: 20px; }
 .content-projects .my-projects { padding-top: 0; }
 .content-projects .my-project-grid { margin-top: 12px; }
-.content-home.browser-content { max-width: none; padding-inline: clamp(16px, 2vw, 32px); }
-.content-home .my-projects { padding-inline: 0; }
+.content-home.browser-content { max-width: none; padding-top: 12px; padding-inline: clamp(16px, 2vw, 32px); }
+.content-home .my-projects { padding-top: 0; padding-inline: 0; }
+.content-home .my-project-grid { margin-top: 8px; }
 @media (min-width: 1600px) { .content-home .my-project-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
 
 .my-project-card dd.count-changes { color: #f1c27c; }

@@ -542,7 +542,7 @@ function App() {
         <a className="toolbar-icon-button" href="#settings" title="Settings" aria-label="Settings"><BrowserIcon name="settings" /></a>
       </nav>
     </header>
-    <main id="main-content" className={`content browser-content${route.section === "runs" ? " content-activity" : ""}`} tabIndex={-1}>
+    <main id="main-content" className={`content browser-content${route.section === "runs" ? " content-activity" : ""}${route.section === "projects" ? " content-home" : ""}`} tabIndex={-1}>
       <div className="route-layer" hidden={route.section !== "projects"}>
         {watchError && <p role="status">Automatic content updates are unavailable. Use Settings to refresh.</p>}
         {!desktop && <p className="scan-notice">Browser preview: native discovery and Git details require the desktop app.</p>}

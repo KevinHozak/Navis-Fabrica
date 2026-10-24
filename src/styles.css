@@ -388,19 +388,19 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 
 /* Calm collection home */
 .my-projects { padding: 20px; }
-.my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); grid-auto-rows: 1fr; align-items: stretch; gap: 22px; margin: 24px 0; }
+.my-project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); grid-auto-rows: 1fr; align-items: stretch; gap: 16px; margin: 24px 0; }
 .my-project-grid > [role="listitem"] { min-width: 0; height: 100%; }
-.my-project-card { position: relative; display: grid; grid-template-rows: 42px 20px 30px 78px 20px 40px; align-content: space-between; gap: 8px; width: 100%; height: 100%; min-width: 0; min-height: 320px; text-align: left; padding: 16px; border: 1px solid #34465b; border-radius: 18px; background: #151e29; color: #e7edf5; }
+.my-project-card { position: relative; display: grid; grid-template-rows: 36px 18px 30px 64px 18px 36px; align-content: space-between; gap: 6px; width: 100%; height: 100%; min-width: 0; min-height: 276px; text-align: left; padding: 12px; border: 1px solid #34465b; border-radius: 14px; background: #151e29; color: #e7edf5; }
 .my-project-card:hover, .my-project-card.selected { border-color: #75b9ed; background: #1a2a3a; }
 .project-card-heading-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
 .project-card-open { flex: 1 1 auto; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .project-card-open:focus-visible { outline: 2px solid #8cc5fa; outline-offset: 4px; border-radius: 4px; }
-.project-card-meta { display: grid; flex: 0 0 100px; grid-template-rows: 20px 20px; align-content: center; min-width: 0; color: #c7d8e9; text-align: right; font-size: 11px; line-height: 20px; font-variant-numeric: tabular-nums; }
+.project-card-meta { display: grid; flex: 0 0 76px; grid-template-rows: 18px 18px; align-content: center; min-width: 0; color: #c7d8e9; text-align: right; font-size: 10px; line-height: 18px; font-variant-numeric: tabular-nums; }
 .project-card-meta > span { display: block; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .project-card-version { display: block; width: 100%; min-width: 0; overflow: hidden; padding: 0; border: 0; appearance: none; background: transparent; color: #d6e9fb !important; font: inherit; line-height: inherit; text-align: right; white-space: nowrap; text-overflow: ellipsis; cursor: pointer; }
 .project-card-version:hover { text-decoration: underline; text-underline-offset: 2px; }
 .project-card-version.is-empty { visibility: hidden; }
-.project-card-branch { min-width: 0; overflow: hidden; color: #abb9c9; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; line-height: 20px; }
+.project-card-branch { min-width: 0; overflow: hidden; color: #abb9c9; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; line-height: 18px; }
 .project-card-quick-actions { display: flex; flex-wrap: wrap; width: 100%; align-items: center; gap: 6px; }
 .project-quick { flex: 0 0 30px; text-decoration: none; width: 30px; height: 30px; padding: 0; color: #b7c6d7; cursor: pointer; }
 .project-quick:not(:disabled) { border-color: #568dbe; color: #d4ebff; box-shadow: 0 0 5px #4da8f044; text-shadow: 0 0 5px #73bdff66; }
@@ -415,7 +415,7 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .project-quick svg path:last-child { fill: none; }
 .project-card-activity, .project-card-action-status, .project-card-refresh-error { display: block; min-width: 0; overflow: hidden; font-size: 11px; line-height: 20px; white-space: nowrap; text-overflow: ellipsis; }
 .project-card-activity { color: #abb9c9; }
-.project-card-action-status, .project-card-refresh-error { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-height: 19px; white-space: normal; overflow-wrap: anywhere; }
+.project-card-action-status, .project-card-refresh-error { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-height: 17px; white-space: normal; overflow-wrap: anywhere; }
 .project-card-action-status { color: #a9d9ff; }
 .project-card-refresh-error { color: #f0bbc0; }
 .my-project-card h3 { font-size: 1.2rem; margin: 0; }
@@ -424,14 +424,14 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 @media (prefers-reduced-motion: reduce) {
   .project-card-refresh svg.is-refreshing { animation: none !important; transform: rotate(45deg); }
 }
-.my-project-card-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.my-project-card-heading { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .my-project-card-heading h3 { margin: 0; }
-.my-project-icon { width: 36px; height: 36px; flex: 0 0 36px; border-radius: 8px; object-fit: contain; }
+.my-project-icon { width: 32px; height: 32px; flex: 0 0 32px; border-radius: 7px; object-fit: contain; }
 .my-project-card small, .my-project-card dt { color: #abb9c9; }
-.my-project-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; width: 100%; height: 78px; margin: 0; }
-.my-project-card dl > div { min-width: 0; padding: 10px 6px; border: 1px solid #34465b; border-radius: 9px; background: #101923; text-align: center; }
-.my-project-card dt { font-size: .7rem; line-height: 1.3; white-space: nowrap; }
-.my-project-card dd { margin: 6px 0 0; overflow: hidden; font-size: 1.5rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; white-space: nowrap; text-overflow: ellipsis; }
+.my-project-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; width: 100%; height: 64px; margin: 0; }
+.my-project-card dl > div { min-width: 0; padding: 6px 4px; border: 1px solid #34465b; border-radius: 8px; background: #101923; text-align: center; }
+.my-project-card dt { font-size: .62rem; line-height: 1.3; white-space: nowrap; }
+.my-project-card dd { margin: 4px 0 0; overflow: hidden; font-size: 1.3rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; white-space: nowrap; text-overflow: ellipsis; }
 .collection-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 20px 0; }
 .collection-options label { display: flex; gap: 12px; padding: 16px; background: #151e29; border-radius: 10px; align-items: center; }
 .collection-options small { display: block; overflow-wrap: anywhere; color: #abb9c9; margin-top: 6px; }
@@ -441,7 +441,6 @@ h1 { margin-bottom: 8px; color: #f0f3f8; font: 700 clamp(27px, 3vw, 35px)/1.15 "
 .project-actions { display: flex; gap: 16px; margin: 20px 0; flex-wrap: wrap; }
 .advanced-settings { margin: 20px; padding: 20px; }
 .advanced-settings summary { cursor: pointer; padding: 10px; }
-@media (max-width: 900px) { .my-project-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); } }
 .activity-entry { color: #abb9c9; font-size: 13px; text-decoration: none; }
 .activity-overview { padding: 24px; margin-bottom: 24px; }
 .activity-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; gap: 16px; border-bottom: 1px solid #272e3a; }

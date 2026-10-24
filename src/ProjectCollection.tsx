@@ -200,8 +200,11 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
     return () => { alive = false; };
   }, [project.id, project.path]);
   useEffect(() => {
+    setIssues({ epics: "0", stories: "0" });
+    setIssueError("");
+  }, [project.id, project.path]);
+  useEffect(() => {
     let alive = true;
-    setIssues({ epics: "0", stories: "0" }); setIssueError("");
     if (!isDesktopApp()) { setIssues({ epics: "0", stories: "0" }); return; }
     async function loadCounts() {
       let epics = 0;
@@ -217,7 +220,10 @@ export function ProjectCard({ project, runs, selected, onClick, onRefreshProject
           else stories += 1;
         }
       }
-      if (alive) setIssues({ epics: String(epics), stories: String(stories) });
+      if (alive) {
+        setIssues({ epics: String(epics), stories: String(stories) });
+        setIssueError("");
+      }
     }
     void loadCounts().catch(e => { if (alive) { setIssues({ epics: "0", stories: "0" }); setIssueError(String(e)); } });
     return () => { alive = false; };

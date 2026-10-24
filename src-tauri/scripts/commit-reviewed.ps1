@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $env:GIT_LITERAL_PATHSPECS = '1'
 $env:GIT_TERMINAL_PROMPT = '0'
+$env:GIT_OPTIONAL_LOCKS = '0'
 $env:GCM_INTERACTIVE = 'never'
 $env:GH_PROMPT_DISABLED = '1'
 $env:NO_COLOR = '1'
@@ -321,10 +322,76 @@ function Open-ProtectedPullRequest([string]$ExpectedHead) {
 }
 function Step([string]$Name, [string]$Message) { Write-Output "GIT_STEP:${Name}:$Message" }
 function Check-Operation {
-    foreach ($name in @('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD')) {
+    foreach ($name in @('rebase-merge', 'rebase-apply', 'sequencer', 'BISECT_LOG', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD')) {
         $path = Git -Arguments @('rev-parse', '--git-path', $name)
         if (Test-Path -LiteralPath $path) { throw 'A Git operation is already in progress. Resolve or abort it before retrying.' }
     }
+}
+function Clear-StaleIndexLock {
+    # Only recover an empty index.lock that has been unchanged for two minutes.
+    # Git's resolved git-path handles linked worktrees and custom git dirs.
+    $resolvedLockPath = Native-Path (Git -Arguments @('rev-parse', '--git-path', 'index.lock'))
+    if (-not [IO.Path]::IsPathRooted($resolvedLockPath)) { $resolvedLockPath = Join-Path (Native-Path $request.cwd) $resolvedLockPath }
+    $lockPath = [IO.Path]::GetFullPath($resolvedLockPath)
+    if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { return }
+    $item = Get-Item -LiteralPath $lockPath -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Git index.lock is a reparse point; refusing automatic recovery.' }
+    $observedLength = $item.Length
+    $observedWrite = $item.LastWriteTimeUtc
+    if ($observedLength -ne 0 -or ([DateTime]::UtcNow - $observedWrite).TotalSeconds -lt 120) {
+        throw 'Git index.lock is fresh or contains data; resolve it manually before retrying.'
+    }
+    try {
+        # Fail closed if process enumeration is unavailable. Any Git process may
+        # be operating on this checkout, so recovery waits until none are active.
+        $gitProcesses = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -in @('git', 'git-lfs') })
+    } catch { throw 'Could not verify that Git is idle; refusing automatic index.lock recovery.' }
+    if ($gitProcesses.Count -gt 0) { throw 'A Git process is active; preserving index.lock.' }
+    # Exclusive open plus handle-based delete disposition closes the check/delete race.
+    try {
+        $current = Get-Item -LiteralPath $lockPath -Force
+        if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $current.Length -ne 0 -or $current.LastWriteTimeUtc -ne $observedWrite -or ([DateTime]::UtcNow - $current.LastWriteTimeUtc).TotalSeconds -lt 120) {
+            throw 'Git index.lock changed during recovery checks; preserving it.'
+        }
+        if (-not ('Fabrica.LockRecovery' -as [type])) {
+            $savedLib = $env:LIB
+            $source = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace Fabrica {
+  public static class LockRecovery {
+    [StructLayout(LayoutKind.Sequential)] private struct Disposition { public byte DeleteFile; }
+    [StructLayout(LayoutKind.Sequential)] private struct FileTime { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)] private struct ByHandleInfo {
+      public uint Attributes; public FileTime Creation; public FileTime Access; public FileTime Write;
+      public uint Volume; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] private static extern SafeFileHandle CreateFile(string p, uint a, uint s, IntPtr sec, uint c, uint f, IntPtr t);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetFileInformationByHandle(SafeFileHandle h, out ByHandleInfo i);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool SetFileInformationByHandle(SafeFileHandle h, int c, ref Disposition d, uint n);
+    public static void DeleteExclusive(string p, long expectedWriteTicks) {
+      using (var h = CreateFile(p, 0x10000 | 0x80, 0, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero)) {
+        if (h.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        ByHandleInfo i; if (!GetFileInformationByHandle(h, out i)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        long writeTime = ((long)i.Write.High << 32) | i.Write.Low;
+        if ((i.Attributes & (0x10 | 0x400)) != 0 || i.SizeHigh != 0 || i.SizeLow != 0 || writeTime != expectedWriteTicks)
+          throw new InvalidOperationException("Git index.lock changed during exclusive recovery checks; preserving it.");
+        var d = new Disposition { DeleteFile = 1 };
+        if (!SetFileInformationByHandle(h, 4, ref d, 1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+      }
+    }
+  }
+}
+'@
+            try { $env:LIB = ''; Add-Type -TypeDefinition $source } finally { $env:LIB = $savedLib }
+        }
+        $gitProcesses = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -in @('git', 'git-lfs') })
+        if ($gitProcesses.Count -gt 0) { throw 'A Git process became active; preserving index.lock.' }
+        [Fabrica.LockRecovery]::DeleteExclusive($lockPath, $observedWrite.ToFileTimeUtc())
+        Step 'lock-recovery' 'Removed one verified stale empty Git index.lock'
+    } catch { throw }
 }
 function Check-Clean([string]$Message = 'Uncommitted changes remain. Rebase and push stopped; no files were stashed.') {
     if (Git -Arguments @('status', '--porcelain=v1', '--untracked-files=all')) {
@@ -362,6 +429,7 @@ function Version-Step([string]$Action, [string[]]$Extra = @()) {
 try {
     Step 'review' 'Checking reviewed repository state'
     Check-Operation
+    Clear-StaleIndexLock
     Check-Target
     if ((Head) -cne $request.head) { throw 'HEAD changed. Click Push to retry.' }
     $currentStatus = [string](Git -Arguments @('status', '--porcelain=v1', '--untracked-files=all'))

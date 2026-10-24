@@ -1,9 +1,12 @@
 """Real Git fixtures for the bundled, provider-independent commit script."""
 import json
 import os
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'src-tauri' / 'scripts' / 'commit-reviewed.ps1'
@@ -42,11 +45,28 @@ class ReviewedGitTests(unittest.TestCase):
         folder.mkdir()
         path = folder / 'request.json'
         path.write_text(json.dumps(request), encoding='utf-8')
+        wrapper = folder / 'run-reviewed.ps1'
+        script_path = str(SCRIPT).replace("'", "''")
+        # Mock only process enumeration at this test boundary: persistent Git
+        # maintenance outside the fixture must not make synthetic tests flaky.
+        # The active-process case supplies its real fixture Git PID below.
+        wrapper.write_text("""param([Parameter(Mandatory=$true)][string]$RequestPath)
+function Get-Process {
+    [CmdletBinding()]
+    param([string[]]$Name)
+    if ($env:FABRICA_TEST_PROCESS_ENUM_FAIL -eq '1') { throw 'Fixture process enumeration failure' }
+    if ($env:FABRICA_TEST_ACTIVE_GIT_PID) {
+        Microsoft.PowerShell.Management\Get-Process -Id ([int]$env:FABRICA_TEST_ACTIVE_GIT_PID)
+    }
+}
+& '""" + script_path + """' -RequestPath $RequestPath
+exit $LASTEXITCODE
+""", encoding='utf-8')
         env = os.environ.copy()
         for name in ('GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE'):
             env.pop(name, None)
         env.update(getattr(self, 'extra_env', {}))
-        return subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('\\\\?\\' + str(SCRIPT)) if getattr(self, 'extended_paths', False) else str(SCRIPT), '-RequestPath', ('\\\\?\\' + str(path)) if getattr(self, 'extended_paths', False) else str(path)],
+        return subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('\\\\?\\' + str(wrapper)) if getattr(self, 'extended_paths', False) else str(wrapper), '-RequestPath', ('\\\\?\\' + str(path)) if getattr(self, 'extended_paths', False) else str(path)],
             capture_output=True, text=True, encoding='utf-8', env=env, timeout=120)
 
     def test_status_drift_reports_the_changed_path_before_commit(self):
@@ -54,11 +74,119 @@ class ReviewedGitTests(unittest.TestCase):
         request = self.request(['file.txt'])
         (self.repo / 'new-after-review.txt').write_text('late edit\n')
         result = self.run_script(request)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('new-after-review.txt', result.stdout + result.stderr)
         self.assertIn('click Push again', result.stdout + result.stderr)
         self.assertEqual(self.git('rev-parse', 'HEAD'), request['head'])
         self.assertTrue((self.repo / 'new-after-review.txt').exists())
+
+    def test_stale_empty_index_lock_is_cleared_before_reviewed_commit(self):
+        (self.repo / 'file.txt').write_text('after\n')
+        lock = self.repo / '.git' / 'index.lock'
+        lock.touch()
+        old = time.time() - 180
+        os.utime(lock, (old, old))
+        result = self.run_script(self.request(['file.txt']))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(lock.exists())
+        self.assertIn('GIT_STEP:lock-recovery:', result.stdout)
+
+    def test_fresh_and_nonempty_index_locks_are_preserved(self):
+        for contents, stale in (('', False), ('keep me', True)):
+            lock = self.repo / '.git' / 'index.lock'
+            lock.write_text(contents)
+            if stale:
+                old = time.time() - 180
+                os.utime(lock, (old, old))
+            result = self.run_script(self.request([], commit=False))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(lock.exists())
+            self.assertEqual(lock.read_text(), contents)
+            lock.unlink()
+
+    def test_exclusively_held_lock_is_preserved(self):
+        lock = self.repo / '.git' / 'index.lock'
+        lock.touch()
+        old = time.time() - 180
+        os.utime(lock, (old, old))
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create_file.restype = wintypes.HANDLE
+        close_handle = ctypes.windll.kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        handle = create_file(str(lock), 0x80000000, 0, None, 3, 0x80, None)
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value)
+        try:
+            result = self.run_script(self.request([], commit=False))
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(lock.exists())
+
+    def test_in_progress_operation_preserves_stale_lock(self):
+        lock = self.repo / '.git' / 'index.lock'
+        lock.touch()
+        old = time.time() - 180
+        os.utime(lock, (old, old))
+        (self.repo / '.git' / 'rebase-merge').mkdir()
+        result = self.run_script(self.request([], commit=False))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('already in progress', result.stdout + result.stderr)
+        self.assertTrue(lock.exists())
+
+    def test_active_git_process_preserves_stale_lock(self):
+        lock = self.repo / '.git' / 'index.lock'
+        lock.touch()
+        old = time.time() - 180
+        os.utime(lock, (old, old))
+        active = subprocess.Popen(['git', '-C', str(self.repo), 'hash-object', '--stdin'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.extra_env = {'FABRICA_TEST_ACTIVE_GIT_PID': str(active.pid)}
+            request = self.request([], commit=False)
+            result = self.run_script(request)
+        finally:
+            active.kill()
+            active.wait(timeout=10)
+            for pipe in (active.stdin, active.stdout, active.stderr):
+                pipe.close()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Git process is active', result.stdout + result.stderr)
+        self.assertTrue(lock.exists())
+
+    def test_process_enumeration_failure_preserves_stale_lock(self):
+        lock = self.repo / '.git' / 'index.lock'
+        lock.touch()
+        old = time.time() - 180
+        os.utime(lock, (old, old))
+        self.extra_env = {'FABRICA_TEST_PROCESS_ENUM_FAIL': '1'}
+        result = self.run_script(self.request([], commit=False))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Could not verify that Git is idle', result.stdout + result.stderr)
+        self.assertTrue(lock.exists())
+
+    def test_linked_worktree_lock_path_is_resolved_and_recovered(self):
+        linked = self.root / 'linked worktree'
+        subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-b', 'linked', str(linked), 'HEAD'], check=True, capture_output=True)
+        (linked / 'file.txt').write_text('linked change\n')
+        lock_text = subprocess.run(['git', '-C', str(linked), 'rev-parse', '--git-path', 'index.lock'], check=True, capture_output=True, text=True).stdout.strip()
+        lock = Path(lock_text)
+        if not lock.is_absolute():
+            lock = linked / lock
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.touch()
+        old = time.time() - 180
+        os.utime(lock, (old, old))
+        status = subprocess.run(['git', '-C', str(linked), 'status', '--porcelain=v1', '--untracked-files=all'], check=True, capture_output=True, text=True).stdout.rstrip('\r\n')
+        index = subprocess.run(['git', '-C', str(linked), 'ls-files', '--stage'], check=True, capture_output=True, text=True).stdout.rstrip('\r\n')
+        digest = subprocess.run(['git', '-C', str(linked), 'hash-object', '--no-filters', '--', 'file.txt'], check=True, capture_output=True, text=True).stdout.strip()
+        request = dict(cwd=str(linked), head=subprocess.run(['git', '-C', str(linked), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip(), branch='linked', status=status, index=index,
+            files=[dict(path='file.txt', hash=digest)], remote=None, remoteUrl=None, remoteBranch=None, commit=True, push=False,
+            subject='Linked worktree lock recovery', body='Fixture')
+        result = self.run_script(request)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(lock.exists())
 
     def test_exact_message_and_large_path_scope(self):
         paths = ['file.txt']

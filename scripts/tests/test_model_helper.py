@@ -60,7 +60,7 @@ class HelperTests(unittest.TestCase):
             self.assertTrue(url.startswith("http://127.0.0.1:11434/"))
             self.assertIsNone(key)
             self.assertEqual(payload["options"]["num_ctx"], 2048)
-            return {"response": "sensitive-reply", "done": True, "done_reason": "stop", "prompt_eval_count": 8, "eval_count": 4}
+            return {"response": "sensitive-reply", "done": True, "done_reason": "stop", "done_reason": "stop", "prompt_eval_count": 8, "eval_count": 4}
         result = m.run(self.config, self.policy, "draft-local", "sensitive-prompt", True, fake)
         self.assertTrue(result["complete"])
         self.assertEqual(result["usage"]["reported_cost_usd"], 0)
@@ -225,7 +225,7 @@ class PresetTests(unittest.TestCase):
         rendered = m.render_preset(preset, document)
         self.assertEqual(json.loads(rendered.split("Document JSON:\n", 1)[1]), document)
         result = m.run(self.config, self.policy, "draft-local", rendered, True,
-            lambda *a, **k: {"response": "ok", "done": True, "prompt_eval_count": 8, "eval_count": 1})
+            lambda *a, **k: {"response": "ok", "done": True, "done_reason": "stop", "prompt_eval_count": 8, "eval_count": 1})
         self.assertTrue(result["complete"])
         with self.assertRaises(m.Refusal):
             m.run(self.config, self.policy, "draft-local", m.render_preset(preset, "x" * 1600),
@@ -288,7 +288,7 @@ class ContextTests(unittest.TestCase):
     def test_exact_final_boundary_and_output_headroom(self):
         selected = m.route(self.policy,"draft-local")
         prompt, report = self.prepare('"\n🌈')
-        required = len(prompt.encode()) + 512 + selected["max_output_tokens"]
+        required = len(prompt.encode()) + 512
         selected["input_envelope"] = required
         self.assertTrue(m.prepare_context(selected,"Summarize.",'"\n🌈',"full")[1]["fits_input_envelope"])
         selected["input_envelope"] -= 1
@@ -327,7 +327,7 @@ class ContextTests(unittest.TestCase):
         def fake(url,payload,key,**kwargs):
             self.assertNotIn("excluded",payload["prompt"])
             self.assertIn("selected",payload["prompt"])
-            return {"response":"synthetic-answer","done":True,"prompt_eval_count":8,"eval_count":2}
+            return {"response":"synthetic-answer","done":True,"done_reason":"stop","prompt_eval_count":8,"eval_count":2}
         def dispatch(*args,**kwargs): return original_run(*args,**kwargs,get=fake)
         for instruction_args in (["--instruction","Summarize."], ["--preset",str(m.ROOT/"config/prompt-presets/draft-local.md")]):
             with patch.object(m,"run",side_effect=dispatch):
@@ -362,5 +362,142 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(report["document_preview"], "🌈")
         with patch.object(m, "run", side_effect=AssertionError("dispatch")):
             self.assertEqual(self.cli(base, "x" * 65537)[0], 2)
+
+
+class LocalPolicyTests(unittest.TestCase):
+    setUp = HelperTests.setUp
+    tearDown = HelperTests.tearDown
+
+    def local(self, **updates):
+        self.policy["routes"]["draft-local"].update(updates)
+        return m.route(self.policy, "draft-local")
+
+    def test_separate_context_input_output_and_legacy_migration(self):
+        selected = self.local(context_tokens=4096, input_envelope=1600, max_output_tokens=400)
+        seen = []
+        def fake(url, payload, key, **kwargs):
+            seen.append(payload)
+            return {"response":"ok", "done":True, "done_reason":"stop", "prompt_eval_count":1, "eval_count":1}
+        m.run(self.config,self.policy,"draft-local","x"*1088,get=fake)
+        self.assertEqual(seen[0]["options"], {"num_ctx":4096,"num_predict":400})
+        with self.assertRaises(m.Refusal): m.run(self.config,self.policy,"draft-local","x"*1089,get=fake)
+        self.assertEqual(len(seen),1)
+        raw=self.policy["routes"]["draft-local"]
+        raw.pop("context_tokens"); raw.pop("keep_alive"); raw.update(input_envelope=2048,max_output_tokens=256)
+        migrated=m.route(self.policy,"draft-local")
+        self.assertEqual((migrated["context_tokens"],migrated["input_envelope"]),(2048,1792))
+        self.assertNotIn("context_tokens",raw)
+
+    def test_unsafe_and_unsupported_bounds_refuse_before_dispatch(self):
+        original=dict(self.policy["routes"]["draft-local"])
+        for update in ({"context_tokens":True},{"context_tokens":0},{"context_tokens":1048577},
+                       {"input_envelope":1800},{"max_output_tokens":2048},{"max_output_tokens":-1},
+                       {"timeout_seconds":False},{"temperature":1},{"keep_alive":-1},
+                       {"keep_alive":"5m"},{"keep_alive":301},{"keep_alive":True}):
+            self.policy["routes"]["draft-local"]={**original,**update}
+            with self.subTest(update=update),self.assertRaises(m.Refusal):
+                m.run(self.config,self.policy,"draft-local","synthetic",get=lambda *a,**k:self.fail("dispatch"))
+
+    def test_keep_alive_omission_and_local_only_values(self):
+        for residency in (None,0,30,300):
+            raw=self.policy["routes"]["draft-local"]
+            raw.pop("keep_alive",None)
+            if residency is not None: raw["keep_alive"]=residency
+            def fake(url,payload,key,**kwargs):
+                self.assertEqual(payload.get("keep_alive"),residency)
+                self.assertTrue(url.startswith("http://127.0.0.1:11434/"))
+                return {"response":"ok","done":True,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}
+            m.run(self.config,self.policy,"draft-local","synthetic",get=fake)
+        for field in ("keep_alive","context_tokens","num_ctx"):
+            self.policy["routes"]["extract"][field]=0
+            with self.assertRaises(m.Refusal): m.route(self.policy,"extract")
+            del self.policy["routes"]["extract"][field]
+
+    def test_local_probe_text_only_and_capacity_validation(self):
+        selected=self.local()
+        def fake(url,payload,**kwargs):
+            self.assertEqual(url,"http://127.0.0.1:11434/api/show")
+            self.assertEqual(payload,{"model":selected["model"]})
+            return {"model_info":{"test.context_length":4096},"capabilities":["completion"]}
+        evidence=m.probe_local(selected,fake)
+        self.assertEqual(m.validate_local_evidence(selected,evidence)["context_tokens"],4096)
+        for update in ({"context_tokens":1024},{"completion":False},{"model":"different"}):
+            with self.assertRaises(m.Refusal):
+                m.run(self.config,self.policy,"draft-local","synthetic",get=lambda *a,**k:self.fail("inference"),local_evidence={**evidence,**update})
+        unknown=m.probe_local(selected,lambda *a,**k:{})
+        self.assertIsNone(m.validate_local_evidence(selected,unknown)["context_tokens"])
+        self.assertIsNone(m.validate_local_evidence(selected)["context_tokens"])
+        with self.assertRaises(m.Refusal): m.probe_local(m.route(self.policy,"extract"),fake)
+        with self.assertRaises(m.Refusal) as caught:
+            m.probe_local(selected,lambda *a,**k:(_ for _ in ()).throw(RuntimeError("sensitive")))
+        self.assertNotIn("sensitive",str(caught.exception))
+
+    def test_normalized_local_termination_and_settlement_independent(self):
+        for text,done,termination,expected in [("ok",True,"stop",None),("partial",True,"length","output_limit"),
+              ("",True,"length","output_limit"),(" ",True,"stop","empty_final_answer"),
+              ("ok",True,None,"unknown_termination"),("ok",False,"stop","unknown_termination"),
+              ("ok",True,"unexpected-sensitive","unknown_termination")]:
+            result=m.run(self.config,self.policy,"draft-local","synthetic",get=lambda *a,**k:{"response":text,"done":done,"done_reason":termination,"thinking":"private-reasoning","prompt_eval_count":1,"eval_count":1})
+            self.assertEqual(result["incomplete_reason"],expected)
+            self.assertEqual(result["complete"],expected is None)
+            self.assertEqual(result["billing_state"],"settled")
+            self.assertNotIn("private-reasoning",json.dumps(result))
+            self.assertNotIn("unexpected-sensitive",json.dumps(result))
+
+    @patch.object(m,"api_key",return_value="unit-test-placeholder")
+    def test_cloud_incomplete_diagnostics_and_unknown_holds(self,key):
+        for error,finish,text,expected in [(None,"length","","output_limit"),(None,"stop","","empty_final_answer"),
+             (None,None,"partial","unknown_termination"),({"code":"context_length_exceeded","message":"private-error"},None,None,"context_rejection"),
+             ({"code":"other","message":"private-error"},None,None,"provider_rejection")]:
+            def fake(url,payload=None,*a,**k):
+                if payload is None:return self.catalog
+                self.assertNotIn("keep_alive",payload);self.assertNotIn("num_ctx",payload)
+                return {"choices":[{"message":{"content":text,"reasoning":"private-reasoning"},"finish_reason":finish}],"error":error}
+            result=m.run(self.config,self.policy,"extract","synthetic",get=fake)
+            self.assertEqual(result["incomplete_reason"],expected)
+            self.assertEqual(result["billing_state"],"unknown")
+            self.assertGreater(result["daily_totals"]["committed_micros"],0)
+            self.assertNotIn("private-error",json.dumps(result));self.assertNotIn("private-reasoning",json.dumps(result))
+
+    def test_http_rejection_is_sanitized_and_not_retried(self):
+        calls=[]
+        def fake(*a,**k):
+            calls.append(1)
+            raise m.urllib.error.HTTPError("http://private",400,"private-provider-error",{},None)
+        with self.assertRaises(m.Refusal) as caught:
+            m.run(self.config,self.policy,"draft-local","synthetic",get=fake)
+        self.assertEqual(caught.exception.incomplete_reason,"provider_rejection")
+        self.assertNotIn("private-provider-error",str(caught.exception))
+        self.assertEqual(len(calls),1)
+        ledger=m.Ledger(self.path)
+        self.assertEqual(ledger.db.execute("SELECT state FROM calls").fetchone()[0],"unknown")
+        ledger.db.close()
+
+    def test_probe_cli_is_explicit_and_inspection_never_generates(self):
+        cli = ContextTests.cli
+        evidence = {"model":"gemma3:4b","state":"observed","context_tokens":4096,"completion":True}
+        base = ["inspect","--preset",str(m.ROOT/"config/prompt-presets/draft-local.md")]
+        with patch.object(m,"probe_local",return_value=evidence) as probe, \
+             patch.object(m,"run",side_effect=AssertionError("inference")), \
+             patch.object(m,"Ledger",side_effect=AssertionError("ledger")):
+            code,result=cli(self,base)
+            self.assertEqual(code,0);probe.assert_not_called()
+            self.assertEqual(result["local_model_evidence"]["state"],"not_probed")
+            code,result=cli(self,base+["--probe-local"])
+            self.assertEqual(code,0);self.assertEqual(probe.call_count,1)
+            self.assertEqual(result["local_model_evidence"]["context_tokens"],4096)
+        for argv in (["usage","--probe-local"],["route","--task","extract","--probe-local"]):
+            self.assertEqual(cli(self,argv)[0],2)
+        with self.assertRaises(m.Refusal):
+            m.probe_local(self.local(),lambda *a,**k:{"error":"private error"})
+
+    def test_cli_exception_reason_is_sanitized(self):
+        config_path=Path(self.temp.name)/"settings.json"
+        config_path.write_text(json.dumps(self.config))
+        with patch.object(m,"run",side_effect=m.Refusal("Usage remains reserved", "provider_rejection")):
+            code,result=ContextTests.cli(self,["run","--task","draft-local","--config",str(config_path)],"synthetic")
+        self.assertEqual(code,2)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["incomplete_reason"],"provider_rejection")
 
 if __name__ == "__main__": unittest.main()

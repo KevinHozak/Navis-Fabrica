@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import time
 import urllib.request
+import urllib.error
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,9 @@ OPENROUTER = "https://openrouter.ai/api/v1"
 MAX_RESPONSE = 2 * 1024 * 1024
 
 class Refusal(Exception):
-    pass
+    def __init__(self, message, incomplete_reason=None):
+        super().__init__(message)
+        self.incomplete_reason = incomplete_reason
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -88,7 +91,72 @@ def route(policy, task, private=False):
         raise Refusal("Unsupported route provider")
     if private and selected["provider"] != "ollama":
         raise Refusal("Private task requires an explicit local route; no cloud fallback")
+    base = {"provider", "model", "input_envelope", "max_output_tokens", "timeout_seconds"}
+    local = {"context_tokens", "keep_alive"} if selected["provider"] == "ollama" else set()
+    if set(selected) - base - local:
+        raise Refusal("Unsupported route setting")
+    for key, ceiling in (("input_envelope", 1048576), ("max_output_tokens", 1048576), ("timeout_seconds", 600)):
+        if type(selected[key]) is not int or not 1 <= selected[key] <= ceiling:
+            raise Refusal("Invalid route bound")
+    if selected["provider"] == "ollama":
+        legacy = "context_tokens" not in selected
+        selected.setdefault("context_tokens", selected["input_envelope"])
+        capacity = selected["context_tokens"]
+        if type(capacity) is not int or not 512 <= capacity <= 1048576:
+            raise Refusal("Invalid local context capacity")
+        if legacy:
+            selected["input_envelope"] = min(selected["input_envelope"], capacity - selected["max_output_tokens"])
+        if selected["input_envelope"] <= 512 or selected["input_envelope"] + selected["max_output_tokens"] > capacity:
+            raise Refusal("Local input envelope plus output exceeds configured context", "context_rejection")
+        if "keep_alive" in selected and (type(selected["keep_alive"]) is not int or not 0 <= selected["keep_alive"] <= 300):
+            raise Refusal("Local keep_alive must be integer seconds from 0 to 300")
     return selected
+
+def probe_local(selected, get=request_json):
+    if selected["provider"] != "ollama":
+        raise Refusal("Local probe requires an Ollama route")
+    try:
+        detail = get("http://127.0.0.1:11434/api/show", {"model": selected["model"]},
+                     timeout=min(selected["timeout_seconds"], 10))
+        if detail.get("error"):
+            raise ValueError("metadata unavailable")
+        # Same model_info *.context_length contract as runner-core providers.rs;
+        # text helpers do not require tools or the coding harness's 8K minimum.
+        info = detail.get("model_info") or {}
+        capacities = [value for key, value in info.items() if key.endswith(".context_length")
+                      and type(value) is int and value > 0]
+        caps = detail.get("capabilities")
+        return {"model": selected["model"], "state": "observed",
+                "context_tokens": min(capacities) if capacities else None,
+                "completion": "completion" in caps if isinstance(caps, list) else None}
+    except Exception:
+        raise Refusal("Local metadata probe unavailable; no inference dispatched") from None
+
+def validate_local_evidence(selected, evidence=None):
+    if selected["provider"] != "ollama":
+        return None
+    evidence = evidence or {"model": selected["model"], "state": "not_probed", "context_tokens": None, "completion": None}
+    if evidence["model"] != selected["model"]:
+        raise Refusal("Local evidence model mismatch")
+    if evidence["completion"] is False:
+        raise Refusal("Model does not report text completion support", "provider_rejection")
+    if evidence["context_tokens"] is not None and selected["context_tokens"] > evidence["context_tokens"]:
+        raise Refusal("Configured context exceeds observed model capacity", "context_rejection")
+    return evidence
+
+def incomplete_reason(result, cloud, text):
+    error = result.get("error")
+    if error:
+        code = error.get("code") if isinstance(error, dict) else None
+        return "context_rejection" if code in {"context_length_exceeded", "context_window_exceeded"} else "provider_rejection"
+    reason = (result.get("choices") or [{}])[0].get("finish_reason") if cloud else result.get("done_reason")
+    if reason in {"length", "max_tokens"}:
+        return "output_limit"
+    if not isinstance(text, str) or not text.strip():
+        return "empty_final_answer"
+    if reason != "stop" or (not cloud and result.get("done") is not True):
+        return "unknown_termination"
+    return None
 
 def load_preset(path):
     """Read one explicitly selected file; deliberately not a general YAML/template engine."""
@@ -158,10 +226,10 @@ def prepare_context(selected, instruction, document, mode, start=None, end=None,
     chosen = None if mode == "none" else document[start:end]
     prompt = compose_context(instruction, chosen)
     size = len(prompt.encode("utf-8"))
-    # Legacy local policy also uses input_envelope as num_ctx. Leave output room
-    # for structured requests; raw-stdin admission remains compatible.
     output_headroom = selected["max_output_tokens"] if selected["provider"] == "ollama" else 0
-    fits = size + 512 + output_headroom <= selected["input_envelope"]
+    fits = size + 512 <= selected["input_envelope"]
+    if output_headroom:
+        fits = fits and size + 512 + output_headroom <= selected["context_tokens"]
     summary = {"document_mode": mode, "offset_unit": "unicode-code-points",
                "source_characters": length, "selected_range": [start, end],
                "selected_characters": end - start,
@@ -171,6 +239,7 @@ def prepare_context(selected, instruction, document, mode, start=None, end=None,
                "input_envelope": selected["input_envelope"],
                "reserved_output_tokens": selected["max_output_tokens"],
                "local_output_headroom": output_headroom,
+               "configured_context_tokens": selected.get("context_tokens"),
                "conservative_input_estimate": size + 512,
                "estimate_unit": "utf8-bytes-plus-margin-not-token-count",
                "model_context_capacity": "not verified offline",
@@ -254,8 +323,9 @@ def cloud_quote(selected, max_output, get=request_json):
     amount = micros(envelope * input_rate + max_output * output_rate)
     return amount, {"prompt": float(input_rate * 1000000), "completion": float(output_rate * 1000000), "request": 0}
 
-def run(config, policy, task, prompt, private=False, get=request_json):
+def run(config, policy, task, prompt, private=False, get=request_json, local_evidence=None):
     selected = route(policy, task, private)
+    local_evidence = validate_local_evidence(selected, local_evidence)
     max_output = selected["max_output_tokens"]
     # Conservative byte envelope, including a margin for a single message. Refuse rather than truncate.
     if not prompt.strip() or len(prompt.encode("utf-8")) + 512 > selected["input_envelope"]:
@@ -278,7 +348,9 @@ def run(config, policy, task, prompt, private=False, get=request_json):
             cap, amount, key = 0, 0, None
             # Local means loopback, not an arbitrary endpoint supplied by task text.
             url = "http://127.0.0.1:11434/api/generate"
-            payload = {"model": selected["model"], "prompt": prompt, "stream": False, "options": {"num_ctx": selected["input_envelope"], "num_predict": max_output}}
+            payload = {"model": selected["model"], "prompt": prompt, "stream": False, "options": {"num_ctx": selected["context_tokens"], "num_predict": max_output}}
+            if "keep_alive" in selected:
+                payload["keep_alive"] = selected["keep_alive"]
         identity = ledger.reserve(day, selected, task, amount, cap if cloud else 10**18)
         start = time.monotonic()
         try:
@@ -287,21 +359,24 @@ def run(config, policy, task, prompt, private=False, get=request_json):
             if cloud:
                 usage = result.get("usage") or {}
                 input_tokens, output_tokens, cost = usage.get("prompt_tokens"), usage.get("completion_tokens"), usage.get("cost")
-                choice = result.get("choices", [{}])[0]
+                choice = (result.get("choices") or [{}])[0]
                 text = choice.get("message", {}).get("content")
-                finished = choice.get("finish_reason") == "stop"
             else:
                 input_tokens, output_tokens, cost = result.get("prompt_eval_count"), result.get("eval_count"), 0
                 text = result.get("response")
-                finished = result.get("done") is True and result.get("done_reason") != "length"
+            reason = incomplete_reason(result, cloud, text)
             state = ledger.settle(identity, cost, input_tokens, output_tokens, elapsed)
             totals = ledger.totals(day)
             warning = cloud and totals["committed_micros"] >= micros(config["daily_budget_usd"]) * .8
-            return {"call_id": identity, "route": selected, "text": text, "complete": finished and isinstance(text, str) and bool(text.strip()), "billing_state": state, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "reported_cost_usd": cost, "source": "openrouter-response" if cloud else "ollama-response", "elapsed_ms": elapsed}, "day": day, "daily_totals": totals, "budget_nearing_limit": warning, "budget_note": "Ask user for a task-specific increase before exceeding the cap" if warning else None}
+            return {"call_id": identity, "route": selected, "text": text if isinstance(text, str) else None, "complete": reason is None,
+                    "incomplete_reason": reason, "local_model_evidence": local_evidence,
+                    "completion_note": "Reasoning may consume generation budget; empty text alone does not confirm reasoning exhaustion." if reason in {"output_limit", "empty_final_answer"} else None,
+                    "billing_state": state, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "reported_cost_usd": cost, "source": "openrouter-response" if cloud else "ollama-response", "elapsed_ms": elapsed}, "day": day, "daily_totals": totals, "budget_nearing_limit": warning, "budget_note": "Ask user for a task-specific increase before exceeding the cap" if warning else None}
         except Exception as error:
             # Do not persist arbitrary response bodies, prompts, URLs, headers or secrets.
             ledger.db.execute("UPDATE calls SET state='unknown' WHERE id=?", (identity,))
-            raise Refusal(f"Provider call failed ({type(error).__name__}); usage remains reserved, no retry. Call {identity}") from None
+            reason = "provider_rejection" if isinstance(error, urllib.error.HTTPError) else "unknown_termination"
+            raise Refusal(f"Provider call failed ({type(error).__name__}); usage remains reserved, no retry. Call {identity}", reason) from None
     finally:
         ledger.db.close()
 
@@ -318,6 +393,7 @@ def main(argv=None):
     parser.add_argument("--start", type=int)
     parser.add_argument("--end", type=int)
     parser.add_argument("--preview", action="store_true", help="Include selected text in transient context output")
+    parser.add_argument("--probe-local", action="store_true", help="Read local model metadata without inference")
     args = parser.parse_args(argv)
     try:
         policy = load(args.policy)
@@ -338,29 +414,41 @@ def main(argv=None):
                 raise Refusal("Usage does not accept a preset")
             preset = load_preset(args.preset)
             args.task, args.private, selected = preset_selection(policy, preset, args.task, args.private)
+        evidence = None
+        if args.probe_local:
+            if args.command == "usage":
+                raise Refusal("Usage does not accept a local probe")
+            selected = route(policy, args.task, args.private)
+            evidence = validate_local_evidence(selected, probe_local(selected))
         if args.command == "context" or context_options:
             selected = route(policy, args.task, args.private)
             instruction = preset["body"] if preset else args.instruction
             prompt, summary = prepare_context(selected, instruction, read_document(),
                 args.document_mode, args.start, args.end, args.preview)
             if args.command == "context":
+                if evidence is not None:
+                    summary["model_context_capacity"] = evidence["context_tokens"]
                 print(json.dumps({"task": args.task, "private": args.private,
                     "route": {key: selected[key] for key in ("provider", "model", "timeout_seconds")},
+                    "local_model_evidence": validate_local_evidence(selected, evidence),
                     **summary}, ensure_ascii=True))
                 return 0 if summary["fits_input_envelope"] else 2
             if not summary["fits_input_envelope"]:
                 raise Refusal("Composed request exceeds input envelope")
             if not args.config:
                 raise Refusal("Set FABRICA_AGENT_CONFIG or pass --config for private settings")
-            result = run(load(args.config), policy, args.task, prompt, args.private)
+            result = run(load(args.config), policy, args.task, prompt, args.private, local_evidence=evidence)
         elif args.command == "inspect":
             if preset is None:
                 raise Refusal("Inspect requires an explicit preset")
             result = {"schema_version": 1, "id": preset["id"], "task": args.task,
-                      "private": args.private, "route": {key: selected[key] for key in
-                          ("provider", "model", "input_envelope", "max_output_tokens", "timeout_seconds")}}
+                      "private": args.private, "local_model_evidence": validate_local_evidence(selected, evidence),
+                      "route": {key: selected[key] for key in
+                          ("provider", "model", "input_envelope", "max_output_tokens", "timeout_seconds", "context_tokens", "keep_alive") if key in selected}}
         elif args.command == "route":
             result = route(policy, args.task, args.private)
+            if args.probe_local:
+                result["local_model_evidence"] = evidence
         else:
             if not args.config:
                 raise Refusal("Set FABRICA_AGENT_CONFIG or pass --config for private settings")
@@ -375,12 +463,15 @@ def main(argv=None):
                     if not document.strip():
                         raise Refusal("Document is empty")
                     document = render_preset(preset, document)
-                result = run(config, policy, args.task, document, args.private)
+                result = run(config, policy, args.task, document, args.private, local_evidence=evidence)
         print(json.dumps(result, ensure_ascii=True))
         return 0 if result.get("complete", True) and result.get("billing_state") not in {"unknown", "overrun"} else 3
     except (Refusal, KeyError, ValueError, OSError, DecimalException, TypeError, sqlite3.Error) as error:
         # Only our fixed refusal text is safe for output. Other errors may contain private paths/content.
-        print(json.dumps({"error": str(error) if isinstance(error, Refusal) else type(error).__name__}))
+        result = {"error": str(error) if isinstance(error, Refusal) else type(error).__name__}
+        if isinstance(error, Refusal) and error.incomplete_reason:
+            result.update(complete=False, incomplete_reason=error.incomplete_reason)
+        print(json.dumps(result))
         return 2
 
 if __name__ == "__main__":

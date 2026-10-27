@@ -32,16 +32,20 @@
     "draft-local": {
       "provider": "ollama",
       "model": "gemma3:4b",
-      "input_envelope": 2048,
+      "input_envelope": 1792,
       "max_output_tokens": 256,
-      "timeout_seconds": 45
+      "timeout_seconds": 45,
+      "context_tokens": 2048,
+      "keep_alive": 0
     },
     "code-local": {
       "provider": "ollama",
       "model": "qwen2.5-coder:7b",
-      "input_envelope": 2048,
+      "input_envelope": 1792,
       "max_output_tokens": 256,
-      "timeout_seconds": 45
+      "timeout_seconds": 45,
+      "context_tokens": 2048,
+      "keep_alive": 0
     }
   }
 }

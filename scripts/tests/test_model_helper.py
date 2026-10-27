@@ -245,4 +245,122 @@ class PresetTests(unittest.TestCase):
             for secret in (b"secret-document", b"secret-response", b"private-identity", preset["body"].encode()):
                 self.assertNotIn(secret, path.read_bytes())
 
+
+class ContextTests(unittest.TestCase):
+    setUp = HelperTests.setUp
+    tearDown = HelperTests.tearDown
+
+    def prepare(self, document, mode="full", instruction="Summarize.", **kwargs):
+        return m.prepare_context(m.route(self.policy, "draft-local"), instruction, document, mode, **kwargs)
+
+    def test_unicode_selection_and_excluded_ranges(self):
+        document = "excluded-prefix 🌈e\u0301漢 excluded-suffix"
+        start = document.index("🌈"); end = document.index(" excluded-suffix")
+        prompt, report = self.prepare(document, "selection", start=start, end=end)
+        self.assertEqual(json.loads(prompt.split("Document JSON:\n", 1)[1]), "🌈e\u0301漢")
+        self.assertEqual(report["selected_characters"], 4)
+        self.assertEqual(report["selected_utf8_bytes"], 10)
+        self.assertEqual(report["excluded_ranges"], [[0, start], [end, len(document)]])
+        self.assertNotIn("document_preview", report)
+        self.assertNotIn("🌈", json.dumps(report, ensure_ascii=False))
+        self.assertNotIn("excluded-prefix", prompt)
+        self.assertNotIn("excluded-suffix", prompt)
+
+    def test_missing_invalid_and_empty_selections_refuse(self):
+        for start, end in [(None,None), (0,None), (-1,2), (0,4), (2,1), (1,1), (True,2)]:
+            with self.subTest(start=start,end=end), self.assertRaises(m.Refusal):
+                self.prepare("abc", "selection", start=start, end=end)
+        for mode in ("full", "none"):
+            with self.assertRaises(m.Refusal): self.prepare("abc", mode, start=0, end=1)
+        with self.assertRaises(m.Refusal): self.prepare("", "selection", start=0, end=1)
+
+    def test_full_none_empty_and_explicit_preview(self):
+        for document in ("", "text [[private-file]] https://example.invalid"):
+            full, report = self.prepare(document, preview=True)
+            self.assertEqual(report["document_preview"], document)
+            self.assertEqual(json.loads(full.split("Document JSON:\n", 1)[1]), document)
+            none, report = self.prepare(document, "none", preview=True)
+            self.assertEqual(none, "Summarize.")
+            self.assertIsNone(report["document_preview"])
+            self.assertEqual(report["selected_characters"], 0)
+        with self.assertRaises(m.Refusal): self.prepare("text", instruction=" ")
+
+    def test_exact_final_boundary_and_output_headroom(self):
+        selected = m.route(self.policy,"draft-local")
+        prompt, report = self.prepare('"\n🌈')
+        required = len(prompt.encode()) + 512 + selected["max_output_tokens"]
+        selected["input_envelope"] = required
+        self.assertTrue(m.prepare_context(selected,"Summarize.",'"\n🌈',"full")[1]["fits_input_envelope"])
+        selected["input_envelope"] -= 1
+        self.assertFalse(m.prepare_context(selected,"Summarize.",'"\n🌈',"full")[1]["fits_input_envelope"])
+        self.assertFalse(self.prepare("x" * 2000)[1]["fits_input_envelope"])
+        self.assertFalse(self.prepare("", instruction="x" * 2000)[1]["fits_input_envelope"])
+
+    def cli(self, argv, document=""):
+        source=io.TextIOWrapper(io.BytesIO(document.encode()),encoding="utf-8")
+        with patch.object(m.sys,"stdin",source), patch.object(m.sys,"stdout",new_callable=io.StringIO) as output:
+            code=m.main(argv)
+        return code,json.loads(output.getvalue())
+
+    def test_offline_inspection_and_cli_validation(self):
+        base=["context","--task","draft-local","--instruction","Summarize.","--document-mode","selection"]
+        with patch.object(m,"Ledger",side_effect=AssertionError("ledger")), \
+             patch.object(m,"request_json",side_effect=AssertionError("network")), \
+             patch.object(m,"api_key",side_effect=AssertionError("credential")):
+            code, report=self.cli(base+["--start","1","--end","2"],"a🌈z")
+            self.assertEqual(code,0)
+            self.assertEqual(report["selected_utf8_bytes"],4)
+            self.assertNotIn("🌈",json.dumps(report,ensure_ascii=False))
+            self.assertEqual(self.cli(base,"abc")[0],2)
+            self.assertEqual(self.cli(["context","--task","extract","--private","--instruction","x","--document-mode","full"],"secret")[0],2)
+            code,report=self.cli(["context","--task","draft-local","--instruction","x","--document-mode","full"],"x"*2000)
+            self.assertEqual(code,2)
+            self.assertFalse(report["fits_input_envelope"])
+        for argv in (["run","--preview"],["context"],["route","--document-mode","none"],
+                     ["context","--instruction","x","--preset",str(m.ROOT/"config/prompt-presets/draft-local.md"),"--document-mode","full"]):
+            self.assertEqual(self.cli(argv)[0],2)
+
+    def test_mock_request_and_telemetry_exclude_unselected_content(self):
+        config_path=Path(self.temp.name)/"settings.json"
+        config_path.write_text(json.dumps(self.config))
+        original_run=m.run
+        def fake(url,payload,key,**kwargs):
+            self.assertNotIn("excluded",payload["prompt"])
+            self.assertIn("selected",payload["prompt"])
+            return {"response":"synthetic-answer","done":True,"prompt_eval_count":8,"eval_count":2}
+        def dispatch(*args,**kwargs): return original_run(*args,**kwargs,get=fake)
+        for instruction_args in (["--instruction","Summarize."], ["--preset",str(m.ROOT/"config/prompt-presets/draft-local.md")]):
+            with patch.object(m,"run",side_effect=dispatch):
+                code,result=self.cli(["run","--config",str(config_path),"--task","draft-local","--document-mode","selection","--start","9","--end","17",*instruction_args],"excluded:selected:excluded")
+            self.assertEqual(code,0)
+            self.assertTrue(result["complete"])
+        for path in self.path.parent.glob("usage.sqlite3*"):
+            for text in (b"excluded",b"selected",b"synthetic-answer",b"Summarize."):
+                self.assertNotIn(text,path.read_bytes())
+
+    @patch.object(m, "api_key", return_value="unit-test-placeholder")
+    def test_cloud_selection_and_none_keep_admission_and_unknown_hold(self, key):
+        selected = m.route(self.policy, "extract")
+        for mode, offsets in (("selection", {"start": 9, "end": 17}), ("none", {})):
+            prompt, report = m.prepare_context(selected, "Summarize.", "excluded:selected:excluded", mode, **offsets)
+            self.assertTrue(report["fits_input_envelope"])
+            def fake(url, payload=None, *args, **kwargs):
+                if payload is None: return self.catalog
+                content = payload["messages"][0]["content"]
+                self.assertNotIn("excluded", content)
+                self.assertEqual("selected" in content, mode == "selection")
+                self.assertEqual(payload["max_tokens"], selected["max_output_tokens"])
+                return {"choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}]}
+            result = m.run(self.config, self.policy, "extract", prompt, get=fake)
+            self.assertEqual(result["billing_state"], "unknown")
+            self.assertGreater(result["daily_totals"]["committed_micros"], 0)
+
+    def test_preview_cli_and_oversize_source_refusal(self):
+        base = ["context", "--task", "draft-local", "--instruction", "Summarize.", "--document-mode", "full"]
+        code, report = self.cli(base + ["--preview"], "🌈")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["document_preview"], "🌈")
+        with patch.object(m, "run", side_effect=AssertionError("dispatch")):
+            self.assertEqual(self.cli(base, "x" * 65537)[0], 2)
+
 if __name__ == "__main__": unittest.main()

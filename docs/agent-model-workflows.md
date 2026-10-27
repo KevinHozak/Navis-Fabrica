@@ -38,3 +38,21 @@ Run `python -m unittest discover -s scripts/tests -p "test_model_helper.py"`. Te
 On 2026-10-17, all 18 isolated tests passed, skill frontmatter validation passed, and live smoke requests completed through Qwen extraction, Gemini document summary, Sonnet review and private Gemma drafting. No coding-job or full-project acceptance claim follows from those checks. Credential-value and whitespace checks passed. Detailed usage measurements and receipts remain in caller-private state; no prompts, responses, credential references or usage databases are distributed here.
 
 API contracts: [OpenRouter provider selection and price ceilings](https://openrouter.ai/docs/guides/routing/provider-selection), [OpenRouter API](https://openrouter.ai/docs/api/reference/overview), and [Ollama generate](https://docs.ollama.com/api/generate). Provider metadata is refreshed on cloud admission rather than treating this dated evidence as a permanent price or quality guarantee.
+
+## Explicit Markdown prompt presets (v1)
+
+Select one file; the helper never scans directories or automatically runs discovered presets. Synthetic examples live in `config/prompt-presets/`: summarize, extract-actions and draft-local. Keep personal presets outside this public checkout, for example `C:/Projects/Agents/private/fabrica/prompt-presets/`. Presets are trusted instructions: review files before selecting them.
+
+```powershell
+python scripts/model_helper.py inspect --preset config/prompt-presets/summarize.md
+'Synthetic meeting notes: Ada will review the draft Friday.' | python scripts/model_helper.py run --preset config/prompt-presets/extract-actions.md
+'Synthetic draft for review.' | python scripts/model_helper.py run --preset config/prompt-presets/draft-local.md --private
+```
+
+A preset is UTF-8 (optional BOM), at most 16 KiB, with an opening and closing `---` line, followed by a nonempty Markdown instruction body. The frontmatter subset is deliberately smaller than YAML: one `key: value` per line, no quotes, comments, blank lines, nesting, lists, aliases or duplicate keys. Required keys are `schema_version: 1`, `id` (stable identity) and `task` (existing route name). IDs and tasks match `[a-z][a-z0-9-]{0,63}`. The only optional key is `private: true` or `private: false` (default false). Unknown versions, unknown keys/routes, malformed values and conflicting `--task` refuse before inference.
+
+Route policy remains authoritative for provider, model, input/output bounds and timeout. Presets cannot override those settings, URLs, credentials, budgets or executable commands. `--task` may only agree with the preset task; CLI `--private` and preset `private: true` combine with logical OR, so neither can weaken the other. Privacy refusal happens during inspection too. `inspect` requires no private settings, credentials, stdin, network or ledger and shows only identity, effective task/privacy and allowlisted route settings; it omits instructions and file paths. `route --preset` also resolves without inference. `usage` rejects presets. Existing `run --task ...` raw-stdin behavior is unchanged.
+
+With a preset, stdin is document data, serialized as one JSON string after the instructions. No placeholders, includes, environment expansion, code execution or automatic file reads occur inside the body or document. Source stdin remains bounded to 64 KiB; the complete rendered prompt, including instructions, JSON escaping and the existing margin, must fit the route input envelope. Empty documents refuse. This structural boundary helps distinguish data but cannot guarantee resistance to model prompt injection; treat model output as untrusted and review it before use. The helper has no tool-execution capability.
+
+Presets use the same admission, credential, reservation, settlement and unknown-usage behavior as raw prompts. The ledger records the existing task route, never preset identity/path/body, rendered prompt, document or response. Output still goes only to stdout; keep caller transcript capture private. Offline tests cover preset loading, precedence, inspection, refusal, payload boundaries and retained cloud holds without paid requests.

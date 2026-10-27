@@ -31,6 +31,7 @@ mod runs;
 mod scanner;
 mod storage;
 mod usage;
+mod usage_dashboard;
 
 static ACTIVE_SCANS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 static PROJECT_FACT_CACHE: OnceLock<Mutex<HashMap<String, scanner::ProjectEntry>>> =
@@ -3005,6 +3006,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            usage_dashboard::get_usage_dashboard,
+            usage_dashboard::get_usage_dashboard_config,
+            usage_dashboard::save_usage_dashboard_config,
             runner_core_execute,
             prepare_issue_work,
             get_runner_context,

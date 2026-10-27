@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-usage-dashboard-config"
+description = "Enables the save_usage_dashboard_config command without any pre-configured scope."
+commands.allow = ["save_usage_dashboard_config"]
+
+[[permission]]
+identifier = "deny-save-usage-dashboard-config"
+description = "Denies the save_usage_dashboard_config command without any pre-configured scope."
+commands.deny = ["save_usage_dashboard_config"]

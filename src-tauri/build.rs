@@ -1,6 +1,9 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "get_usage_dashboard",
+            "get_usage_dashboard_config",
+            "save_usage_dashboard_config",
             "runner_core_execute",
             "get_runner_context",
             "prepare_issue_work",

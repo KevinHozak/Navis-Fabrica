@@ -692,3 +692,34 @@ fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
     animation: none; box-shadow: 0 0 8px #62b6ff99;
   }
 }
+
+.usage-dashboard { margin-bottom: 18px; padding: 18px; }
+.usage-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.usage-heading h2 { margin: 0; }
+.usage-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-top: 14px; }
+.usage-filters label { flex: 1 1 130px; min-width: 0; }
+.usage-dashboard label { display: flex; flex-direction: column; gap: 5px; }
+.usage-dashboard input, .usage-dashboard select, .usage-dashboard textarea { max-width: 100%; width: 100%; box-sizing: border-box; }
+.usage-status, .usage-definition { color: #b6c7d8; font-size: .85rem; }
+.usage-cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(300px,100%),1fr)); gap: 12px; }
+.usage-card { border: 1px solid #456078; border-radius: 8px; padding: 12px; min-width: 0; }
+.usage-card h3 { margin: 0; font-size: 1rem; }
+.usage-model, .usage-card p { overflow-wrap: anywhere; font-size: .85rem; }
+.usage-card dl { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; font-size: .85rem; }
+.usage-card dd { margin: 0; text-align: right; }
+.usage-token { display: contents; }
+.usage-dashboard details { margin-top: 12px; }
+.usage-dashboard summary { cursor: pointer; }
+.usage-table-wrap { overflow: auto; max-height: 320px; }
+.usage-table-wrap table { border-collapse: collapse; font-size: .8rem; width: 100%; }
+.usage-table-wrap th, .usage-table-wrap td { padding: 7px; text-align: left; border-bottom: 1px solid #456078; overflow-wrap: anywhere; }
+.usage-table-wrap th small { display: block; font-weight: normal; }
+.usage-dashboard fieldset { display: grid; gap: 10px; margin-top: 10px; min-width: 0; }
+
+.usage-summary { display: list-item; }
+.usage-summary h2 { display: inline; margin: 0; font-size: 1.2rem; }
+.usage-dashboard > .usage-heading { justify-content: flex-end; margin-top: 10px; }
+.usage-dashboard input, .usage-dashboard select, .usage-dashboard textarea, .usage-dashboard button { background: #172533; color: #d8eafa; border: 1px solid #456078; padding: 7px 10px; border-radius: 6px; color-scheme: dark; }
+.usage-dashboard button { cursor: pointer; }
+.usage-dashboard button:disabled { opacity: .6; cursor: default; }
+.usage-dashboard :is(input,select,textarea,button,summary):focus-visible { outline: 2px solid #8bcaff; outline-offset: 3px; }

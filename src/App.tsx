@@ -1,6 +1,7 @@
 import { sameProjectPath } from "./Activity";
 import { mergeRefreshPaths as mergePaths, settleRefreshPaths, withoutRefreshPaths as withoutPaths } from "./projectRefreshState";
 import { ProjectCollection } from "./ProjectCollection";
+import { UsageDashboard } from "./UsageDashboard";
 import { useEffect, useRef, useState } from "react";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
@@ -546,6 +547,7 @@ function App() {
       <div className="route-layer" hidden={route.section !== "projects"}>
         {watchError && <p role="status">Automatic content updates are unavailable. Use Settings to refresh.</p>}
         {!desktop && <p className="scan-notice">Browser preview: native discovery and Git details require the desktop app.</p>}
+        <UsageDashboard active={route.section === "projects"} />
         <ProjectCollection projects={projects} onOpenProject={project => navigateToRoute({ section: "project", projectId: project.id })} onOpenChanges={project => navigateToRoute({ section: "changes", projectId: project.id })} onOpenBuild={project => navigateToRoute({ section: "build", projectId: project.id })} onOpenIssues={(project, type) => navigateToRoute({ section: "epics-stories", projectId: project.id, issueType: type })} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} />
       </div>
       {visitedProjectIds.map(id => {

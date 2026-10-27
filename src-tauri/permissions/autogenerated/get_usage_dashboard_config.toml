@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-usage-dashboard-config"
+description = "Enables the get_usage_dashboard_config command without any pre-configured scope."
+commands.allow = ["get_usage_dashboard_config"]
+
+[[permission]]
+identifier = "deny-get-usage-dashboard-config"
+description = "Denies the get_usage_dashboard_config command without any pre-configured scope."
+commands.deny = ["get_usage_dashboard_config"]

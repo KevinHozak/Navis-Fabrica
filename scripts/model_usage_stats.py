@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime
 from contextlib import closing
 from usage_metrics import VERSION, cost_summary, epoch, estimate, number, timing
 
@@ -14,26 +15,41 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = Path(os.environ.get('FABRICA_USAGE_DATA', str(Path(os.environ.get('LOCALAPPDATA', str(Path.home() / '.local/state'))) / 'navis-fabrica/usage')))
 
 
-def read_codex(path):
+def read_codex(path, dashboard=False):
     model = 'unknown'
     previous = {}
     rows = []
     skills = set()
     timestamps = []
+    timeline = []
+    identity, parent = path.stem, None
+    if path.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError("Session exceeds import bound")
     with path.open(encoding='utf-8-sig') as stream:
-        for line in stream:
+        while line := stream.readline(2 * 1024 * 1024 + 1):
+            if len(line.encode('utf-8')) > 2 * 1024 * 1024:
+                raise ValueError("Session event exceeds import bound")
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue  # A live log can end with an incomplete line.
             payload = event.get('payload', {})
+            if event.get('type') == 'session_meta':
+                identity = payload.get('id') or identity
+                parent = payload.get('forked_from_id') or payload.get('parent_session_id')
             if event.get('type') in ('event_msg', 'response_item'):
-                timestamp = epoch(event.get('timestamp'))
+                timestamp = None
+                if dashboard:
+                    try:
+                        if datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).tzinfo is not None:timestamp=epoch(event['timestamp'])
+                    except (ValueError, TypeError, AttributeError, KeyError, OSError):timestamp=None
+                else:timestamp=epoch(event.get('timestamp'))
                 if timestamp is not None:
                     timestamps.append(timestamp)
+                    timeline.append({'at': timestamp, 'model': model})
             if event.get('type') == 'turn_context':
                 model = payload.get('model') or 'unknown'
-            if event.get('type') == 'response_item' and payload.get('type') == 'function_call':
+            if not dashboard and event.get('type') == 'response_item' and payload.get('type') == 'function_call':
                 # A skill file read is evidence of loading, not proof of invocation.
                 skills.update(re.findall(r'[/\\]([^/\\"\s]+)[/\\]SKILL\.md', payload.get('arguments', '')))
             if event.get('type') != 'event_msg' or payload.get('type') != 'token_count':
@@ -41,6 +57,8 @@ def read_codex(path):
             total = (payload.get('info') or {}).get('total_token_usage')
             if not total:
                 continue
+            if not isinstance(total, dict) or any(not number(v) for k,v in total.items() if k.endswith('_tokens')):
+                raise ValueError("Invalid usage counters")
             # Cumulative counters are snapshots, never sum snapshots directly.
             delta = {k: max(0, total.get(k, 0) - previous.get(k, 0)) for k in
                      ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens')}
@@ -49,10 +67,15 @@ def read_codex(path):
             previous = total
             if any(delta.values()):
                 row = {'source': 'codex', 'model': model, 'timestamp': event.get('timestamp'), **delta}
+                if dashboard:
+                    row['snapshot'] = {k: total.get(k) for k in delta}
                 if 'cache_write_input_tokens' not in total:
                     row.pop('cache_write_input_tokens', None)
                 rows.append(row)
-    return {'usage': rows, 'skill_files_observed': sorted(skills), 'timing': timing(timestamps)}
+    result = {'usage': rows, 'skill_files_observed': sorted(skills), 'timing': timing(timestamps)}
+    if dashboard:
+        result.update(session_id=identity, parent_id=parent, timeline=timeline)
+    return result
 
 
 def collect(days=7, codex_home=None, fabrica_db=None, output=None, pricing=None):

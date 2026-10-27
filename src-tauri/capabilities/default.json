@@ -6,6 +6,9 @@
     "main"
   ],
   "permissions": [
+    "allow-get-usage-dashboard",
+    "allow-get-usage-dashboard-config",
+    "allow-save-usage-dashboard-config",
     "allow-get-settings",
     "allow-runner-core-execute",
     "allow-get-runner-context",

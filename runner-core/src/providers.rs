@@ -142,22 +142,31 @@ where
     };
     match request(key) {
         Ok(value) => {
-            let catalog_is_valid = value
-                .get("models")
-                .and_then(Value::as_array)
-                .is_some();
+            let catalog_is_valid = value.get("models").and_then(Value::as_array).is_some();
             if catalog_is_valid {
                 result(
                     "healthy",
                     "TypeSafe is reachable. The configured Jev version is pinned; versioned IDs may not appear in this alias catalog.",
                 )
             } else {
-                result("unavailable", "TypeSafe returned an invalid model catalog response.")
+                result(
+                    "unavailable",
+                    "TypeSafe returned an invalid model catalog response.",
+                )
             }
         }
-        Err(401 | 403) => result("authenticationFailed", "TypeSafe rejected the saved API key. Check its validity and access."),
-        Err(429) => result("rateLimited", "TypeSafe rate limited the health check. Try again later."),
-        Err(_) => result("unavailable", "TypeSafe health check failed or timed out. The response was omitted to protect credentials."),
+        Err(401 | 403) => result(
+            "authenticationFailed",
+            "TypeSafe rejected the saved API key. Check its validity and access.",
+        ),
+        Err(429) => result(
+            "rateLimited",
+            "TypeSafe rate limited the health check. Try again later.",
+        ),
+        Err(_) => result(
+            "unavailable",
+            "TypeSafe health check failed or timed out. The response was omitted to protect credentials.",
+        ),
     }
 }
 
@@ -218,7 +227,7 @@ pub fn typesafe_http_probe(profile: &TypeSafeProfile, api_key: Option<&str>) -> 
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenRouterModel {
     pub id: String,
@@ -232,16 +241,20 @@ pub struct OpenRouterModel {
     pub supported_parameters: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenRouterEndpoint {
     pub model_id: String,
     pub tag: String,
     pub context_length: Option<u64>,
+    pub max_prompt_tokens: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
     pub prompt_price: Option<String>,
     pub completion_price: Option<String>,
     pub request_price: Option<String>,
     pub status: Option<i64>,
     pub zdr: Option<bool>,
+    pub supported_parameters: Option<Vec<String>>,
 }
 
 pub fn parse_openrouter_endpoints(value: &Value, model_id: &str) -> Vec<OpenRouterEndpoint> {
@@ -263,6 +276,10 @@ pub fn parse_openrouter_endpoints(value: &Value, model_id: &str) -> Vec<OpenRout
                 model_id: endpoint_model.to_owned(),
                 tag: tag.to_owned(),
                 context_length: endpoint.get("context_length").and_then(Value::as_u64),
+                max_prompt_tokens: endpoint.get("max_prompt_tokens").and_then(Value::as_u64),
+                max_completion_tokens: endpoint
+                    .get("max_completion_tokens")
+                    .and_then(Value::as_u64),
                 prompt_price: pricing
                     .and_then(|v| v.get("prompt"))
                     .and_then(Value::as_str)
@@ -277,10 +294,85 @@ pub fn parse_openrouter_endpoints(value: &Value, model_id: &str) -> Vec<OpenRout
                     .map(str::to_owned),
                 status: endpoint.get("status").and_then(Value::as_i64),
                 zdr: endpoint.get("zdr").and_then(Value::as_bool),
+                supported_parameters: endpoint
+                    .get("supported_parameters")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    }),
             })
         })
         .take(256)
         .collect()
+}
+
+/// Exact endpoint identities in OpenRouter's current ZDR inventory. The
+/// response is consumed in memory; no provider payload is retained.
+pub fn parse_openrouter_zdr_endpoints(
+    value: &Value,
+) -> Option<std::collections::BTreeSet<(String, String)>> {
+    let rows = value.get("data")?.as_array()?;
+    if rows.len() > 10_000 {
+        return None;
+    }
+    let mut endpoints = std::collections::BTreeSet::new();
+    for row in rows {
+        let model_id = row.get("model_id")?.as_str()?.trim();
+        let tag = row.get("tag")?.as_str()?.trim();
+        if model_id.is_empty() || model_id.len() > 160 || !valid_endpoint_tag(tag) {
+            return None;
+        }
+        endpoints.insert((model_id.to_owned(), tag.to_owned()));
+    }
+    Some(endpoints)
+}
+
+pub fn openrouter_zdr_endpoints_http_probe_with_timeout(
+    api_key: &str,
+    timeout: Duration,
+) -> Result<std::collections::BTreeSet<(String, String)>, String> {
+    if !valid_openrouter_key(api_key) {
+        return Err("OpenRouter key is invalid.".into());
+    }
+    let client = blocking_http_client_builder()
+        .connect_timeout(timeout.min(Duration::from_secs(3)))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "OpenRouter ZDR metadata client is unavailable.".to_string())?;
+    let response = client
+        .get(format!("{OPENROUTER_API_BASE}/endpoints/zdr"))
+        .bearer_auth(api_key)
+        .send()
+        .map_err(|_| "OpenRouter ZDR endpoint inventory could not be refreshed.".to_string())?;
+    if response.status().as_u16() == 429 {
+        return Err("OpenRouter rate limit was reached during ZDR inventory refresh.".into());
+    }
+    if !response.status().is_success() {
+        return Err("OpenRouter ZDR endpoint inventory was rejected.".into());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > OPENROUTER_MAX_RESPONSE_BYTES as u64)
+    {
+        return Err("OpenRouter ZDR endpoint inventory exceeded its response limit.".into());
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(OPENROUTER_MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "OpenRouter ZDR endpoint inventory could not be read.".to_string())?;
+    if bytes.len() > OPENROUTER_MAX_RESPONSE_BYTES {
+        return Err("OpenRouter ZDR endpoint inventory exceeded its response limit.".into());
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "OpenRouter ZDR endpoint inventory was malformed.".to_string())?;
+    parse_openrouter_zdr_endpoints(&value)
+        .ok_or_else(|| "OpenRouter ZDR endpoint inventory contained invalid records.".into())
 }
 
 fn valid_endpoint_tag(value: &str) -> bool {
@@ -356,7 +448,23 @@ pub fn validate_openrouter_free_endpoint(
     require_zdr: bool,
     timeout: Duration,
 ) -> Result<bool, String> {
-    let endpoints = openrouter_endpoints_http_probe_with_timeout(api_key, model_id, timeout)?;
+    let deadline = Instant::now() + timeout;
+    let endpoints = openrouter_endpoints_http_probe_with_timeout(
+        api_key,
+        model_id,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
+    let zdr_inventory = if require_zdr {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("OpenRouter endpoint validation deadline expired.".into());
+        }
+        Some(openrouter_zdr_endpoints_http_probe_with_timeout(
+            api_key, remaining,
+        )?)
+    } else {
+        None
+    };
     let matches = endpoints
         .iter()
         .filter(|endpoint| {
@@ -380,7 +488,11 @@ pub fn validate_openrouter_free_endpoint(
                     .request_price
                     .as_deref()
                     .is_none_or(|price| openrouter_price_micros_per_million(price) == Some(0))
-                && (!require_zdr || endpoint.zdr == Some(true))
+                && (!require_zdr
+                    || (endpoint.zdr != Some(false)
+                        && zdr_inventory.as_ref().is_some_and(|inventory| {
+                            inventory.contains(&(model_id.to_owned(), endpoint.tag.clone()))
+                        })))
         })
         .count();
     Ok(matches == 1)
@@ -566,7 +678,7 @@ where
                 authenticated_for_execution: Some(false),
                 models: Vec::new(),
                 free_model_daily_requests: None,
-            })
+            });
         }
         Err(429) => return Err("OpenRouter rate limit was reached during metadata refresh.".into()),
         Err(_) => return Err("OpenRouter key metadata could not be verified.".into()),
@@ -587,7 +699,7 @@ where
                 authenticated_for_execution: None,
                 models: Vec::new(),
                 free_model_daily_requests: None,
-            })
+            });
         }
     };
     if !authenticated_for_execution {
@@ -1232,7 +1344,7 @@ pub fn ollama_probe(endpoint: &str) -> OllamaProbe {
                 models: Vec::new(),
                 available_memory_bytes: available_memory_bytes(),
                 note: message,
-            }
+            };
         }
     };
     let endpoint = normalized.as_str().trim_end_matches('/').to_owned();
@@ -1250,7 +1362,7 @@ pub fn ollama_probe(endpoint: &str) -> OllamaProbe {
                 models: Vec::new(),
                 available_memory_bytes: available_memory_bytes(),
                 note: "Could not initialize the local Ollama health check.".into(),
-            }
+            };
         }
     };
     let tags: Value = match client.get(format!("{endpoint}/api/tags")).send().and_then(|response| response.error_for_status()).and_then(|response| response.json()) {
@@ -1298,9 +1410,13 @@ pub fn ollama_probe(endpoint: &str) -> OllamaProbe {
     let parsed = ollama_models_from_responses(&tags, &details);
     let eligible = parsed.iter().filter(|model| model.eligible).count();
     OllamaProbe {
-        state: "ready".into(), endpoint, models: parsed,
+        state: "ready".into(),
+        endpoint,
+        models: parsed,
         available_memory_bytes: available_memory_bytes(),
-        note: format!("Ollama is reachable. Up to 50 local models were inspected; {eligible} report tool support and at least {OLLAMA_MIN_CONTEXT_TOKENS} context tokens. Unknown capabilities remain ineligible."),
+        note: format!(
+            "Ollama is reachable. Up to 50 local models were inspected; {eligible} report tool support and at least {OLLAMA_MIN_CONTEXT_TOKENS} context tokens. Unknown capabilities remain ineligible."
+        ),
     }
 }
 
@@ -1375,7 +1491,7 @@ pub fn probe_antigravity(executable: &Path) -> AntigravityProbe {
                 state: "unavailable".into(),
                 models: Vec::new(),
                 note: "Could not create a temporary directory for the provider probe.".into(),
-            }
+            };
         }
     };
     let version_output = crate::process::capture(

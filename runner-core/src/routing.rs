@@ -126,6 +126,9 @@ pub struct CandidateFacts {
     /// zero-price remote route may be considered for Economy.
     #[serde(skip)]
     pub economy_policy: Option<crate::economy::EconomyModelPolicy>,
+    /// Opaque core-minted proof; client JSON cannot supply or persist it.
+    #[serde(skip)]
+    pub economy_admission: Option<crate::economy::VerifiedEconomyAdmission>,
     /// Context and tool facts come from refreshed backend observations, not
     /// the configured model label. None is unknown and fails capability checks.
     #[serde(default)]
@@ -261,7 +264,7 @@ fn route_assignment(assignment: &AssignmentRequest, facts: &[CandidateFacts]) ->
             None => {},
             Some(fact) => {
                 if reason.is_some() {}
-                else if crate::economy::is_free_variant_id(&candidate.model_id) && fact.economy_policy.is_none() {
+                else if crate::economy::is_free_variant_id(&candidate.model_id) && fact.economy_admission.is_none() {
                     reason = Some("Rejected: free model variants require backend verified Economy admission.".into());
                 }
                 else if !fact.evidence_ready { reason = Some(fact.evidence_reasons.first().cloned().unwrap_or_else(|| "Rejected: provider observations are incomplete or stale.".to_owned())); }
@@ -276,7 +279,7 @@ fn route_assignment(assignment: &AssignmentRequest, facts: &[CandidateFacts]) ->
                     && fact.billing == BillingPolicy::Paid
                     && fact.input_micros_per_million_tokens == Some(0)
                     && fact.output_micros_per_million_tokens == Some(0)
-                    && fact.economy_policy.is_none()
+                    && fact.economy_admission.is_none()
                 { reason = Some("Rejected: zero-price remote models need dated coding-trial and endpoint privacy evidence before Economy selection.".into()); }
                 else if fact.billing == BillingPolicy::Paid && (assignment.max_input_tokens.is_none() || assignment.max_output_tokens.is_none()) { reason = Some("Rejected: paid work requires maximum input and output-token policies.".into()); }
                 else if fact.billing == BillingPolicy::Paid && (fact.input_micros_per_million_tokens.is_none() || fact.output_micros_per_million_tokens.is_none() || fact.pricing_source.as_deref().is_none_or(|source|source.trim().is_empty()) || fact.pricing_verified_at_ms.is_none_or(|checked| checked > assignment.request.now_ms || assignment.request.now_ms.saturating_sub(checked) > 24 * 60 * 60 * 1000)) { reason = Some("Rejected: paid work requires fresh verified input and output pricing provenance.".into()); }
@@ -1182,13 +1185,11 @@ mod tests {
         request.require_context_evidence = true;
         let decision = decide(request);
         assert_eq!(decision.selected_provider_id, None);
-        assert!(
-            decision
-                .candidates
-                .iter()
-                .flat_map(|row| &row.reasons)
-                .any(|reason| reason.contains("context capacity is unknown"))
-        );
+        assert!(decision
+            .candidates
+            .iter()
+            .flat_map(|row| &row.reasons)
+            .any(|reason| reason.contains("context capacity is unknown")));
     }
 
     #[test]
@@ -1389,12 +1390,10 @@ mod tests {
         let decision = decide(request);
         assert_eq!(decision.selected_provider_id.as_deref(), Some("faster"));
         assert!(decision.desired_completion_note.contains("soft preference"));
-        assert!(
-            decision.candidates[1]
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("does not predict"))
-        );
+        assert!(decision.candidates[1]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not predict")));
     }
 
     fn fallback_request(candidates: Vec<Candidate>) -> FallbackRequest {
@@ -1476,11 +1475,9 @@ mod tests {
         input.routing.manual_model_id = Some("model".into());
         let decision = evaluate_fallback(input);
         assert!(!decision.accepted);
-        assert!(
-            decision
-                .reason
-                .contains("manual fallback override is not eligible")
-        );
+        assert!(decision
+            .reason
+            .contains("manual fallback override is not eligible"));
     }
 
     #[test]
@@ -1638,6 +1635,7 @@ mod tests {
             pricing_source: (!local).then(|| "fixture-pricing".into()),
             pricing_verified_at_ms: Some(10_100),
             economy_policy: None,
+            economy_admission: None,
             context_tokens: Some(32_768),
             supports_tools: Some(true),
             evidence_ready: true,
@@ -1675,14 +1673,12 @@ mod tests {
             result.implementer.decision.selected_provider_id.as_deref(),
             Some("local")
         );
-        assert!(
-            result
-                .implementer
-                .decision
-                .candidates
-                .iter()
-                .any(|row| row.provider_id == "remote" && !row.eligible)
-        );
+        assert!(result
+            .implementer
+            .decision
+            .candidates
+            .iter()
+            .any(|row| row.provider_id == "remote" && !row.eligible));
         assert_eq!(result.implementer.estimated_cost_micros, Some(0));
     }
 
@@ -1710,19 +1706,17 @@ mod tests {
         };
         let result = route_job(request);
         assert_eq!(result.implementer.decision.selected_provider_id, None);
-        assert!(
-            result
-                .implementer
-                .decision
-                .candidates
-                .iter()
-                .any(|row| row.provider_id == "paid" && row.reasons.join(" ").contains("pricing"))
-        );
+        assert!(result
+            .implementer
+            .decision
+            .candidates
+            .iter()
+            .any(|row| row.provider_id == "paid" && row.reasons.join(" ").contains("pricing")));
     }
 
     #[test]
-    fn economy_never_selects_a_zero_price_remote_model_without_backend_evaluation_and_privacy_evidence()
-     {
+    fn economy_never_selects_a_zero_price_remote_model_without_backend_evaluation_and_privacy_evidence(
+    ) {
         let mut request = request(vec![candidate(
             "openrouter-main",
             false,
@@ -1751,11 +1745,10 @@ mod tests {
         let row = &result.implementer.decision.candidates[0];
         assert!(!row.eligible);
         assert_eq!(row.model_id, "vendor/model:free");
-        assert!(
-            row.reasons
-                .join(" ")
-                .contains("dated coding-trial and endpoint privacy evidence")
-        );
+        assert!(row
+            .reasons
+            .join(" ")
+            .contains("backend verified Economy admission"));
     }
 
     #[test]
@@ -1780,12 +1773,10 @@ mod tests {
             candidate_facts: vec![facts("paid", "model", false, 5)],
         });
         assert_eq!(result.implementer.decision.selected_model_id, None);
-        assert!(
-            result.implementer.decision.candidates[0]
-                .reasons
-                .join(" ")
-                .contains("token")
-        );
+        assert!(result.implementer.decision.candidates[0]
+            .reasons
+            .join(" ")
+            .contains("token"));
     }
 
     #[test]

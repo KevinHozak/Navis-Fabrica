@@ -3444,8 +3444,7 @@ fn list_jev_routing_history(app: AppHandle) -> Result<Vec<usage::JevRoutingHisto
     usage::list_jev_routing_history(&runs::history_path(&app)?)
 }
 
-#[tauri::command]
-fn evaluate_routing(mut request: routing::Request) -> Result<routing::Decision, String> {
+fn validate_routing_request(request: &routing::Request) -> Result<(), String> {
     if request.candidates.len() > 3_200 || request.usage_signals.len() > 500 {
         return Err("Routing input exceeds the supported candidate or signal limit.".into());
     }
@@ -3486,8 +3485,91 @@ fn evaluate_routing(mut request: routing::Request) -> Result<routing::Decision, 
     }) {
         return Err("Routing candidate identities or quality ratings are invalid.".into());
     }
-    request.now_ms = usage::now_ms();
-    Ok(routing::decide(request))
+    Ok(())
+}
+
+fn hydrate_economy_routing_evidence(app: &AppHandle, request: &mut routing::Request) -> bool {
+    // Routing previews read the configured runner snapshot only. A frontend
+    // request cannot set this skipped flag, and recommendation never probes.
+    let configured_settings = settings_path(app).and_then(|path| load_settings(&path));
+    let evidence_result = configured_settings
+        .as_ref()
+        .map_err(|_| "Configured provider settings are unavailable.".to_string())
+        .and_then(|settings| {
+            let data_root = default_runner_data_root(app)?;
+            let store = runner_core::provider_observations::ProviderObservationStore::open_read_only(&data_root)?;
+            let snapshot = store.snapshot(settings, request.now_ms)?;
+            snapshot.candidate_facts(
+                settings,
+                request.now_ms,
+                runner_core::supervisor::ROUTING_OBSERVATION_MAX_AGE_MS,
+            )
+        });
+    let evidence_available = evidence_result.is_ok();
+    let economy_facts = evidence_result.unwrap_or_default();
+    for candidate in &mut request.candidates {
+        candidate.economy_evidence_ready = false;
+        let configured_openrouter_candidate = configured_settings.as_ref().is_ok_and(|settings| {
+            settings.providers.iter().any(|profile| {
+                profile.id == candidate.provider_id
+                    && profile.kind == providers::ProviderKind::OpenRouter
+                    && profile.models.iter().any(|model| model.id == candidate.model_id)
+            })
+        });
+        if !configured_openrouter_candidate {
+            continue;
+        }
+        let Some(profile_facts) = economy_facts.iter().find(|fact| {
+            fact.provider_id == candidate.provider_id && fact.model_id == candidate.model_id
+        }) else {
+            continue;
+        };
+        if profile_facts.economy_admission.is_some() {
+            candidate.economy_evidence_ready = true;
+            candidate.context_tokens = profile_facts.context_tokens;
+            candidate.supports_tools = profile_facts.supports_tools;
+            candidate.is_local = profile_facts.billing == routing::BillingPolicy::Local;
+        }
+    }
+    evidence_available
+}
+
+fn add_economy_refresh_reasons(
+    decision: &mut routing::Decision,
+    request: &routing::Request,
+    evidence_available: bool,
+) {
+    for row in &mut decision.candidates {
+        let is_economy_candidate = request.candidates.iter().any(|candidate| {
+            candidate.provider_id == row.provider_id
+                && candidate.model_id == row.model_id
+                && runner_core::economy::is_free_variant_id(&candidate.model_id)
+        });
+        if is_economy_candidate
+            && !request.candidates.iter().any(|candidate| {
+                candidate.provider_id == row.provider_id
+                    && candidate.model_id == row.model_id
+                    && candidate.economy_evidence_ready
+            })
+        {
+            row.reasons.push(if !evidence_available {
+                "No fresh configured provider evidence is available. Refresh provider evidence in the Batch Runner, then evaluate again.".into()
+            } else {
+                "No backend-verified Economy admission is available. Check Economy status; refresh provider evidence in the Batch Runner if the saved evidence is stale.".into()
+            });
+        }
+    }
+}
+
+#[tauri::command]
+fn evaluate_routing(app: AppHandle, mut request: routing::Request) -> Result<routing::Decision, String> {
+    validate_routing_request(&request)?;
+    let now_ms = usage::now_ms();
+    request.now_ms = now_ms;
+    let evidence_available = hydrate_economy_routing_evidence(&app, &mut request);
+    let mut decision = routing::decide(request.clone());
+    add_economy_refresh_reasons(&mut decision, &request, evidence_available);
+    Ok(decision)
 }
 
 #[tauri::command]
@@ -3496,12 +3578,9 @@ fn evaluate_jev_routing(
     mut request: routing::Request,
     task_summary: String,
 ) -> Result<jev::RoutingEvaluation, String> {
-    if request.candidates.len() > 3_200 || request.usage_signals.len() > 500 {
-        return Err("Routing input exceeds the supported candidate or signal limit.".into());
-    }
+    validate_routing_request(&request)?;
     request.now_ms = usage::now_ms();
-    // Share the same request validation used by deterministic routing.
-    let _ = evaluate_routing(request.clone())?;
+    let evidence_available = hydrate_economy_routing_evidence(&app, &mut request);
     let summary = task_summary.trim().to_owned();
     if summary.is_empty()
         || summary.len() > jev::MAX_SUMMARY_BYTES
@@ -3641,6 +3720,9 @@ fn evaluate_jev_routing(
             reasons: vec!["Rejected: provider health or run availability check failed.".into()],
         });
     }
+    let mut reason_request = request.clone();
+    reason_request.candidates = original.clone();
+    add_economy_refresh_reasons(&mut fallback, &reason_request, evidence_available);
     let eligible = fallback
         .candidates
         .iter()

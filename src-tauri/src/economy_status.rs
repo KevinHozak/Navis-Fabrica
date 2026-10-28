@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use tauri::AppHandle;
 
@@ -55,7 +58,9 @@ pub async fn get_economy_model_status(
         .ok_or_else(|| "Save a valid OpenRouter credential for this profile first.".to_string())?;
     let provider_id = profile.id;
     let runtime_executable = profile.executable;
+    let endpoint_key = key.clone();
 
+    let status_deadline = Instant::now() + CATALOG_TIMEOUT;
     let catalog_probe = tauri::async_runtime::spawn_blocking(move || {
         providers::openrouter_metadata_http_probe_with_timeout(&key, CATALOG_TIMEOUT)
     });
@@ -79,10 +84,55 @@ pub async fn get_economy_model_status(
         );
     }
     let observed_at = now_ms();
+    let passing_ids =
+        economy::trusted_economy_candidate_ids("aider", &runtime_version, observed_at);
+    let catalog_ids = observation
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let proof_ids = passing_ids
+        .into_iter()
+        .filter(|model_id| catalog_ids.contains(model_id.as_str()))
+        .take(16)
+        .collect::<Vec<_>>();
+    let (endpoints_by_model, zdr_endpoints) = if proof_ids.is_empty() {
+        (BTreeMap::new(), BTreeSet::new())
+    } else {
+        let proof_key = endpoint_key;
+        let remaining = status_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            (BTreeMap::new(), BTreeSet::new())
+        } else {
+            tauri::async_runtime::spawn_blocking(move || {
+                let zdr = providers::openrouter_zdr_endpoints_http_probe_with_timeout(
+                    &proof_key, remaining,
+                )?;
+                let mut endpoints = BTreeMap::new();
+                for model_id in proof_ids {
+                    let remaining = status_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    if let Ok(rows) = providers::openrouter_endpoints_http_probe_with_timeout(
+                        &proof_key, &model_id, remaining,
+                    ) {
+                        endpoints.insert(model_id, rows);
+                    }
+                }
+                Ok::<_, String>((endpoints, zdr))
+            })
+            .await
+            .unwrap_or_else(|_| Err("OpenRouter endpoint proof could not be refreshed.".into()))
+            .unwrap_or_else(|_| (BTreeMap::new(), BTreeSet::new()))
+        }
+    };
     Ok(EconomyStatusResponse {
         models: economy::statuses_from_catalog(
             &provider_id,
             &observation.models,
+            &endpoints_by_model,
+            &zdr_endpoints,
             observed_at,
             "aider",
             &runtime_version,

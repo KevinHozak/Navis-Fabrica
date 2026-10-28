@@ -17,13 +17,13 @@ use crate::runtime::{
 };
 use crate::settings::{self, Settings};
 use crate::verification::{
-    CheckExecutor, CheckOutput, CheckSpec, ProcessCheckExecutor, RepairProgress, RepairState,
-    ReviewerIdentity, VerificationEnvelope, VerificationOutcome, VerificationService,
-    source_snapshot, validate_check,
+    source_snapshot, validate_check, CheckExecutor, CheckOutput, CheckSpec, ProcessCheckExecutor,
+    RepairProgress, RepairState, ReviewerIdentity, VerificationEnvelope, VerificationOutcome,
+    VerificationService,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -253,6 +253,35 @@ pub struct RouteSemanticCommitment {
     pub minimum_context_tokens: Option<u64>,
     pub authorized_candidates: Vec<crate::routing::CandidateRoute>,
     pub paid_quote: Option<CommittedPaidQuote>,
+    /// Exact backend-minted Economy endpoint pin. These fields are only
+    /// commitments; they cannot create or restore a VerifiedEconomyAdmission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economy_endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economy_evidence_digest: Option<String>,
+}
+
+impl RouteSemanticCommitment {
+    pub(crate) fn validate_economy_pin(
+        &self,
+        facts: &crate::routing::CandidateFacts,
+    ) -> Result<(), String> {
+        if let Some(endpoint_id) = self.economy_endpoint_id.as_deref() {
+            let admission = facts.economy_admission.as_ref().ok_or_else(|| {
+                "fresh Economy admission could not be rehydrated before dispatch".to_owned()
+            })?;
+            if admission.endpoint_id() != endpoint_id
+                || self.economy_evidence_digest.as_deref() != Some(admission.evidence_digest())
+                || admission.provider_profile_id() != self.provider_id
+                || admission.model_id() != self.model_id
+            {
+                return Err("fresh Economy endpoint or evidence pin changed since preview".into());
+            }
+        } else if self.economy_evidence_digest.is_some() {
+            return Err("Economy evidence digest has no committed endpoint pin".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -670,6 +699,11 @@ impl Supervisor {
         }
         for key in request.paid_policies.keys() {
             let policy = &request.paid_policies[key];
+            if !matches!(policy.mode, crate::paid_gateway::GatewayMode::Paid) {
+                return Err(SupervisorError::Invalid(format!(
+                    "paid policy {key} cannot supply a serialized Economy or synthetic-trial admission"
+                )));
+            }
             let candidate_is_authorized = request.jobs.iter().any(|job| {
                 job.plan.tasks.iter().any(|task| {
                     if paid_policy_key(&job.issue_id, &task.task_id) != *key {
@@ -2304,7 +2338,33 @@ impl Supervisor {
                     dispatch_deadline,
                     &request.dispatch_refresh_consent,
                 ) {
-                    Ok(fresh) => {
+                    Ok(mut fresh) => {
+                        if commitment.economy_endpoint_id.is_some() {
+                            let requirements = task.route_requirements.clone().unwrap_or_default();
+                            let remaining =
+                                dispatch_deadline.saturating_duration_since(Instant::now());
+                            let admission = crate::economy::refresh_profile_admission(
+                                selected_profile,
+                                &committed_route.model_id,
+                                requirements
+                                    .max_input_tokens
+                                    .or(requirements.context_tokens),
+                                requirements.max_output_tokens,
+                                requirements.require_tools.unwrap_or(true),
+                                task.limits.max_tokens.unwrap_or(0),
+                                task.limits.max_seconds.unwrap_or(0),
+                                remaining.min(Duration::from_secs(30)),
+                                now_ms().max(0) as u64,
+                            );
+                            match admission {
+                                Ok(admission) => fresh.facts.economy_admission = Some(admission),
+                                Err(reason) => {
+                                    return self.finish_attempt(&claim, AttemptOutcome::NeedsInput {
+                                        summary: format!("fresh Economy admission failed before reservation: {reason}"),
+                                    });
+                                }
+                            }
+                        }
                         if cancel.load(Ordering::SeqCst) || now_ms() >= batch_deadline_ms {
                             let reason = "batch cancellation or absolute deadline arrived during provider refresh";
                             let _ = jobs.record_checkpoint(claim.job.id, worker_id, claim.fencing_token,
@@ -2412,6 +2472,7 @@ impl Supervisor {
                         "selected provider {provider_id} is missing from current settings"
                     ))
                 })?;
+            let economy_admission = routed.economy_admission.clone();
             let reservation_id = reservation_id(
                 &request.batch_id,
                 claim.job.id,
@@ -2419,22 +2480,33 @@ impl Supervisor {
                 claim.attempt_number,
             );
             let budgets = BudgetStore::open(&self.paths.budgets)?;
-            let committed_paid_policy = if profile.kind == ProviderKind::OpenRouter {
-                Some(
-                    request
-                        .paid_policies
-                        .get(&paid_policy_key(&claim.job.issue_id, &task.task_id))
-                        .ok_or_else(|| {
-                            SupervisorError::Invalid(format!(
-                                "paid task {} has no admitted policy",
-                                task.task_id
-                            ))
-                        })?,
-                )
-            } else {
-                None
-            };
-            let execution_paid_policy = if let Some(policy) = committed_paid_policy {
+            let committed_paid_policy = request
+                .paid_policies
+                .get(&paid_policy_key(&claim.job.issue_id, &task.task_id))
+                .filter(|policy| policy.provider_id == profile.id && policy.model_id == model_id);
+            let economy_policy = economy_admission
+                .as_ref()
+                .map(|admission| admission.gateway_policy());
+            if profile.kind == ProviderKind::OpenRouter
+                && committed_paid_policy.is_none()
+                && economy_policy.is_none()
+            {
+                return self.finish_attempt(&claim, AttemptOutcome::NeedsInput {
+                    summary: "OpenRouter task has no current backend-admitted Paid or Economy policy.".into(),
+                });
+            }
+            if committed_paid_policy.is_some() && economy_policy.is_some() {
+                return self.finish_attempt(
+                    &claim,
+                    AttemptOutcome::NeedsInput {
+                        summary: "Task cannot carry both Paid and Economy dispatch policies."
+                            .into(),
+                    },
+                );
+            }
+            let execution_paid_policy = if let Some(policy) = committed_paid_policy
+                .filter(|policy| matches!(policy.mode, crate::paid_gateway::GatewayMode::Paid))
+            {
                 let refreshed_at = if refresh_audit.is_some() {
                     refreshed_pricing_time
                 } else {
@@ -2445,26 +2517,46 @@ impl Supervisor {
                         SupervisorError::Verification(format!("needs_input: {reason}"))
                     })?,
                 )
+            } else if let Some(policy) = economy_policy {
+                Some(policy)
             } else {
                 None
             };
             let paid_policy = execution_paid_policy.as_ref();
-            let max_tokens = match paid_policy {
-                Some(policy) => paid_call_token_ceiling(policy).ok_or_else(|| {
-                    SupervisorError::Invalid("paid token reservation overflowed".into())
-                })?,
-                None => task
-                    .limits
-                    .max_tokens
-                    .ok_or_else(|| SupervisorError::Invalid("task has no token budget".into()))?,
+            let max_tokens = if economy_admission.is_some() {
+                economy_admission
+                    .as_ref()
+                    .map(|admission| admission.max_tokens())
+                    .ok_or_else(|| {
+                        SupervisorError::Invalid("Economy token reservation is missing".into())
+                    })?
+            } else {
+                match paid_policy {
+                    Some(policy) => paid_call_token_ceiling(policy).ok_or_else(|| {
+                        SupervisorError::Invalid("paid token reservation overflowed".into())
+                    })?,
+                    None => task.limits.max_tokens.ok_or_else(|| {
+                        SupervisorError::Invalid("task has no token budget".into())
+                    })?,
+                }
             };
-            let max_cost = paid_policy.map_or(task.limits.max_cost_micros.unwrap_or(0), |policy| {
-                policy.max_cost_micros
-            });
+            let max_cost = if economy_admission.is_some() {
+                0
+            } else {
+                paid_policy.map_or(task.limits.max_cost_micros.unwrap_or(0), |policy| {
+                    policy.max_cost_micros
+                })
+            };
             let max_seconds = task
                 .limits
                 .max_seconds
                 .ok_or_else(|| SupervisorError::Invalid("task has no time budget".into()))?;
+            let max_seconds = economy_admission.as_ref().map_or(max_seconds, |admission| {
+                max_seconds.min(admission.max_seconds())
+            });
+            let is_paid = paid_policy.is_some_and(|policy| {
+                matches!(policy.mode, crate::paid_gateway::GatewayMode::Paid)
+            });
             let reservation = ReservationRequest {
                 reservation_id: reservation_id.clone(),
                 batch_id: request.batch_id.clone(),
@@ -2480,7 +2572,7 @@ impl Supervisor {
                 max_cost_micros: Some(max_cost),
                 max_seconds: max_seconds
                     .min((batch_deadline_ms.saturating_sub(now_ms()) / 1000).max(1) as u64),
-                is_paid: paid_policy.is_some(),
+                is_paid,
                 pricing_source: paid_policy.map(|policy| policy.pricing.source.clone()),
                 pricing_verified_at_ms: paid_policy.map(|policy| policy.pricing.observed_at_ms),
             };
@@ -2592,8 +2684,13 @@ impl Supervisor {
                         parent_reservation_id: &reservation_id,
                         policy,
                         allowed_files: &task.files,
-                        authenticated_canonical_slug: None,
+                        authenticated_canonical_slug: economy_admission
+                            .as_ref()
+                            .map(|admission| admission.canonical_slug()),
                         economy_trial_task_id: None,
+                        synthetic_trial_consent: false,
+                        synthetic_trial_fixture: None,
+                        economy_admission: economy_admission.as_ref(),
                         cancel: Arc::clone(&cancel),
                     },
                     &workspace.record.build_output_path,
@@ -2612,7 +2709,7 @@ impl Supervisor {
                 Err(_) => 0,
             };
             let usage = outcome.as_ref().ok().map(|o| o.usage.clone());
-            if paid_policy.is_some() {
+            if is_paid {
                 settle_paid_parent_usage(&budgets, &reservation_id, sink.dispatched, elapsed)?;
             } else {
                 settle_runtime_usage(
@@ -2620,6 +2717,7 @@ impl Supervisor {
                     &reservation_id,
                     sink.dispatched,
                     usage.as_ref(),
+                    economy_admission.as_ref(),
                     elapsed,
                 )?;
             }
@@ -3938,7 +4036,11 @@ fn safe_checkpoint_key(value: &str) -> String {
         })
         .take(80)
         .collect::<String>();
-    if key.is_empty() { "task".into() } else { key }
+    if key.is_empty() {
+        "task".into()
+    } else {
+        key
+    }
 }
 
 fn checkpoint_process_identity(value: &Value) -> Option<crate::process::ProcessIdentity> {
@@ -4598,6 +4700,7 @@ fn settle_runtime_usage(
     reservation_id: &str,
     dispatched: bool,
     usage: Option<&RuntimeUsage>,
+    economy_admission: Option<&crate::economy::VerifiedEconomyAdmission>,
     elapsed_seconds: u64,
 ) -> Result<(), SupervisorError> {
     if !dispatched {
@@ -4609,6 +4712,51 @@ fn settle_runtime_usage(
         .and_then(|u| {
             if u.billing == BillingStatus::LocalNoApiCharge {
                 Some(0.0)
+            } else if u.billing == BillingStatus::ZeroCostPolicy {
+                let reservation = budgets.get(reservation_id).ok()?;
+                let now = now_ms().max(0) as u64;
+                if reservation.state != crate::budgets::ReservationState::Dispatched
+                    || reservation.max_cost_micros != 0
+                    || reservation.runtime_id != "aider"
+                    || reservation.pricing_source.as_deref()
+                        != Some("authenticated-openrouter-model-and-zdr-endpoint-metadata")
+                    || economy_admission.is_none_or(|admission| {
+                        admission.provider_profile_id() != reservation.provider_id
+                            || admission.model_id() != reservation.model_id
+                            || admission.gateway_policy().runtime_id != reservation.runtime_id
+                    })
+                    || reservation.pricing_verified_at_ms.is_none_or(|observed| {
+                        observed > now || now.saturating_sub(observed) > 24 * 60 * 60 * 1000
+                    })
+                    || u.source.as_deref() != Some("openrouter-free-ledger-token-usage")
+                {
+                    return None;
+                }
+                let expected_selected_source =
+                    format!("openrouter-response-usage|model={}", reservation.model_id);
+                let expected_canonical_source = format!(
+                    "openrouter-response-usage|model={}",
+                    economy_admission?.canonical_slug()
+                );
+                let calls = budgets.free_calls_for_parent(reservation_id).ok()?;
+                let mut total_tokens = 0_u64;
+                if calls.is_empty() || calls.len() > 1_000 {
+                    return None;
+                }
+                for call in calls {
+                    if call.state != crate::budgets::PaidCallState::Settled
+                        || !matches!(
+                            call.settlement_source.as_deref(),
+                            Some(source)
+                                if source == expected_selected_source
+                                    || source == expected_canonical_source
+                        )
+                    {
+                        return None;
+                    }
+                    total_tokens = total_tokens.checked_add(call.actual_tokens?)?;
+                }
+                (Some(total_tokens) == u.total_tokens).then_some(0.0)
             } else {
                 u.cost_usd
             }
@@ -4958,6 +5106,7 @@ impl RuntimeObserver for ReviewRuntimeSink {
             &self.reservation_id,
             state.0,
             Some(&outcome.usage),
+            None,
             outcome.elapsed_ms / 1000,
         )
         .map_err(|e| e.to_string())?;
@@ -6400,7 +6549,7 @@ fn job_budget(plan: &JobPlan) -> BudgetPolicy {
     }
 }
 
-const ROUTING_OBSERVATION_MAX_AGE_MS: u128 = 5 * 60 * 1000;
+pub const ROUTING_OBSERVATION_MAX_AGE_MS: u128 = 5 * 60 * 1000;
 const MAX_TASK_ROUTE_CANDIDATES: usize = 32;
 
 struct TaskRouteResult {
@@ -6409,6 +6558,7 @@ struct TaskRouteResult {
     eligible: bool,
     provenance: Option<Value>,
     reasons: Vec<String>,
+    economy_admission: Option<crate::economy::VerifiedEconomyAdmission>,
 }
 
 fn derive_route_commitments(
@@ -6493,6 +6643,14 @@ fn derive_route_commitments(
                     minimum_context_tokens,
                     authorized_candidates,
                     paid_quote,
+                    economy_endpoint_id: fact
+                        .economy_admission
+                        .as_ref()
+                        .map(|admission| admission.endpoint_id().to_owned()),
+                    economy_evidence_digest: fact
+                        .economy_admission
+                        .as_ref()
+                        .map(|admission| admission.evidence_digest().to_owned()),
                 },
             );
         }
@@ -6533,6 +6691,7 @@ fn check_fresh_route_commitment(
     {
         return Err("provider refresh returned a different route".into());
     }
+    commitment.validate_economy_pin(&fresh.facts)?;
     if fresh.facts.local_only != commitment.local_only || fresh.facts.billing != commitment.billing
     {
         return Err("provider privacy or billing classification changed since preview".into());
@@ -6622,6 +6781,7 @@ fn route_task(
             eligible: true,
             provenance: None,
             reasons: Vec::new(),
+            economy_admission: None,
         });
     }
 
@@ -6741,7 +6901,11 @@ fn route_task(
             quality_rating,
             latency_ms: None,
             latency_collected_at_ms: None,
-            economy_evidence_ready: false,
+            economy_evidence_ready: facts.iter().any(|fact| {
+                fact.provider_id == candidate.provider_id
+                    && fact.model_id == candidate.model_id
+                    && fact.economy_admission.is_some()
+            }),
         });
 
         let Some(mut observed) = facts
@@ -6767,34 +6931,65 @@ fn route_task(
                 );
             }
             if profile.kind == ProviderKind::OpenRouter {
-                let policy_ok = paid_policy.is_some_and(|policy| {
-                    validate_paid_model_policy(
-                        batch,
-                        &job.issue_id,
-                        task,
-                        profile,
-                        &candidate.model_id,
-                        policy,
-                        refreshed_pricing_time_ms,
-                    )
-                    .is_ok()
-                        && policy.provider_id == candidate.provider_id
-                        && policy.model_id == candidate.model_id
-                        && policy.model_context_window_tokens
-                            <= observed.context_tokens.unwrap_or(0)
-                        && requirements
-                            .max_input_tokens
-                            .is_none_or(|tokens| tokens <= policy.model_context_window_tokens)
-                        && requirements
-                            .max_output_tokens
-                            .is_none_or(|tokens| tokens <= policy.max_output_tokens_per_call)
-                        && observed.input_micros_per_million_tokens
-                            == Some(policy.pricing.input_price_micros_per_1m)
-                        && observed.output_micros_per_million_tokens
-                            == Some(policy.pricing.output_price_micros_per_1m)
-                        && observed.pricing_source.as_deref()
-                            == Some(policy.pricing.source.as_str())
-                });
+                let economy_ok = requirements.pace.unwrap_or(crate::routing::Pace::Balanced)
+                    == crate::routing::Pace::Economy
+                    && observed
+                        .economy_admission
+                        .as_ref()
+                        .is_some_and(|admission| {
+                            admission.provider_profile_id() == profile.id
+                                && admission.model_id() == candidate.model_id
+                                && task
+                                    .limits
+                                    .max_tokens
+                                    .is_some_and(|value| value >= admission.max_tokens())
+                                && task
+                                    .limits
+                                    .max_seconds
+                                    .is_some_and(|value| value >= admission.max_seconds())
+                                && requirements
+                                    .max_input_tokens
+                                    .is_none_or(|value| value <= admission.context_tokens())
+                                && requirements.max_output_tokens.is_none_or(|value| {
+                                    value <= admission.max_output_tokens_per_call()
+                                })
+                                && admission
+                                    .validate_pinned_policy(
+                                        &profile.id,
+                                        &admission.gateway_policy(),
+                                        now as u64,
+                                    )
+                                    .is_ok()
+                        });
+                let policy_ok = economy_ok
+                    || paid_policy.is_some_and(|policy| {
+                        validate_paid_model_policy(
+                            batch,
+                            &job.issue_id,
+                            task,
+                            profile,
+                            &candidate.model_id,
+                            policy,
+                            refreshed_pricing_time_ms,
+                        )
+                        .is_ok()
+                            && policy.provider_id == candidate.provider_id
+                            && policy.model_id == candidate.model_id
+                            && policy.model_context_window_tokens
+                                <= observed.context_tokens.unwrap_or(0)
+                            && requirements
+                                .max_input_tokens
+                                .is_none_or(|tokens| tokens <= policy.model_context_window_tokens)
+                            && requirements
+                                .max_output_tokens
+                                .is_none_or(|tokens| tokens <= policy.max_output_tokens_per_call)
+                            && observed.input_micros_per_million_tokens
+                                == Some(policy.pricing.input_price_micros_per_1m)
+                            && observed.output_micros_per_million_tokens
+                                == Some(policy.pricing.output_price_micros_per_1m)
+                            && observed.pricing_source.as_deref()
+                                == Some(policy.pricing.source.as_str())
+                    });
                 if !policy_ok {
                     observed.evidence_ready = false;
                     observed.evidence_reasons.push("OpenRouter requires a matching explicit paid policy and current verified catalog pricing for this exact model.".into());
@@ -6845,26 +7040,41 @@ fn route_task(
         usage_signals: Vec::new(),
         now_ms: now,
     };
-    let max_input_tokens = requirements.max_input_tokens.or_else(|| {
-        paid_policy
-            .filter(|policy| {
-                candidates.iter().any(|candidate| {
-                    policy.provider_id == candidate.provider_id
-                        && policy.model_id == candidate.model_id
+    let selected_economy = candidate_facts
+        .iter()
+        .find(|fact| {
+            fact.economy_admission.is_some()
+                && candidates.iter().any(|candidate| {
+                    candidate.provider_id == fact.provider_id && candidate.model_id == fact.model_id
                 })
-            })
-            .map(|policy| policy.model_context_window_tokens)
-    });
-    let max_output_tokens = requirements.max_output_tokens.or_else(|| {
-        paid_policy
-            .filter(|policy| {
-                candidates.iter().any(|candidate| {
-                    policy.provider_id == candidate.provider_id
-                        && policy.model_id == candidate.model_id
+        })
+        .and_then(|fact| fact.economy_admission.as_ref());
+    let max_input_tokens = requirements
+        .max_input_tokens
+        .or_else(|| {
+            paid_policy
+                .filter(|policy| {
+                    candidates.iter().any(|candidate| {
+                        policy.provider_id == candidate.provider_id
+                            && policy.model_id == candidate.model_id
+                    })
                 })
-            })
-            .map(|policy| policy.max_output_tokens_per_call)
-    });
+                .map(|policy| policy.model_context_window_tokens)
+        })
+        .or_else(|| selected_economy.map(|admission| admission.context_tokens()));
+    let max_output_tokens = requirements
+        .max_output_tokens
+        .or_else(|| {
+            paid_policy
+                .filter(|policy| {
+                    candidates.iter().any(|candidate| {
+                        policy.provider_id == candidate.provider_id
+                            && policy.model_id == candidate.model_id
+                    })
+                })
+                .map(|policy| policy.max_output_tokens_per_call)
+        })
+        .or_else(|| selected_economy.map(|admission| admission.max_output_tokens_per_call()));
     let assignment = crate::routing::AssignmentRequest {
         task_id: format!("{}/{}", job.issue_id, task.task_id),
         request,
@@ -6875,7 +7085,7 @@ fn route_task(
     let decision = crate::routing::route_job(crate::routing::JobRoutingRequest {
         implementer: assignment,
         reviewer: None,
-        candidate_facts,
+        candidate_facts: candidate_facts.clone(),
     })
     .implementer;
     let mut selected = decision
@@ -6912,6 +7122,16 @@ fn route_task(
     let (provider_id, model_id) = selected.map_or((None, None), |(provider, model)| {
         (Some(provider), Some(model))
     });
+    let economy_admission =
+        provider_id
+            .as_ref()
+            .zip(model_id.as_ref())
+            .and_then(|(provider, model)| {
+                candidate_facts
+                    .iter()
+                    .find(|fact| &fact.provider_id == provider && &fact.model_id == model)
+                    .and_then(|fact| fact.economy_admission.clone())
+            });
     let provenance = serde_json::to_value(decision).map_err(|error| {
         SupervisorError::Invalid(format!("route provenance serialization failed: {error}"))
     })?;
@@ -6920,6 +7140,7 @@ fn route_task(
         model_id,
         eligible,
         provenance: Some(provenance),
+        economy_admission,
         reasons: if eligible {
             Vec::new()
         } else if reasons.is_empty() {
@@ -7090,11 +7311,9 @@ mod supervisor_tests {
         let unavailable = SupervisorError::Verification(
             "needs_input: reviewer metadata refresh failed before dispatch: exact selected model is unavailable".into(),
         );
-        assert!(
-            unavailable
-                .to_string()
-                .starts_with("verification error: needs_input:")
-        );
+        assert!(unavailable
+            .to_string()
+            .starts_with("verification error: needs_input:"));
         assert!(verification_error_requires_input(&unavailable));
         assert!(!verification_error_requires_input(
             &SupervisorError::Verification("check command failed".into(),)
@@ -7307,15 +7526,13 @@ mod supervisor_tests {
             .write_all(b"\n")
             .unwrap();
 
-        assert!(
-            supervisor
-                .verify_ready_jobs(
-                    &request.batch_id,
-                    "verification-needs-input-worker",
-                    &preview.request
-                )
-                .unwrap()
-        );
+        assert!(supervisor
+            .verify_ready_jobs(
+                &request.batch_id,
+                "verification-needs-input-worker",
+                &preview.request
+            )
+            .unwrap());
         let status = supervisor.status_view(&request.batch_id).unwrap();
         let public_job = &status.jobs[0];
         assert_eq!(public_job.state, JobState::NeedsInput);
@@ -7324,33 +7541,27 @@ mod supervisor_tests {
             .get_checkpoint(claim.job.id, "manual_acceptance_required")
             .unwrap()
             .unwrap();
-        assert!(
-            manual_acceptance["items"][0]
-                .as_str()
-                .unwrap()
-                .contains("needs_input:")
-        );
+        assert!(manual_acceptance["items"][0]
+            .as_str()
+            .unwrap()
+            .contains("needs_input:"));
 
-        assert!(
-            jobs.get_checkpoint(claim.job.id, "verification_route_refresh")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(claim.job.id, "verification_check_0")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(claim.job.id, "verification_review")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(claim.job.id, "verification_repair_round_1")
-                .unwrap()
-                .is_none()
-        );
+        assert!(jobs
+            .get_checkpoint(claim.job.id, "verification_route_refresh")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(claim.job.id, "verification_check_0")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(claim.job.id, "verification_review")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(claim.job.id, "verification_repair_round_1")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -7468,32 +7679,27 @@ mod supervisor_tests {
             .get_checkpoint(job.id, "manual_acceptance_required")
             .unwrap()
             .unwrap();
-        assert!(
-            manual["items"][0]
-                .as_str()
-                .unwrap()
-                .contains("needs_input: workspace ownership recovery")
-        );
+        assert!(manual["items"][0]
+            .as_str()
+            .unwrap()
+            .contains("needs_input: workspace ownership recovery"));
         assert_eq!(manual["codeHead"].as_str(), Some(proposal_head.as_str()));
         assert_eq!(
             manual["codeFingerprint"].as_str(),
             Some(proposal_fingerprint.as_str())
         );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_check_0")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_review")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_repair_round_1")
-                .unwrap()
-                .is_none()
-        );
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_check_0")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_review")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_repair_round_1")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -7558,6 +7764,7 @@ mod supervisor_tests {
             pricing_source: Some("verified-fixture-catalog".into()),
             pricing_verified_at_ms: Some(now as u128),
             economy_policy: None,
+            economy_admission: None,
             context_tokens: Some(16_384),
             supports_tools: Some(true),
             evidence_ready: true,
@@ -7586,12 +7793,12 @@ mod supervisor_tests {
                 model_id: reviewed.model_id.clone(),
             }],
             paid_quote: Some(quote),
+            economy_endpoint_id: None,
+            economy_evidence_digest: None,
         };
-        assert!(
-            check_fresh_paid_quote(&commitment, &changed_facts)
-                .unwrap_err()
-                .contains("quote or source changed")
-        );
+        assert!(check_fresh_paid_quote(&commitment, &changed_facts)
+            .unwrap_err()
+            .contains("quote or source changed"));
     }
 
     fn budget_request(id: &str) -> ReservationRequest {
@@ -7610,6 +7817,183 @@ mod supervisor_tests {
             pricing_source: None,
             pricing_verified_at_ms: None,
         }
+    }
+
+    #[test]
+    fn free_policy_usage_settles_zero_cost_only_for_a_verified_zero_cost_reservation() {
+        let folder = tempdir().unwrap();
+        let budgets = BudgetStore::open(folder.path().join("free-usage.sqlite3")).unwrap();
+        configure_test_budget(&budgets, 1_000);
+        let now = now_ms().max(0) as u64;
+        let mut request = budget_request("free-settled");
+        request.provider_id = "openrouter-fixture".into();
+        request.model_id = "vendor/test-model".into();
+        request.runtime_id = "aider".into();
+        request.max_tokens = 300;
+        request.max_cost_micros = Some(0);
+        request.max_seconds = 20;
+        request.pricing_source =
+            Some("authenticated-openrouter-model-and-zdr-endpoint-metadata".into());
+        request.pricing_verified_at_ms = Some(now);
+        budgets.reserve(&request, now).unwrap();
+        budgets
+            .mark_dispatched(&request.reservation_id, now + 1)
+            .unwrap();
+        let pricing_source = "authenticated-openrouter-model-and-zdr-endpoint-metadata";
+        budgets
+            .reserve_free_call(&crate::budgets::FreeCallRequest {
+                parent_reservation_id: request.reservation_id.clone(),
+                call_id: "free-call-settled".into(),
+                provider_id: request.provider_id.clone(),
+                model_id: request.model_id.clone(),
+                runtime_id: request.runtime_id.clone(),
+                max_tokens: 100,
+                max_calls: 3,
+                pricing_source: pricing_source.into(),
+                pricing_verified_at_ms: now,
+                now_ms: now + 1,
+            })
+            .unwrap();
+        let canonical_model = "vendor/test-model-verified";
+        let test_evaluation = crate::economy::CodingEvaluationEvidence {
+            model_id: request.model_id.clone(),
+            runtime_id: "aider".into(),
+            runtime_version: "0.86.2".into(),
+            evaluated_at_ms: now,
+            fixture_set_id: "cfg-test-settlement".into(),
+            fixture_set_sha256: "a".repeat(64),
+            result_sha256: "b".repeat(64),
+            cases: 3,
+            passed: 3,
+            independent_review: true,
+        };
+        let model = crate::providers::OpenRouterModel {
+            id: request.model_id.clone(),
+            canonical_slug: Some(canonical_model.into()),
+            name: "fixture model".into(),
+            context_length: Some(65_536),
+            prompt_price: Some("0".into()),
+            completion_price: Some("0".into()),
+            input_modalities: Some(vec!["text".into()]),
+            output_modalities: Some(vec!["text".into()]),
+            supported_parameters: Some(vec!["max_tokens".into(), "tools".into()]),
+        };
+        let endpoint = crate::providers::OpenRouterEndpoint {
+            model_id: request.model_id.clone(),
+            tag: "vendor/endpoint".into(),
+            context_length: Some(65_536),
+            max_prompt_tokens: Some(32_768),
+            max_completion_tokens: Some(8_192),
+            prompt_price: Some("0".into()),
+            completion_price: Some("0".into()),
+            request_price: Some("0".into()),
+            status: Some(0),
+            zdr: None,
+            supported_parameters: Some(vec!["max_tokens".into(), "tools".into()]),
+        };
+        let admission = crate::economy::with_test_admission_evidence(
+            test_evaluation,
+            &request.model_id,
+            &endpoint.tag,
+            now,
+            || {
+                crate::economy::admit_authenticated_candidate(
+                    &request.provider_id,
+                    &request.model_id,
+                    "aider",
+                    "0.86.2",
+                    &crate::providers::OpenRouterMetadataObservation {
+                        authenticated_for_execution: Some(true),
+                        models: vec![model],
+                        free_model_daily_requests: None,
+                    },
+                    &[endpoint.clone()],
+                    &[(request.model_id.clone(), endpoint.tag.clone())]
+                        .into_iter()
+                        .collect(),
+                    None,
+                    None,
+                    true,
+                    122_880,
+                    120,
+                    now,
+                )
+                .unwrap()
+            },
+        );
+        budgets
+            .settle_free_call(
+                "free-call-settled",
+                Some(42),
+                &format!("openrouter-response-usage|model={canonical_model}"),
+            )
+            .unwrap();
+        let known = RuntimeUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: Some(42),
+            cost_usd: None,
+            source: Some("openrouter-free-ledger-token-usage".into()),
+            confidence: Some("provider-reported-token-usage".into()),
+            billing: BillingStatus::ZeroCostPolicy,
+        };
+        settle_runtime_usage(
+            &budgets,
+            &request.reservation_id,
+            true,
+            Some(&known),
+            Some(&admission),
+            3,
+        )
+        .unwrap();
+        let settled = budgets.get(&request.reservation_id).unwrap();
+        assert_eq!(settled.state, crate::budgets::ReservationState::Settled);
+
+        let mut unknown_request = request;
+        unknown_request.reservation_id = "free-unknown".into();
+        budgets.reserve(&unknown_request, now + 2).unwrap();
+        budgets
+            .mark_dispatched(&unknown_request.reservation_id, now + 3)
+            .unwrap();
+        budgets
+            .reserve_free_call(&crate::budgets::FreeCallRequest {
+                parent_reservation_id: unknown_request.reservation_id.clone(),
+                call_id: "free-call-unknown".into(),
+                provider_id: unknown_request.provider_id.clone(),
+                model_id: unknown_request.model_id.clone(),
+                runtime_id: unknown_request.runtime_id.clone(),
+                max_tokens: 100,
+                max_calls: 3,
+                pricing_source: pricing_source.into(),
+                pricing_verified_at_ms: now,
+                now_ms: now + 3,
+            })
+            .unwrap();
+        budgets
+            .settle_free_call("free-call-unknown", None, "provider-usage-unknown")
+            .unwrap();
+        let unknown = RuntimeUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: Some(42),
+            cost_usd: None,
+            source: None,
+            confidence: None,
+            billing: BillingStatus::Unknown,
+        };
+        settle_runtime_usage(
+            &budgets,
+            &unknown_request.reservation_id,
+            true,
+            Some(&unknown),
+            None,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            budgets.get(&unknown_request.reservation_id).unwrap().state,
+            crate::budgets::ReservationState::Unresolved
+        );
     }
 
     fn configure_test_budget(store: &BudgetStore, max_tokens: u64) {
@@ -7681,10 +8065,11 @@ mod supervisor_tests {
             "src-tauri/src/game_view.rs".to_owned(),
             "web/theme.css".to_owned(),
         ];
-        assert!(
-            validate_observed_change_scope(&["src-tauri\\src\\game_view.rs".to_owned()], &allowed,)
-                .is_ok()
-        );
+        assert!(validate_observed_change_scope(
+            &["src-tauri\\src\\game_view.rs".to_owned()],
+            &allowed,
+        )
+        .is_ok());
         let error =
             validate_observed_change_scope(&["web/app.js".to_owned()], &allowed).unwrap_err();
         assert!(error.contains("outside declared task scope"));
@@ -7896,6 +8281,7 @@ mod supervisor_tests {
                                 "synthetic fixture does not authorize paid pricing",
                             ),
                             pricing_verified_at_ms: None,
+                            economy_metadata: None,
                         })
                         .collect(),
                 }
@@ -7925,12 +8311,10 @@ mod supervisor_tests {
         let job = jobs.get(batch.job_ids[0]).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(job.attempt_count, 0);
-        assert!(
-            !BatchStore::open(&supervisor.paths().batches)
-                .unwrap()
-                .acquire_verification(&request.batch_id, job.id, "late-verifier", 3, MAX_LEASE_MS)
-                .unwrap()
-        );
+        assert!(!BatchStore::open(&supervisor.paths().batches)
+            .unwrap()
+            .acquire_verification(&request.batch_id, job.id, "late-verifier", 3, MAX_LEASE_MS)
+            .unwrap());
         assert_eq!(
             supervisor.status(&request.batch_id).unwrap().state,
             BatchState::Cancelled
@@ -8045,11 +8429,9 @@ mod supervisor_tests {
         .unwrap();
 
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
-        assert!(
-            batches
-                .reserve_worker(&request.batch_id, "cancel-unknown-worker", 0, 4)
-                .unwrap()
-        );
+        assert!(batches
+            .reserve_worker(&request.batch_id, "cancel-unknown-worker", 0, 4)
+            .unwrap());
         let worker_identity = crate::process::current_process_identity().unwrap();
         batches
             .worker_started(
@@ -8422,49 +8804,39 @@ mod supervisor_tests {
             .unwrap();
         assert_eq!(failure["statusKey"], "workspace_preparation_failure");
         assert_eq!(failure["stage"], "prepare_workspace");
-        assert!(
-            failure["error"]
-                .as_str()
-                .unwrap()
-                .contains("existing issue checkout")
-        );
+        assert!(failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("existing issue checkout"));
         assert!(failure["guidance"].as_str().unwrap().contains("inspect"));
         assert!(failure.to_string().len() < 2048);
         let status = supervisor.status_view(&request.batch_id).unwrap();
         let job_status = &status.jobs[0];
         assert_eq!(job_status.state, JobState::NeedsInput);
-        assert!(
-            job_status
-                .checkpoints
-                .iter()
-                .any(|checkpoint| checkpoint.key == "workspace_preparation_failure")
-        );
-        assert!(
-            supervisor
-                .morning_summary(&request.batch_id)
-                .unwrap()
-                .needs_input
-                .contains(&"TEST-L001".into())
-        );
+        assert!(job_status
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.key == "workspace_preparation_failure"));
+        assert!(supervisor
+            .morning_summary(&request.batch_id)
+            .unwrap()
+            .needs_input
+            .contains(&"TEST-L001".into()));
 
         let reservation = reservation_id(&request.batch_id, job_id, "implement", 1);
-        assert!(
-            BudgetStore::open(&supervisor.paths().budgets)
-                .unwrap()
-                .get_optional(&reservation)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job_id, "runtime_process_implement")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job_id, "dispatch_implement")
-                .unwrap()
-                .is_none()
-        );
+        assert!(BudgetStore::open(&supervisor.paths().budgets)
+            .unwrap()
+            .get_optional(&reservation)
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job_id, "runtime_process_implement")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job_id, "dispatch_implement")
+            .unwrap()
+            .is_none());
         assert_eq!(fs::read(&ownership_path).unwrap(), original_ownership);
         assert_eq!(
             fs::read(project.join("TEST-L001.md")).unwrap(),
@@ -8693,25 +9065,27 @@ mod supervisor_tests {
 
         let mut changed_privacy = fresh.clone();
         changed_privacy.facts.local_only = !commitment.local_only;
-        assert!(
-            check_fresh_route_commitment(&preview.request, &settings, job, task, &changed_privacy)
-                .unwrap_err()
-                .contains("privacy or billing")
-        );
+        assert!(check_fresh_route_commitment(
+            &preview.request,
+            &settings,
+            job,
+            task,
+            &changed_privacy
+        )
+        .unwrap_err()
+        .contains("privacy or billing"));
 
         let mut changed_capability = fresh.clone();
         changed_capability.facts.supports_tools = Some(false);
-        assert!(
-            check_fresh_route_commitment(
-                &preview.request,
-                &settings,
-                job,
-                task,
-                &changed_capability
-            )
-            .unwrap_err()
-            .contains("tool capability")
-        );
+        assert!(check_fresh_route_commitment(
+            &preview.request,
+            &settings,
+            job,
+            task,
+            &changed_capability
+        )
+        .unwrap_err()
+        .contains("tool capability"));
 
         assert!(matches!(
             crate::provider_observations::ModelFreeRefreshConsent::default(),
@@ -8768,11 +9142,15 @@ mod supervisor_tests {
 
             let mut alternate = refreshed;
             alternate.facts.provider_id = "unreviewed-provider".into();
-            assert!(
-                check_fresh_route_commitment(&preview.request, &settings, job, task, &alternate)
-                    .unwrap_err()
-                    .contains("different route")
-            );
+            assert!(check_fresh_route_commitment(
+                &preview.request,
+                &settings,
+                job,
+                task,
+                &alternate
+            )
+            .unwrap_err()
+            .contains("different route"));
         }
     }
 
@@ -8826,23 +9204,19 @@ mod supervisor_tests {
             .unwrap();
         assert_eq!(audit["state"], "needs_input");
         assert!(audit["reason"].as_str().unwrap().contains("runtime"));
-        assert!(
-            BudgetStore::open(&supervisor.paths().budgets)
-                .unwrap()
-                .get_optional(&reservation_id(&request.batch_id, job.id, "implement", 1))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "dispatch_implement")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "runtime_process_implement")
-                .unwrap()
-                .is_none()
-        );
+        assert!(BudgetStore::open(&supervisor.paths().budgets)
+            .unwrap()
+            .get_optional(&reservation_id(&request.batch_id, job.id, "implement", 1))
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "dispatch_implement")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "runtime_process_implement")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -8866,12 +9240,10 @@ mod supervisor_tests {
         assert_eq!(checkpoint["statusKey"], "runtime_input_request");
         assert_eq!(checkpoint["threadId"], "thread-local-fixture");
         assert_eq!(checkpoint["requestId"], 17);
-        assert!(
-            checkpoint["method"]
-                .as_str()
-                .unwrap()
-                .contains("requestApproval")
-        );
+        assert!(checkpoint["method"]
+            .as_str()
+            .unwrap()
+            .contains("requestApproval"));
     }
 
     #[test]
@@ -9009,11 +9381,9 @@ mod supervisor_tests {
         supervisor.start(&request, 1).unwrap();
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
         let identity = crate::process::current_process_identity().unwrap();
-        assert!(
-            batches
-                .reserve_worker(&request.batch_id, "persisted-live-worker", 0, 2)
-                .unwrap()
-        );
+        assert!(batches
+            .reserve_worker(&request.batch_id, "persisted-live-worker", 0, 2)
+            .unwrap());
         batches
             .worker_started(
                 "persisted-live-worker",
@@ -9055,12 +9425,10 @@ mod supervisor_tests {
             deadline_ms: now_ms() - 1,
             build_output: PathBuf::new(),
         };
-        assert!(
-            executor
-                .execute(Path::new("."), &check)
-                .unwrap_err()
-                .contains("deadline expired")
-        );
+        assert!(executor
+            .execute(Path::new("."), &check)
+            .unwrap_err()
+            .contains("deadline expired"));
 
         let (_folder, mut request, _worker, _settings_path) = preview_fixture();
         request.policy.max_network_retries = 1;
@@ -9130,12 +9498,10 @@ mod supervisor_tests {
         assert_eq!(aggregate.max_seconds, 100);
 
         request.policy.budget.max_tokens = 1_000;
-        assert!(
-            Supervisor::dry_run_request(&request)
-                .unwrap_err()
-                .to_string()
-                .contains("aggregate job budget exceeds the batch")
-        );
+        assert!(Supervisor::dry_run_request(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("aggregate job budget exceeds the batch"));
 
         request.policy.budget.max_tokens = 10_000;
         assert!(Supervisor::dry_run_request(&request).is_ok());
@@ -9255,11 +9621,9 @@ mod supervisor_tests {
         seed_fixture_provider_observations(&supervisor.paths().root, &request.settings_path);
         supervisor.start(&request, now_ms()).unwrap();
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
-        assert!(
-            batches
-                .reserve_worker(&request.batch_id, "expired-paused-worker", 0, now_ms())
-                .unwrap()
-        );
+        assert!(batches
+            .reserve_worker(&request.batch_id, "expired-paused-worker", 0, now_ms())
+            .unwrap());
         batches
             .worker_started("expired-paused-worker", 4_000_000_000, Some(1), now_ms())
             .unwrap();
@@ -9541,11 +9905,9 @@ mod supervisor_tests {
         seed_fixture_provider_observations(&supervisor.paths().root, &request.settings_path);
         supervisor.start(&request, now_ms()).unwrap();
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
-        assert!(
-            batches
-                .reserve_worker(&request.batch_id, "dead-hosted-worker", 0, now_ms())
-                .unwrap()
-        );
+        assert!(batches
+            .reserve_worker(&request.batch_id, "dead-hosted-worker", 0, now_ms())
+            .unwrap());
         batches
             .worker_started("dead-hosted-worker", 4_000_000_000, Some(1), now_ms())
             .unwrap();
@@ -9669,18 +10031,14 @@ mod supervisor_tests {
         )
         .unwrap();
         let status = supervisor.status_view(&request.batch_id).unwrap();
-        assert!(
-            status.jobs[0]
-                .checkpoints
-                .iter()
-                .all(|checkpoint| checkpoint.key != "implementation_proposed")
-        );
-        assert!(
-            status.jobs[0]
-                .checkpoints
-                .iter()
-                .any(|checkpoint| checkpoint.key == "runtime_usage")
-        );
+        assert!(status.jobs[0]
+            .checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.key != "implementation_proposed"));
+        assert!(status.jobs[0]
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.key == "runtime_usage"));
         assert!(status.jobs[0].checkpoints_truncated);
         assert_eq!(status.jobs.len(), MAX_BATCH_JOBS);
     }
@@ -9753,12 +10111,10 @@ mod supervisor_tests {
         let status = supervisor.status_view(&request.batch_id).unwrap();
         assert_eq!(status.jobs.len(), 17);
         assert!(status.jobs[16].checkpoints_truncated);
-        assert!(
-            status.jobs[16]
-                .checkpoints
-                .iter()
-                .all(|checkpoint| checkpoint.key != key)
-        );
+        assert!(status.jobs[16]
+            .checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.key != key));
         let total_status_bytes: usize = status
             .jobs
             .iter()
@@ -9925,11 +10281,9 @@ mod supervisor_tests {
                 .state,
             BatchState::Running
         );
-        assert!(
-            store
-                .reserve_worker("batch-a", "running-worker", 0, 5)
-                .unwrap()
-        );
+        assert!(store
+            .reserve_worker("batch-a", "running-worker", 0, 5)
+            .unwrap());
         assert_eq!(
             store
                 .control("batch-a", "stopping", "finish current work", 6)
@@ -10028,27 +10382,22 @@ mod supervisor_tests {
         assert_eq!(failure["statusKey"], "post_provider_capture_failure");
         assert_eq!(failure["state"], "needs_input");
         assert_eq!(failure["stage"], "allowed_scope_validation");
-        assert!(
-            failure["error"]
-                .as_str()
-                .unwrap()
-                .contains("unexpected.txt")
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "implementation_proposed")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_review")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_complete")
-                .unwrap()
-                .is_none()
-        );
+        assert!(failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected.txt"));
+        assert!(jobs
+            .get_checkpoint(job.id, "implementation_proposed")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_review")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_complete")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -10073,16 +10422,14 @@ mod supervisor_tests {
         let record = isolation.recover_workspace(&claim.job.issue_id).unwrap();
         assert_eq!(record.owned_changes, vec!["output.txt"]);
         let jobs = JobsStore::open(&supervisor.paths().jobs).unwrap();
-        assert!(
-            jobs.get_checkpoint(claim.job.id, "implementation_proposed")
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            jobs.get_checkpoint(claim.job.id, "post_provider_capture_failure")
-                .unwrap()
-                .is_none()
-        );
+        assert!(jobs
+            .get_checkpoint(claim.job.id, "implementation_proposed")
+            .unwrap()
+            .is_some());
+        assert!(jobs
+            .get_checkpoint(claim.job.id, "post_provider_capture_failure")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -10117,16 +10464,14 @@ mod supervisor_tests {
             .unwrap();
         assert_eq!(failure["stage"], "observed_changed_paths");
         assert!(failure["error"].as_str().unwrap().contains("cancelled"));
-        assert!(
-            jobs.get_checkpoint(job.id, "implementation_proposed")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_review")
-                .unwrap()
-                .is_none()
-        );
+        assert!(jobs
+            .get_checkpoint(job.id, "implementation_proposed")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_review")
+            .unwrap()
+            .is_none());
         assert_eq!(
             fs::read_to_string(worktree.join("output.txt")).unwrap(),
             "provider result retained"
@@ -10188,16 +10533,14 @@ mod supervisor_tests {
             .unwrap()
             .unwrap();
         assert_eq!(failure["stage"], "source_changed_during_metadata_wait");
-        assert!(
-            jobs.get_checkpoint(job.id, "implementation_proposed")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            jobs.get_checkpoint(job.id, "verification_review")
-                .unwrap()
-                .is_none()
-        );
+        assert!(jobs
+            .get_checkpoint(job.id, "implementation_proposed")
+            .unwrap()
+            .is_none());
+        assert!(jobs
+            .get_checkpoint(job.id, "verification_review")
+            .unwrap()
+            .is_none());
         assert_eq!(
             fs::read_to_string(worktree.join("output.txt")).unwrap(),
             "external content drift"

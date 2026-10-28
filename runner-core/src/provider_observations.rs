@@ -191,6 +191,22 @@ pub struct ProviderModelObservation {
     pub output_micros_per_million_tokens: Observation<u64>,
     pub pricing_source: Observation<String>,
     pub pricing_verified_at_ms: Option<u128>,
+    /// Normalized authenticated model/endpoint/ZDR metadata captured only by
+    /// explicit provider refresh. It is revalidated before dispatch and never
+    /// contains a bearer credential or response body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economy_metadata: Option<OpenRouterEconomyMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenRouterEconomyMetadata {
+    pub model: providers::OpenRouterModel,
+    pub endpoints: Vec<providers::OpenRouterEndpoint>,
+    pub zdr_endpoint_tags: std::collections::BTreeSet<String>,
+    pub runtime_version: String,
+    pub runtime_identity_fingerprint: String,
+    pub observed_at_ms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -716,7 +732,16 @@ fn refresh_openrouter_provider(
     match probe {
         Ok(probe) if probe.authenticated_for_execution == Some(true) => {
             let now_ms = unix_time_ms();
-            let models = refresh_authenticated_openrouter_models(profile, &probe.models, now_ms);
+            let mut models =
+                refresh_authenticated_openrouter_models(profile, &probe.models, now_ms);
+            refresh_openrouter_economy_metadata(
+                profile,
+                &runtime_identity_fingerprint,
+                &probe.models,
+                &mut models,
+                deadline,
+                now_ms,
+            );
             ProviderObservation {
                 provider_id: profile.id.clone(),
                 kind: profile.kind,
@@ -909,6 +934,89 @@ fn refresh_authenticated_openrouter_models(
         })
         .collect()
 }
+
+fn refresh_openrouter_economy_metadata(
+    profile: &ProviderProfile,
+    runtime_identity_fingerprint: &str,
+    catalog_models: &[providers::OpenRouterModel],
+    observed_models: &mut [ProviderModelObservation],
+    deadline: Instant,
+    observed_at_ms: u128,
+) {
+    let Some(executable) =
+        providers::find_executable(&profile.executable, std::env::var_os("PATH").as_deref())
+    else {
+        return;
+    };
+    let Some(runtime_version) = providers::probe_aider_runtime_version(&executable) else {
+        return;
+    };
+    let Ok(now) = u64::try_from(observed_at_ms) else {
+        return;
+    };
+    let model_ids = crate::economy::trusted_economy_candidate_ids("aider", &runtime_version, now);
+    if model_ids.is_empty() {
+        return;
+    }
+    let Some(secret_ref) = profile.secret_ref.as_deref().filter(|reference| {
+        providers::openrouter_credential_reference_matches(&profile.id, reference)
+    }) else {
+        return;
+    };
+    let Some(key) =
+        crate::credentials::resolve(secret_ref).filter(|key| providers::valid_openrouter_key(key))
+    else {
+        return;
+    };
+    for model_id in model_ids {
+        if !profile.models.iter().any(|model| model.id == model_id) {
+            continue;
+        }
+        let Some(model) = catalog_models
+            .iter()
+            .find(|model| model.id == model_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(endpoints) =
+            providers::openrouter_endpoints_http_probe_with_timeout(&key, &model_id, remaining)
+        else {
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(zdr_inventory) =
+            providers::openrouter_zdr_endpoints_http_probe_with_timeout(&key, remaining)
+        else {
+            continue;
+        };
+        let tags = zdr_inventory
+            .into_iter()
+            .filter(|(inventory_model, _)| inventory_model == &model_id)
+            .map(|(_, tag)| tag)
+            .collect();
+        if let Some(observed) = observed_models
+            .iter_mut()
+            .find(|row| row.model_id == model_id)
+        {
+            observed.economy_metadata = Some(OpenRouterEconomyMetadata {
+                model,
+                endpoints,
+                zdr_endpoint_tags: tags,
+                runtime_version: runtime_version.clone(),
+                runtime_identity_fingerprint: runtime_identity_fingerprint.to_owned(),
+                observed_at_ms: u128::try_from(unix_time_ms()).unwrap_or(u128::MAX),
+            });
+        }
+    }
+}
 fn apply_authenticated_openrouter_pricing(
     observation: &mut ProviderModelObservation,
     model: &providers::OpenRouterModel,
@@ -1081,6 +1189,7 @@ fn unknown_model(model_id: &str, reason: &str) -> ProviderModelObservation {
         output_micros_per_million_tokens: Observation::unknown(reason),
         pricing_source: Observation::unknown(reason),
         pricing_verified_at_ms: None,
+        economy_metadata: None,
     }
 }
 
@@ -1133,6 +1242,22 @@ impl ProviderObservationSnapshot {
                         model.model_id.trim().is_empty()
                             || model.model_id.len() > 160
                             || model.model_id.chars().any(char::is_control)
+                            || model.economy_metadata.as_ref().is_some_and(|metadata| {
+                                metadata.model.id != model.model_id
+                                    || metadata.endpoints.len() > 256
+                                    || metadata.zdr_endpoint_tags.len() > 256
+                                    || metadata.runtime_version.is_empty()
+                                    || metadata.runtime_version.len() > 64
+                                    || metadata.runtime_identity_fingerprint
+                                        != provider.runtime_identity_fingerprint
+                                    || metadata.observed_at_ms > now_ms
+                                    || metadata.endpoints.iter().any(|endpoint| {
+                                        endpoint.model_id != model.model_id
+                                            || endpoint.tag.is_empty()
+                                            || endpoint.tag.len() > 128
+                                            || endpoint.tag.chars().any(char::is_control)
+                                    })
+                            })
                     })
             })
         {
@@ -1229,6 +1354,59 @@ impl ProviderObservationSnapshot {
                 {
                     reasons.push("Verified current per-token pricing is unavailable.".into());
                 }
+                let economy_admission = model.economy_metadata.as_ref().and_then(|metadata| {
+                    let observed_time = metadata.observed_at_ms;
+                    if profile.kind != ProviderKind::OpenRouter
+                        || !installed
+                        || observed.runtime_installed.value != Some(true)
+                        || !runtime_matches
+                        || !authenticated
+                        || observed.authenticated.value != Some(true)
+                        || !healthy
+                        || observed.healthy.value != Some(true)
+                        || !available
+                        || model.model_available.value != Some(true)
+                        || billing_value != BillingPolicy::Paid
+                        || !privacy
+                        || model.local_only.value != Some(false)
+                        || input_price != Some(0)
+                        || output_price != Some(0)
+                        || !context
+                        || observed.runtime_identity_fingerprint
+                            != metadata.runtime_identity_fingerprint
+                        || observed_time > now_ms
+                        || now_ms.saturating_sub(observed_time) > max_age_ms
+                    {
+                        return None;
+                    }
+                    let current_time = u64::try_from(now_ms).ok()?;
+                    let zdr_endpoints = metadata
+                        .zdr_endpoint_tags
+                        .iter()
+                        .map(|tag| (model.model_id.clone(), tag.clone()))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let observation = providers::OpenRouterMetadataObservation {
+                        authenticated_for_execution: Some(true),
+                        models: vec![metadata.model.clone()],
+                        free_model_daily_requests: None,
+                    };
+                    crate::economy::admit_authenticated_candidate(
+                        &observed.provider_id,
+                        &model.model_id,
+                        "aider",
+                        &metadata.runtime_version,
+                        &observation,
+                        &metadata.endpoints,
+                        &zdr_endpoints,
+                        None,
+                        None,
+                        true,
+                        122_880,
+                        120,
+                        current_time,
+                    )
+                    .ok()
+                });
                 facts.push(CandidateFacts {
                     provider_id: observed.provider_id.clone(),
                     model_id: model.model_id.clone(),
@@ -1246,6 +1424,7 @@ impl ProviderObservationSnapshot {
                     model_available: available && model.model_available.value == Some(true),
                     local_only: privacy && model.local_only.value == Some(true),
                     economy_policy: None,
+                    economy_admission,
                     context_tokens: if context {
                         model.context_tokens.value
                     } else {
@@ -1505,6 +1684,7 @@ mod tests {
                 output_micros_per_million_tokens: Observation::unknown("not a paid model"),
                 pricing_source: Observation::unknown("subscription billing has no API price"),
                 pricing_verified_at_ms: None,
+                economy_metadata: None,
             }],
         }
     }
@@ -1804,5 +1984,444 @@ mod tests {
             .evidence_reasons
             .iter()
             .any(|reason| reason.contains("model availability")));
+    }
+
+    #[test]
+    fn persisted_economy_endpoint_metadata_roundtrips_but_failed_registry_never_mints_preview_proof(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = synthetic_executable(directory.path());
+        let mut settings = fixture_settings(&executable);
+        let profile = &mut settings.providers[0];
+        profile.id = "openrouter-test".into();
+        profile.kind = ProviderKind::OpenRouter;
+        profile.models[0].id = "poolside/laguna-s-2.1:free".into();
+        profile.secret_ref = Some("credential-store:openrouter-test".into());
+        let fingerprint = providers::runtime_identity_fingerprint(profile).unwrap();
+        let model_id = profile.models[0].id.clone();
+        let catalog_model = providers::OpenRouterModel {
+            id: model_id.clone(),
+            canonical_slug: Some("poolside/laguna-s-2.1-20260720".into()),
+            name: "synthetic catalog model".into(),
+            context_length: Some(65_536),
+            prompt_price: Some("0".into()),
+            completion_price: Some("0".into()),
+            input_modalities: Some(vec!["text".into()]),
+            output_modalities: Some(vec!["text".into()]),
+            supported_parameters: Some(vec!["max_tokens".into(), "tools".into()]),
+        };
+        let endpoint = providers::OpenRouterEndpoint {
+            model_id: model_id.clone(),
+            tag: "poolside/fp4".into(),
+            context_length: Some(65_536),
+            max_prompt_tokens: Some(32_768),
+            max_completion_tokens: Some(8_192),
+            prompt_price: Some("0".into()),
+            completion_price: Some("0".into()),
+            request_price: Some("0".into()),
+            status: Some(0),
+            zdr: None,
+            supported_parameters: Some(vec!["max_tokens".into(), "tools".into()]),
+        };
+        let mut provider = fixture_provider(&settings, 1_793_059_200_000);
+        provider.runtime_identity_fingerprint = fingerprint.clone();
+        provider.authenticated =
+            Observation::known(true, "openrouter-key-and-user-catalog", 1_793_059_200_000);
+        provider.models[0] = ProviderModelObservation {
+            model_id: model_id.clone(),
+            model_available: Observation::known(
+                true,
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            context_tokens: Observation::known(
+                65_536,
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            supports_tools: Observation::known(
+                true,
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            local_only: Observation::known(
+                false,
+                "openrouter-provider-classification",
+                1_793_059_200_000,
+            ),
+            billing: Observation::known(
+                BillingPolicy::Paid,
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            input_micros_per_million_tokens: Observation::known(
+                0,
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            output_micros_per_million_tokens: Observation::known(
+                0,
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            pricing_source: Observation::known(
+                "OpenRouter /models/user".into(),
+                "openrouter-user-model-catalog",
+                1_793_059_200_000,
+            ),
+            pricing_verified_at_ms: Some(1_793_059_200_000),
+            economy_metadata: Some(OpenRouterEconomyMetadata {
+                model: catalog_model.clone(),
+                endpoints: vec![endpoint.clone()],
+                zdr_endpoint_tags: [endpoint.tag.clone()].into_iter().collect(),
+                runtime_version: "0.86.2".into(),
+                runtime_identity_fingerprint: fingerprint,
+                observed_at_ms: 1_793_059_200_000,
+            }),
+        };
+        let snapshot = seal_snapshot(&settings, 1_793_059_200_000, vec![provider]).unwrap();
+        let data_root = directory.path().join("data");
+        persist_snapshot(&data_root, &snapshot).unwrap();
+        let store = ProviderObservationStore::open_read_only(&data_root).unwrap();
+        let loaded = store.snapshot(&settings, 1_793_059_200_000).unwrap();
+        let test_evaluation = crate::economy::CodingEvaluationEvidence {
+            model_id: model_id.clone(),
+            runtime_id: "aider".into(),
+            runtime_version: "0.86.2".into(),
+            evaluated_at_ms: 1_793_059_200_000,
+            fixture_set_id: "cfg-test-positive-fixture".into(),
+            fixture_set_sha256: "a".repeat(64),
+            result_sha256: "b".repeat(64),
+            cases: 3,
+            passed: 3,
+            independent_review: true,
+        };
+        let positive_fact = crate::economy::with_test_admission_evidence(
+            test_evaluation.clone(),
+            &model_id,
+            "poolside/fp4",
+            1_793_059_200_000,
+            || {
+                loaded
+                    .candidate_facts(&settings, 1_793_059_200_000, 300_000)
+                    .unwrap()
+                    .remove(0)
+            },
+        );
+        let proof = positive_fact
+            .economy_admission
+            .as_ref()
+            .expect("shared validator admits a complete test-only trusted fixture");
+        assert_eq!(proof.model_id(), model_id);
+        assert_eq!(proof.endpoint_id(), "poolside/fp4");
+        assert!(!proof.evidence_digest().is_empty());
+        for blocked_observation in [
+            "installed",
+            "runtime",
+            "authentication",
+            "health",
+            "availability",
+        ] {
+            let mut blocked = loaded.clone();
+            match blocked_observation {
+                "installed" => {
+                    blocked.providers[0].runtime_installed = Observation::known(
+                        false,
+                        "test-negative-runtime-installation",
+                        1_793_059_200_000,
+                    );
+                }
+                "runtime" => {
+                    let mismatch = "0".repeat(64);
+                    blocked.providers[0].runtime_identity_fingerprint = mismatch.clone();
+                    blocked.providers[0].models[0]
+                        .economy_metadata
+                        .as_mut()
+                        .unwrap()
+                        .runtime_identity_fingerprint = mismatch;
+                }
+                "authentication" => {
+                    blocked.providers[0].authenticated = Observation::known(
+                        false,
+                        "test-negative-authentication",
+                        1_793_059_200_000,
+                    );
+                }
+                "health" => {
+                    blocked.providers[0].healthy =
+                        Observation::known(false, "test-negative-health", 1_793_059_200_000);
+                }
+                "availability" => {
+                    blocked.providers[0].models[0].model_available = Observation::known(
+                        false,
+                        "test-negative-model-availability",
+                        1_793_059_200_000,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let blocked = seal_snapshot(&settings, 1_793_059_200_000, blocked.providers).unwrap();
+            let fact = crate::economy::with_test_admission_evidence(
+                test_evaluation.clone(),
+                &model_id,
+                "poolside/fp4",
+                1_793_059_200_000,
+                || {
+                    blocked
+                        .candidate_facts(&settings, 1_793_059_200_000, 300_000)
+                        .unwrap()
+                        .remove(0)
+                },
+            );
+            assert!(
+                fact.economy_admission.is_none(),
+                "cached metadata must not mint a proof with negative {blocked_observation} evidence"
+            );
+        }
+        let route = crate::routing::decide(crate::routing::Request {
+            complexity: crate::routing::Complexity::Standard,
+            pace: crate::routing::Pace::Economy,
+            require_context_evidence: true,
+            minimum_context_tokens: None,
+            require_tools: true,
+            local_only: false,
+            desired_completion_minutes: None,
+            manual_provider_id: None,
+            manual_model_id: None,
+            candidates: vec![crate::routing::Candidate {
+                provider_id: "openrouter-test".into(),
+                telemetry_provider_id: "openrouter-test".into(),
+                provider_name: "OpenRouter fixture".into(),
+                model_id: model_id.clone(),
+                model_name: "Synthetic fixture model".into(),
+                is_local: false,
+                context_tokens: Some(65_536),
+                supports_tools: Some(true),
+                reasoning_efforts: vec![],
+                quality_rating: Some(5),
+                latency_ms: None,
+                latency_collected_at_ms: None,
+                economy_evidence_ready: positive_fact.economy_admission.is_some(),
+            }],
+            usage_signals: vec![],
+            now_ms: 1_793_059_200_000,
+        });
+        assert_eq!(
+            route.selected_provider_id.as_deref(),
+            Some("openrouter-test")
+        );
+        assert_eq!(route.selected_model_id.as_deref(), Some(model_id.as_str()));
+        let admission = positive_fact.economy_admission.as_ref().unwrap();
+        let commitment = crate::supervisor::RouteSemanticCommitment {
+            provider_id: "openrouter-test".into(),
+            model_id: model_id.clone(),
+            runtime_identity_fingerprint: providers::runtime_identity_fingerprint(
+                &settings.providers[0],
+            )
+            .unwrap(),
+            local_only: false,
+            billing: BillingPolicy::Paid,
+            requires_tools: true,
+            minimum_context_tokens: Some(16_384),
+            authorized_candidates: vec![crate::routing::CandidateRoute {
+                provider_id: "openrouter-test".into(),
+                model_id: model_id.clone(),
+            }],
+            paid_quote: None,
+            economy_endpoint_id: Some(admission.endpoint_id().into()),
+            economy_evidence_digest: Some(admission.evidence_digest().into()),
+        };
+        let restored: crate::supervisor::RouteSemanticCommitment =
+            serde_json::from_slice(&serde_json::to_vec(&commitment).unwrap()).unwrap();
+        assert_eq!(restored, commitment);
+        restored.validate_economy_pin(&positive_fact).unwrap();
+        let mut changed_pin = restored;
+        changed_pin.economy_endpoint_id = Some("poolside/changed-endpoint".into());
+        assert!(changed_pin
+            .validate_economy_pin(&positive_fact)
+            .unwrap_err()
+            .contains("pin changed"));
+
+        let remint_metadata = providers::OpenRouterMetadataObservation {
+            authenticated_for_execution: Some(true),
+            models: vec![catalog_model.clone()],
+            free_model_daily_requests: None,
+        };
+        let remint_zdr = [(model_id.clone(), endpoint.tag.clone())]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let reminted = crate::economy::with_test_admission_evidence(
+            test_evaluation.clone(),
+            &model_id,
+            &endpoint.tag,
+            1_793_059_200_000,
+            || {
+                crate::economy::admit_authenticated_candidate(
+                    "openrouter-test",
+                    &model_id,
+                    "aider",
+                    "0.86.2",
+                    &remint_metadata,
+                    &[endpoint.clone()],
+                    &remint_zdr,
+                    Some(16_384),
+                    Some(4_096),
+                    false,
+                    65_536,
+                    60,
+                    1_793_059_200_000,
+                )
+                .unwrap()
+            },
+        );
+        assert_eq!(
+            reminted.evidence_digest(),
+            admission.evidence_digest(),
+            "task-specific input/output/tools/time envelopes must not change the semantic pin"
+        );
+
+        let mut changed_capacity = endpoint.clone();
+        changed_capacity.max_prompt_tokens = Some(24_576);
+        let capacity_drift = crate::economy::with_test_admission_evidence(
+            test_evaluation.clone(),
+            &model_id,
+            &endpoint.tag,
+            1_793_059_200_000,
+            || {
+                crate::economy::admit_authenticated_candidate(
+                    "openrouter-test",
+                    &model_id,
+                    "aider",
+                    "0.86.2",
+                    &remint_metadata,
+                    &[changed_capacity],
+                    &remint_zdr,
+                    Some(16_384),
+                    Some(4_096),
+                    false,
+                    65_536,
+                    60,
+                    1_793_059_200_000,
+                )
+                .unwrap()
+            },
+        );
+        assert_ne!(
+            capacity_drift.evidence_digest(),
+            admission.evidence_digest()
+        );
+
+        let mut changed_capability = endpoint.clone();
+        changed_capability.supported_parameters = Some(vec!["max_tokens".into()]);
+        let capability_drift = crate::economy::with_test_admission_evidence(
+            test_evaluation.clone(),
+            &model_id,
+            &endpoint.tag,
+            1_793_059_200_000,
+            || {
+                crate::economy::admit_authenticated_candidate(
+                    "openrouter-test",
+                    &model_id,
+                    "aider",
+                    "0.86.2",
+                    &remint_metadata,
+                    &[changed_capability],
+                    &remint_zdr,
+                    Some(16_384),
+                    Some(4_096),
+                    false,
+                    65_536,
+                    60,
+                    1_793_059_200_000,
+                )
+                .unwrap()
+            },
+        );
+        assert_ne!(
+            capability_drift.evidence_digest(),
+            admission.evidence_digest()
+        );
+
+        let privacy_drift = crate::economy::with_test_admission_privacy(
+            test_evaluation.clone(),
+            &model_id,
+            &endpoint.tag,
+            1_793_059_200_000,
+            true,
+            false,
+            true,
+            || {
+                crate::economy::admit_authenticated_candidate(
+                    "openrouter-test",
+                    &model_id,
+                    "aider",
+                    "0.86.2",
+                    &remint_metadata,
+                    &[endpoint.clone()],
+                    &remint_zdr,
+                    Some(16_384),
+                    Some(4_096),
+                    false,
+                    65_536,
+                    60,
+                    1_793_059_200_000,
+                )
+            },
+        );
+        assert!(privacy_drift.is_err(), "privacy drift must fail admission");
+
+        let fact = loaded
+            .candidate_facts(&settings, 1_793_059_200_000, 300_000)
+            .unwrap()
+            .remove(0);
+        assert!(
+            fact.economy_admission.is_none(),
+            "failed 2/3 trusted evaluation must not mint preview proof"
+        );
+
+        let metadata = providers::OpenRouterMetadataObservation {
+            authenticated_for_execution: Some(true),
+            models: vec![catalog_model],
+            free_model_daily_requests: None,
+        };
+        let refusal = crate::economy::admit_authenticated_candidate(
+            "openrouter-test",
+            &model_id,
+            "aider",
+            "0.86.2",
+            &metadata,
+            &[endpoint],
+            &[(model_id.clone(), "poolside/fp4".into())]
+                .into_iter()
+                .collect(),
+            None,
+            None,
+            true,
+            122_880,
+            120,
+            1_793_059_200_000,
+        )
+        .unwrap_err();
+        assert!(refusal.contains("no fresh trusted passing coding evaluation"));
+
+        let mut tampered = loaded;
+        tampered.providers[0].models[0]
+            .economy_metadata
+            .as_mut()
+            .unwrap()
+            .endpoints[0]
+            .tag = "attacker/endpoint".into();
+        tampered = seal_snapshot(&settings, 1_793_059_200_000, tampered.providers).unwrap();
+        let bytes = serde_json::to_vec(&tampered).unwrap();
+        let decoded: ProviderObservationSnapshot = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate(&settings, 1_793_059_200_000).unwrap();
+        let tampered_fact = decoded
+            .candidate_facts(&settings, 1_793_059_200_000, 300_000)
+            .unwrap()
+            .remove(0);
+        assert!(
+            tampered_fact.economy_admission.is_none(),
+            "resealed caller metadata cannot override failed backend evaluation"
+        );
     }
 }

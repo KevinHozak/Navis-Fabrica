@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "policies": [
+    {
+      "modelId": "poolside/laguna-s-2.1:free",
+      "providerSlug": "poolside",
+      "endpointTag": "poolside/fp4",
+      "sourceUrl": "https://openrouter.ai/docs/guides/privacy/provider-logging",
+      "observedAtMs": 1793145600000,
+      "noTraining": true,
+      "noRetention": null,
+      "noContentLogging": null
+    },
+    {
+      "modelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "providerSlug": "nvidia",
+      "endpointTag": "nvidia",
+      "sourceUrl": "https://openrouter.ai/docs/guides/privacy/provider-logging",
+      "observedAtMs": 1793145600000,
+      "noTraining": false,
+      "noRetention": null,
+      "noContentLogging": null
+    },
+    {
+      "modelId": "nvidia/nemotron-3.5-lightning:free",
+      "providerSlug": "nvidia",
+      "endpointTag": "nvidia/nvfp4",
+      "sourceUrl": "https://openrouter.ai/docs/guides/privacy/provider-logging",
+      "observedAtMs": 1793145600000,
+      "noTraining": false,
+      "noRetention": null,
+      "noContentLogging": null
+    }
+  ]
+}

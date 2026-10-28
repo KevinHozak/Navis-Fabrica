@@ -44,6 +44,18 @@ The official provider policy table observed on 2026-10-27 lists Poolside as not 
 
 The user explicitly authorized an exception only for newly created synthetic-code trials on these three endpoints despite unknown retention and possible NVIDIA training. Bounds: three candidates × three tasks; at most three inference requests per task, 8,192 output tokens per request, 120 seconds per task; zero paid API budget; no automatic retries or fallback. This exception does not authorize private repository content, production use, or changed privacy settings for existing jobs. Trial output and logs remain private and are reviewed as untrusted data. No key belongs in prompts, command arguments, settings or persisted telemetry.
 
+## Production admission contract — 2026-10-28 repair
+
+Explicit provider refresh stores normalized catalog and exact endpoint observations. Read-only preview and recommendation rehydrate eligibility from that snapshot, the current runtime identity and core-owned reviewed evidence; they do not probe providers or accept a frontend eligibility flag. Missing or stale observations require another explicit refresh.
+
+The runner commits the selected model, serving endpoint and semantic evidence digest. Dispatch rebuilds admission from authenticated metadata and compares the pin before reserving or starting the provider process. The capped gateway repeats identity, zero-price, context/capability, endpoint and ZDR checks for each call. A caller cannot deserialize the opaque admission or reuse the synthetic training exception as production permission.
+
+Reviewed endpoint policy records live in [the core policy registry](../runner-core/config/economy-endpoint-policies.json). Unknown training, retention or content-logging policy blocks production admission; the current three candidates have no compatible policy proof and all failed the full coding matrix. Local-only repository policy continues to exclude OpenRouter. Manual selectors preserve saved choices while blocking free, zero-priced or router identities that lack current eligibility.
+
+Free requests use a separate call ledger and retain request, token and time caps. Enforced zero-price budget settlement is policy-derived; it is distinct from measured provider token usage and an invoice dollar receipt. Unknown usage keeps its reservation unresolved. No new live evaluation is part of this repair.
+
+ZDR membership is checked through the [documented exact endpoint inventory](https://openrouter.ai/docs/guides/features/zdr). It does not substitute for reviewed endpoint policy. The current documentation also describes broker screening/legal-retention exceptions, so this feature does not promise absolute OpenRouter broker non-retention.
+
 ## Provider controls and limits
 
 Pin the selected exact model and serving provider at admission and every call; reject random or automatic routers, fallback models and mismatched response identity. The gateway must enforce zero price ceilings, request/token/time caps and provider-only routing. Ordinary eligible strict-policy requests require compatible policy evidence and enforced no-collection/ZDR restrictions. The synthetic-only policy exception must remain distinct and auditable.

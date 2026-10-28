@@ -13,9 +13,9 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -121,6 +121,7 @@ pub enum BillingStatus {
     LocalNoApiCharge,
     ProviderManagedUnknown,
     ProviderReported,
+    ZeroCostPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +198,13 @@ pub struct PaidDispatchContext<'a> {
     pub allowed_files: &'a [String],
     pub authenticated_canonical_slug: Option<&'a str>,
     pub economy_trial_task_id: Option<&'a str>,
+    /// Consent is set only by the bounded synthetic trial runner.
+    pub synthetic_trial_consent: bool,
+    /// Opaque fixture proof created by the core's exact fixture verifier.
+    pub synthetic_trial_fixture: Option<&'a crate::economy::VerifiedTrialFixture>,
+    /// Opaque production Economy proof. Synthetic trial consent is a separate
+    /// path and cannot populate this field.
+    pub economy_admission: Option<&'a crate::economy::VerifiedEconomyAdmission>,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -875,12 +883,74 @@ fn run_openrouter_paid(
             && !matches!(
                 &policy.mode,
                 crate::paid_gateway::GatewayMode::SyntheticTrial { .. }
+                    | crate::paid_gateway::GatewayMode::Economy { .. }
             ))
     {
         return Err(RuntimeError::new(
             "PAID_POLICY_MISMATCH",
             "The paid model policy does not match the selected provider, model, runtime, or zero-fee requirement.",
         ));
+    }
+    if matches!(
+        &policy.mode,
+        crate::paid_gateway::GatewayMode::Economy { .. }
+    ) {
+        let Some(admission) = paid.economy_admission else {
+            return Err(RuntimeError::new(
+                "ECONOMY_ADMISSION_REQUIRED",
+                "A backend verified Economy admission is required before runtime setup.",
+            ));
+        };
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        if admission
+            .validate_pinned_policy(&profile.id, policy, current_time_ms)
+            .is_err()
+            || admission.model_id() != model_id
+            || request.timeout_seconds > admission.max_seconds()
+        {
+            return Err(RuntimeError::new(
+                "ECONOMY_ADMISSION_INVALID",
+                "The backend Economy proof or its task time ceiling no longer matches the selected route.",
+            ));
+        }
+    } else if paid.economy_admission.is_some() {
+        return Err(RuntimeError::new(
+            "ECONOMY_ADMISSION_INVALID",
+            "An Economy proof cannot be used by a Paid or synthetic trial policy.",
+        ));
+    }
+    match &policy.mode {
+        crate::paid_gateway::GatewayMode::SyntheticTrial { allow_training, .. } => {
+            if !paid.synthetic_trial_consent
+                || !*allow_training
+                || paid.economy_trial_task_id.is_none()
+                || paid.synthetic_trial_fixture.is_none_or(|fixture| {
+                    !fixture.matches_trial_pair(
+                        model_id,
+                        paid.economy_trial_task_id.unwrap_or_default(),
+                    ) || fixture.root != cwd
+                })
+            {
+                return Err(RuntimeError::new(
+                    "ECONOMY_TRIAL_CONSENT_REQUIRED",
+                    "Synthetic trial mode requires an exact fixture task and explicit trial consent.",
+                ));
+            }
+        }
+        _ if paid.synthetic_trial_consent
+            || paid.economy_trial_task_id.is_some()
+            || paid.synthetic_trial_fixture.is_some() =>
+        {
+            return Err(RuntimeError::new(
+                "ECONOMY_TRIAL_MODE_MISMATCH",
+                "Synthetic trial context cannot be used with Paid or Economy mode.",
+            ));
+        }
+        _ => {}
     }
     // Aider 0.86.2 automatically reads configuration and dotenv files from its
     // home, git root, and current directory. Reject those sources before even
@@ -894,6 +964,16 @@ fn run_openrouter_paid(
                 "The synthetic trial workspace changed or contains unapproved content.",
             )
         })?;
+        if paid.synthetic_trial_fixture.is_none_or(|proof| {
+            proof.seed_inventory_fingerprint != verified.seed_inventory_fingerprint
+                || proof.fixture_set_sha256 != verified.fixture_set_sha256
+                || !proof.matches_trial_pair(model_id, task_id)
+        }) {
+            return Err(RuntimeError::new(
+                "ECONOMY_FIXTURE_CHANGED",
+                "Synthetic trial fixture proof is missing or no longer matches the approved seed.",
+            ));
+        }
         let expected = verified
             .task
             .seed_files
@@ -1058,6 +1138,9 @@ fn run_openrouter_paid(
             parent_reservation_id: paid.parent_reservation_id.into(),
             policy: policy.clone(),
             authenticated_canonical_slug: paid.authenticated_canonical_slug.map(str::to_owned),
+            economy_admission: paid.economy_admission.cloned(),
+            synthetic_trial_consent: paid.synthetic_trial_consent,
+            synthetic_trial_fixture: paid.synthetic_trial_fixture.cloned(),
             request_timeout: require_time()?.min(Duration::from_secs(300)),
             dispatch_deadline: runtime_started + requested_timeout,
             cancel: paid.cancel.clone(),
@@ -1123,7 +1206,16 @@ fn run_openrouter_paid(
                 let control = sink.borrow_mut().on_event(RuntimeEvent {
                     kind: RuntimeEventKind::ProcessStarted,
                     stream: None,
-                    text: "Paid provider process started behind the capped local gateway.".into(),
+                    text: if matches!(
+                        &policy.mode,
+                        crate::paid_gateway::GatewayMode::Economy { .. }
+                            | crate::paid_gateway::GatewayMode::SyntheticTrial { .. }
+                    ) {
+                        "OpenRouter provider process started behind the capped local gateway."
+                            .into()
+                    } else {
+                        "Paid provider process started behind the capped local gateway.".into()
+                    },
                     process: Some(identity),
                 });
                 if matches!(
@@ -1223,8 +1315,35 @@ fn run_openrouter_paid(
         policy_refusal,
         &diagnostic_tail,
     );
+    let zero_cost_policy = matches!(
+        &policy.mode,
+        crate::paid_gateway::GatewayMode::Economy { .. }
+            | crate::paid_gateway::GatewayMode::SyntheticTrial { .. }
+    );
     let message = if let Some(refusal) = policy_refusal {
         refusal.message()
+    } else if zero_cost_policy {
+        match state {
+            RuntimeState::Completed => "OpenRouter provider process completed successfully.",
+            RuntimeState::Cancelled => "OpenRouter provider process was cancelled.",
+            RuntimeState::TimedOut => {
+                "OpenRouter provider process exceeded its configured deadline."
+            }
+            RuntimeState::NeedsInput => {
+                "OpenRouter provider run needs reconciliation before continuing."
+            }
+            RuntimeState::Failed if result.output_incomplete => {
+                "OpenRouter provider output ended without confirmed pipe completion."
+            }
+            RuntimeState::AuthenticationRequired => {
+                "OpenRouter authentication is required or expired."
+            }
+            RuntimeState::RateLimited => "OpenRouter rate limit was reached.",
+            RuntimeState::UnsupportedModel => {
+                "The selected OpenRouter model is not supported by Aider."
+            }
+            _ => "OpenRouter provider process failed.",
+        }
     } else {
         match state {
             RuntimeState::Completed => "Paid provider process completed successfully.",
@@ -1246,6 +1365,15 @@ fn run_openrouter_paid(
     };
     let mut result = outcome(state, profile, model_id.into(), code, elapsed, message);
     result.usage = match gateway.usage_totals() {
+        Some((tokens, _cost_micros)) if zero_cost_policy => RuntimeUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: Some(tokens),
+            cost_usd: None,
+            source: Some("openrouter-free-ledger-token-usage".into()),
+            confidence: Some("provider-reported-token-usage".into()),
+            billing: BillingStatus::ZeroCostPolicy,
+        },
         Some((tokens, cost_micros)) => RuntimeUsage {
             input_tokens: None,
             output_tokens: None,
@@ -3706,12 +3834,10 @@ mod review_adapter_tests {
             message["params"]["config"]["tools"]["web_search"]["enabled"],
             false
         );
-        assert!(
-            message["params"]["config"]["mcp_servers"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(message["params"]["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .is_empty());
         let turn = providers::app_server_turn_start_with_output_schema(
             2,
             "review-thread",
@@ -3736,12 +3862,10 @@ mod review_adapter_tests {
             turn["params"]["config"]["tools"]["web_search"]["enabled"],
             false
         );
-        assert!(
-            turn["params"]["config"]["mcp_servers"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(turn["params"]["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .is_empty());
         let implementation = codex_thread_start(1, "C:/Projects/sample", "model", false);
         assert_eq!(implementation["params"]["sandbox"], "workspace-write");
     }
@@ -4078,11 +4202,9 @@ mod tests {
             PathBuf::from(&resolved[1]),
             worktree.canonicalize().unwrap().join("generated/nested.rs")
         );
-        assert!(
-            resolved
-                .iter()
-                .all(|path| Path::new(path).starts_with(worktree.canonicalize().unwrap()))
-        );
+        assert!(resolved
+            .iter()
+            .all(|path| Path::new(path).starts_with(worktree.canonicalize().unwrap())));
     }
 
     #[test]
@@ -4093,13 +4215,11 @@ mod tests {
         for allowed in [
             Vec::new(),
             vec!["../outside.rs".to_string()],
-            vec![
-                folder
-                    .path()
-                    .join("outside.rs")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
+            vec![folder
+                .path()
+                .join("outside.rs")
+                .to_string_lossy()
+                .into_owned()],
         ] {
             let error = resolve_paid_aider_source_files(&worktree, &allowed).unwrap_err();
             assert_eq!(error.code, "PAID_ALLOWED_FILES_INVALID");
@@ -4817,11 +4937,10 @@ while ($line = [Console]::In.ReadLine()) {
         let result = run(&settings, &request, &cancel, &mut sink).unwrap();
 
         assert_eq!(result.state, RuntimeState::Completed);
-        assert!(
-            sink.0
-                .iter()
-                .any(|event| event.kind == RuntimeEventKind::ApprovalRequest)
-        );
+        assert!(sink
+            .0
+            .iter()
+            .any(|event| event.kind == RuntimeEventKind::ApprovalRequest));
     }
 
     #[test]
@@ -4951,11 +5070,10 @@ while ($line = [Console]::In.ReadLine()) {
             let mut sink = RecordingSink::default();
             let result = run(&settings, &request, &cancel, &mut sink).unwrap();
             assert_eq!(result.state, RuntimeState::Completed, "{}", kind.label());
-            assert!(
-                sink.0
-                    .iter()
-                    .any(|event| event.text.contains("synthetic agent output"))
-            );
+            assert!(sink
+                .0
+                .iter()
+                .any(|event| event.text.contains("synthetic agent output")));
             if kind == ProviderKind::Ollama {
                 assert_eq!(result.usage.cost_usd, Some(0.0));
                 assert_eq!(result.usage.billing, BillingStatus::LocalNoApiCharge);

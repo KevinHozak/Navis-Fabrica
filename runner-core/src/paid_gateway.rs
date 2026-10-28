@@ -11,11 +11,11 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -91,6 +91,11 @@ pub struct PaidGatewayConfig {
     /// Ephemeral alias learned from authenticated provider metadata during
     /// this synthetic trial admission; never deserialized or persisted as policy.
     pub authenticated_canonical_slug: Option<String>,
+    /// Opaque backend admission for ordinary Economy calls. Synthetic trials
+    /// intentionally use only their separate consent and fixture proof.
+    pub economy_admission: Option<crate::economy::VerifiedEconomyAdmission>,
+    pub synthetic_trial_consent: bool,
+    pub synthetic_trial_fixture: Option<crate::economy::VerifiedTrialFixture>,
     pub request_timeout: Duration,
     /// Monotonic deadline for the parent runtime, shared with admission checks.
     pub dispatch_deadline: Instant,
@@ -174,7 +179,10 @@ pub struct PaidGateway {
 impl PaidGateway {
     /// Bind the local server with a closed dispatch gate. The caller must first
     /// durably record ProcessStarted and mark the parent reservation dispatched.
-    pub fn bind(config: PaidGatewayConfig, budgets: BudgetStore) -> Result<Self, PaidGatewayError> {
+    pub(crate) fn bind(
+        config: PaidGatewayConfig,
+        budgets: BudgetStore,
+    ) -> Result<Self, PaidGatewayError> {
         Self::bind_to_upstream(
             config,
             budgets,
@@ -402,6 +410,68 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
         return Err(PaidGatewayError::Invalid(
             "router identities and free model variants cannot use the paid gateway",
         ));
+    }
+    match &p.mode {
+        GatewayMode::Economy { .. } => {
+            let Some(admission) = config.economy_admission.as_ref() else {
+                return Err(PaidGatewayError::Invalid(
+                    "backend Economy admission is missing",
+                ));
+            };
+            admission
+                .validate_pinned_policy(&p.provider_id, p, now_ms())
+                .map_err(|_| {
+                    PaidGatewayError::Invalid("backend Economy admission is stale or mismatched")
+                })?;
+            if config.request_timeout > Duration::from_secs(admission.max_seconds())
+                || config
+                    .dispatch_deadline
+                    .saturating_duration_since(Instant::now())
+                    > Duration::from_secs(admission.max_seconds())
+            {
+                return Err(PaidGatewayError::Invalid(
+                    "Economy dispatch exceeds the backend time ceiling",
+                ));
+            }
+            if config.authenticated_canonical_slug.as_deref() != Some(admission.canonical_slug()) {
+                return Err(PaidGatewayError::Invalid(
+                    "authenticated canonical model identity changed",
+                ));
+            }
+        }
+        GatewayMode::Paid | GatewayMode::SyntheticTrial { .. }
+            if config.economy_admission.is_some() =>
+        {
+            return Err(PaidGatewayError::Invalid(
+                "Economy admission cannot authorize this gateway mode",
+            ));
+        }
+        _ => {}
+    }
+    match &p.mode {
+        GatewayMode::SyntheticTrial { allow_training, .. } => {
+            let Some(fixture) = config.synthetic_trial_fixture.as_ref() else {
+                return Err(PaidGatewayError::Invalid(
+                    "synthetic trial fixture proof is missing",
+                ));
+            };
+            if !config.synthetic_trial_consent
+                || !allow_training
+                || !fixture.matches_trial_pair(&p.model_id, &fixture.task.id)
+            {
+                return Err(PaidGatewayError::Invalid(
+                    "synthetic trial consent or fixture binding is invalid",
+                ));
+            }
+        }
+        GatewayMode::Paid | GatewayMode::Economy { .. }
+            if config.synthetic_trial_consent || config.synthetic_trial_fixture.is_some() =>
+        {
+            return Err(PaidGatewayError::Invalid(
+                "synthetic trial context cannot authorize this gateway mode",
+            ));
+        }
+        _ => {}
     }
     if matches!(&p.mode, GatewayMode::SyntheticTrial { .. })
         && config
@@ -994,7 +1064,20 @@ fn refresh_free_endpoint(shared: &Shared) -> bool {
     let policy = &shared.config.policy;
     let (endpoint_id, require_zdr, expected_canonical) = match &policy.mode {
         GatewayMode::Paid => return true,
-        GatewayMode::Economy { endpoint_id } => (endpoint_id, true, None),
+        GatewayMode::Economy { endpoint_id } => {
+            let Some(admission) = shared.config.economy_admission.as_ref() else {
+                return false;
+            };
+            if admission
+                .validate_pinned_policy(&policy.provider_id, policy, now_ms())
+                .is_err()
+                || admission.endpoint_id() != endpoint_id
+                || admission.model_id() != policy.model_id
+            {
+                return false;
+            }
+            (endpoint_id, true, Some(admission.canonical_slug()))
+        }
         GatewayMode::SyntheticTrial {
             endpoint_id,
             allow_training,
@@ -1045,9 +1128,16 @@ fn refresh_free_endpoint(shared: &Shared) -> bool {
         .and_then(providers::openrouter_price_micros_per_million);
     if current_input != Some(0)
         || current_output != Some(0)
-        || model
-            .context_length
-            .is_none_or(|context| context < policy.model_context_window_tokens)
+        || model.context_length.is_none_or(|context| {
+            let required = if matches!(&policy.mode, GatewayMode::Economy { .. }) {
+                policy
+                    .model_context_window_tokens
+                    .saturating_add(policy.max_output_tokens_per_call)
+            } else {
+                policy.model_context_window_tokens
+            };
+            context < required
+        })
         || expected_canonical
             .is_some_and(|expected| model.canonical_slug.as_deref() != Some(expected))
     {
@@ -1060,17 +1150,98 @@ fn refresh_free_endpoint(shared: &Shared) -> bool {
     if endpoint_remaining.is_zero() {
         return false;
     }
-    providers::validate_openrouter_free_endpoint(
-        &shared.config.upstream_api_key,
-        &policy.model_id,
-        endpoint_id,
-        policy.model_context_window_tokens,
-        require_zdr,
-        endpoint_remaining
+    let timeout = endpoint_remaining
+        .min(shared.config.request_timeout)
+        .min(Duration::from_secs(10));
+    if matches!(&policy.mode, GatewayMode::Economy { .. }) {
+        let Some(admission) = shared.config.economy_admission.as_ref() else {
+            return false;
+        };
+        let Ok(endpoints) = providers::openrouter_endpoints_http_probe_with_timeout(
+            &shared.config.upstream_api_key,
+            &policy.model_id,
+            timeout,
+        ) else {
+            return false;
+        };
+        let remaining_zdr = shared
+            .config
+            .dispatch_deadline
+            .saturating_duration_since(Instant::now())
             .min(shared.config.request_timeout)
-            .min(Duration::from_secs(10)),
-    )
-    .is_ok_and(|eligible| eligible)
+            .min(Duration::from_secs(10));
+        if remaining_zdr.is_zero() {
+            return false;
+        }
+        let Ok(zdr) = providers::openrouter_zdr_endpoints_http_probe_with_timeout(
+            &shared.config.upstream_api_key,
+            remaining_zdr,
+        ) else {
+            return false;
+        };
+        let required_context = policy
+            .model_context_window_tokens
+            .saturating_add(policy.max_output_tokens_per_call);
+        let matches = endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.model_id == policy.model_id
+                    && endpoint.tag == *endpoint_id
+                    && endpoint.status == Some(0)
+                    && endpoint.zdr != Some(false)
+                    && endpoint
+                        .context_length
+                        .is_some_and(|context| context >= required_context)
+                    && endpoint
+                        .max_prompt_tokens
+                        .is_some_and(|tokens| tokens >= policy.model_context_window_tokens)
+                    && endpoint
+                        .max_completion_tokens
+                        .is_some_and(|tokens| tokens >= policy.max_output_tokens_per_call)
+                    && endpoint
+                        .prompt_price
+                        .as_deref()
+                        .and_then(providers::openrouter_price_micros_per_million)
+                        == Some(0)
+                    && endpoint
+                        .completion_price
+                        .as_deref()
+                        .and_then(providers::openrouter_price_micros_per_million)
+                        == Some(0)
+                    && endpoint
+                        .request_price
+                        .as_deref()
+                        .and_then(providers::openrouter_price_micros_per_million)
+                        == Some(0)
+                    && endpoint
+                        .supported_parameters
+                        .as_ref()
+                        .is_some_and(|values| values.iter().any(|value| value == "max_tokens"))
+                    && (!admission.requires_tools()
+                        || endpoint
+                            .supported_parameters
+                            .as_ref()
+                            .is_some_and(|values| {
+                                values
+                                    .iter()
+                                    .any(|value| matches!(value.as_str(), "tools" | "tool_choice"))
+                            }))
+                    && zdr.contains(&(policy.model_id.clone(), endpoint.tag.clone()))
+                    && endpoint.tag.split('/').next() == Some(admission.provider_slug())
+            })
+            .count();
+        matches == 1
+    } else {
+        providers::validate_openrouter_free_endpoint(
+            &shared.config.upstream_api_key,
+            &policy.model_id,
+            endpoint_id,
+            policy.model_context_window_tokens,
+            require_zdr,
+            timeout,
+        )
+        .is_ok_and(|eligible| eligible)
+    }
 }
 
 fn sha256_prefix(bytes: &[u8]) -> String {
@@ -1393,6 +1564,9 @@ mod tests {
             parent_reservation_id: parent_id,
             policy: policy(now),
             authenticated_canonical_slug: None,
+            economy_admission: None,
+            synthetic_trial_consent: false,
+            synthetic_trial_fixture: None,
             request_timeout: Duration::from_secs(5),
             dispatch_deadline: Instant::now() + Duration::from_secs(60),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1577,6 +1751,9 @@ mod tests {
                 parent_reservation_id: parent_id.clone(),
                 policy: policy(priced_at),
                 authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1645,6 +1822,9 @@ mod tests {
                     parent_reservation_id: parent_id.clone(),
                     policy: policy(priced_at),
                     authenticated_canonical_slug: None,
+                    economy_admission: None,
+                    synthetic_trial_consent: false,
+                    synthetic_trial_fixture: None,
                     request_timeout: Duration::from_secs(10),
                     dispatch_deadline: deadline,
                     cancel,
@@ -1665,12 +1845,10 @@ mod tests {
                 .send()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(
-                budgets
-                    .paid_calls_for_parent(&parent_id)
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(budgets
+                .paid_calls_for_parent(&parent_id)
+                .unwrap()
+                .is_empty());
             gateway.stop();
         }
     }
@@ -1690,6 +1868,9 @@ mod tests {
                     parent_reservation_id: parent_id.clone(),
                     policy: policy(priced_at),
                     authenticated_canonical_slug: None,
+                    economy_admission: None,
+                    synthetic_trial_consent: false,
+                    synthetic_trial_fixture: None,
                     request_timeout: Duration::from_secs(10),
                     dispatch_deadline,
                     cancel: cancel.clone(),
@@ -1729,12 +1910,10 @@ mod tests {
                 .send()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(
-                budgets
-                    .paid_calls_for_parent(&parent_id)
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(budgets
+                .paid_calls_for_parent(&parent_id)
+                .unwrap()
+                .is_empty());
             gateway.stop();
         }
     }
@@ -1765,6 +1944,9 @@ mod tests {
             parent_reservation_id: parent_id,
             policy: p,
             authenticated_canonical_slug: None,
+            economy_admission: None,
+            synthetic_trial_consent: false,
+            synthetic_trial_fixture: None,
             request_timeout: Duration::from_secs(10),
             dispatch_deadline: Instant::now() + Duration::from_secs(60),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1816,6 +1998,9 @@ mod tests {
                 parent_reservation_id: parent_id.clone(),
                 policy: policy(priced_at),
                 authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1875,6 +2060,9 @@ mod tests {
                 parent_reservation_id: parent_id.clone(),
                 policy: policy(priced_at),
                 authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1912,8 +2100,8 @@ mod tests {
     #[test]
     fn paid_call_cap_refusal_cancels_retrying_child_and_preserves_settled_usage() {
         use crate::process::{self, ProcessControl};
-        use std::sync::Mutex;
         use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
 
         let (_dir, budgets, parent_id, priced_at) = budget_store();
         let response_body = json!({
@@ -1932,6 +2120,9 @@ mod tests {
                 parent_reservation_id: parent_id.clone(),
                 policy: capped_policy,
                 authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2074,6 +2265,9 @@ try {
                 parent_reservation_id: parent_id.clone(),
                 policy: smoke_policy,
                 authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
                 request_timeout: Duration::from_secs(30),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2538,6 +2732,9 @@ try {
                 parent_reservation_id: parent_id.clone(),
                 policy: smoke_policy,
                 authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
                 request_timeout: Duration::from_secs(30),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2720,11 +2917,9 @@ try {
         assert!(!project.join(".aider.tags.cache.v4").exists());
         let paid_calls = budgets.paid_calls_for_parent(&parent_id).unwrap();
         assert_eq!(paid_calls.len(), sent_requests.len());
-        assert!(
-            paid_calls
-                .iter()
-                .all(|call| call.state == PaidCallState::Settled)
-        );
+        assert!(paid_calls
+            .iter()
+            .all(|call| call.state == PaidCallState::Settled));
         assert_eq!(
             gateway.usage_totals(),
             Some((

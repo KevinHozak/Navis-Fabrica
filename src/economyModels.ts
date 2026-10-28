@@ -14,6 +14,11 @@ export type EconomyModelStatus = {
   evaluationPassed: number;
   evaluationCases: number;
   evaluationReasonCodes: string[];
+  catalogPresent: boolean;
+  catalogFresh: boolean;
+  currentZeroPriced: boolean;
+  currentContextTokens: number | null;
+  capabilityReason: string | null;
   privacyStatus: "eligible" | "unknown" | "incompatible";
   privacySource: string | null;
   privacyObservedAtMs: number | null;
@@ -40,5 +45,7 @@ export async function getEconomyModelStatuses(providerId: string): Promise<Econo
 }
 
 export function formatEconomyEvidenceDate(value: number | null): string {
-  return value === null ? "not recorded" : new Date(value).toLocaleDateString();
+  if (value === null || !Number.isFinite(value)) return "not recorded";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "not recorded" : date.toISOString().slice(0, 10);
 }

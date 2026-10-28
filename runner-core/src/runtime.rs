@@ -1780,7 +1780,7 @@ fn isolated_aider_environment_with_build_output(
     env
 }
 
-fn resolve_aider_executable(executable: &str) -> Result<PathBuf, RuntimeError> {
+pub(crate) fn resolve_aider_executable(executable: &str) -> Result<PathBuf, RuntimeError> {
     let configured = Path::new(executable);
     let direct = configured.is_absolute() || configured.components().count() > 1;
     let found = if direct {
@@ -1820,7 +1820,7 @@ fn resolve_aider_executable(executable: &str) -> Result<PathBuf, RuntimeError> {
     })
 }
 
-fn resolve_aider_python(aider: &Path) -> Result<PathBuf, RuntimeError> {
+pub(crate) fn resolve_aider_python(aider: &Path) -> Result<PathBuf, RuntimeError> {
     let aider = aider.canonicalize().map_err(|_| {
         RuntimeError::new(
             "AIDER_PYTHON_UNAVAILABLE",
@@ -1989,6 +1989,7 @@ fn verify_aider_guard(
         .map(Path::new)
         .and_then(|p| p.canonicalize().ok());
     if facts.get("ok").and_then(Value::as_bool) != Some(true)
+        || facts.get("unicodeOutputProbe").and_then(Value::as_str) != Some("U+25BA ►")
         || string("distribution") != Some("aider-chat")
         || string("expectedVersion") != Some("0.86.2")
         || string("version") != Some("0.86.2")
@@ -4508,6 +4509,69 @@ mod tests {
             verify_aider_guard(Path::new(&normal), &files, None, timeout)
                 .expect("the same adjacent interpreter must pass with its ordinary Windows path");
         }
+    }
+
+    #[test]
+    #[ignore = "requires FABRICA_AIDER_SMOKE_EXE; launches only the isolated Aider guard probe after forcing CP1252 streams"]
+    fn actual_paid_aider_guard_reconfigures_cp1252_stdout_and_stderr_to_utf8() {
+        let executable = std::env::var_os("FABRICA_AIDER_SMOKE_EXE")
+            .expect("root must provide the installed Aider executable");
+        let aider = resolve_aider_executable(&executable.to_string_lossy()).unwrap();
+        let python = resolve_aider_python(&aider).unwrap();
+        let policy = PaidModelPolicy {
+            mode: crate::paid_gateway::GatewayMode::Paid,
+            provider_id: "openrouter".into(),
+            model_id: "vendor/model".into(),
+            runtime_id: "aider".into(),
+            model_context_window_tokens: 4096,
+            max_output_tokens_per_call: 512,
+            max_calls: 1,
+            max_cost_micros: 500,
+            pricing: crate::paid_gateway::PaidPricingCeiling {
+                input_price_micros_per_1m: 1,
+                output_price_micros_per_1m: 1,
+                request_fee_micros: 0,
+                source: "diagnostic-only".into(),
+                observed_at_ms: 1,
+            },
+            endpoint_pin: None,
+            model_catalog_pricing: None,
+        };
+        let files = prepare_paid_aider_files("probe only", &policy, &["C:/synthetic/source.rs".into()]).unwrap();
+        let environment = isolated_aider_environment(
+            &files,
+            "http://127.0.0.1:1/v1",
+            "fabrica-dummy",
+        )
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect::<Vec<_>>();
+        let script = concat!(
+            "import runpy,sys;",
+            "sys.stdout.reconfigure(encoding='cp1252');",
+            "sys.stderr.reconfigure(encoding='cp1252');",
+            "path=sys.argv[1];sys.argv=[path,'--probe'];",
+            "runpy.run_path(path,run_name='__main__')"
+        );
+        let output = process::capture_with_environment(
+            &python,
+            &[
+                "-I".into(),
+                "-c".into(),
+                script.into(),
+                files.guard_path.clone(),
+            ],
+            Path::new(&files.profile_path),
+            Duration::from_secs(15),
+            16 * 1024,
+            Some(&environment),
+        )
+        .unwrap();
+        assert!(!output.timed_out && !output.truncated);
+        assert_eq!(output.status.and_then(|status| status.code()), Some(0));
+        let marker = b"U+25BA \xE2\x96\xBA";
+        assert!(output.stdout.windows(marker.len()).any(|window| window == marker));
+        assert!(output.stderr.windows(marker.len()).any(|window| window == marker));
     }
     #[test]
     fn paid_aider_environment_contains_only_isolated_profile_and_dummy_gateway_secret() {

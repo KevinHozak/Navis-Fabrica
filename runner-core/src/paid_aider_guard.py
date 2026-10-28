@@ -12,6 +12,19 @@ import stat
 import sys
 from typing import Iterable
 
+
+def _configure_utf8_output() -> None:
+    # Python -I intentionally ignores PYTHONIOENCODING/PYTHONUTF8. Reconfigure
+    # the actual inherited pipe streams before importing Aider or Rich, whose
+    # console objects cache the stream encoding during import.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
+_configure_utf8_output()
+
 EXPECTED_DISTRIBUTION = "aider-chat"
 EXPECTED_VERSION = "0.86.2"
 MAX_ALLOWED_FILES = 128
@@ -105,7 +118,9 @@ def _install_facts() -> dict[str, object]:
 
 def _emit_probe() -> int:
     facts = _install_facts()
+    facts["unicodeOutputProbe"] = "U+25BA ►"
     sys.stdout.write(json.dumps(facts, ensure_ascii=False, sort_keys=True) + "\n")
+    sys.stderr.write("U+25BA ►\n")
     return 0 if facts.get("ok") is True else 2
 
 

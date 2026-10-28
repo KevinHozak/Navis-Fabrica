@@ -1,6 +1,6 @@
 [package]
 name = "navis-fabrica"
-version = "1.0.25"
+version = "1.0.26"
 description = "Navis-Fabrica desktop workshop"
 edition = "2021"
 

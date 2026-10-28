@@ -2609,7 +2609,7 @@ try {
             "object": "chat.completion",
             "created": 1,
             "model": "vendor/model-a",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Compatibility smoke complete — résumé: café 🛠."}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Compatibility smoke complete — observed FABRICA_TASK_FILE_WITNESS_7c91e2. résumé: café 🛠 ►.\n\nweb/theme.css\n```css\n<<<<<<< SEARCH\n/* synthetic admitted source */\n=======\n/* synthetic admitted source ► */\n>>>>>>> REPLACE\n```"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16, "cost": 0.00005}
         });
         let (upstream_url, captured, upstream_worker) =
@@ -2673,7 +2673,7 @@ try {
         };
         let prompt = write(
             "prompt.md",
-            b"Read the provided source file and include its marker in your reply. Do not edit files.\n",
+            b"Read the source files. Edit web/theme.css by changing the exact comment `/* synthetic admitted source */` to `/* synthetic admitted source \xe2\x96\xba */`. Include the source witness marker in your reply.\n",
         );
         let metadata = write(
             "model-metadata.json",
@@ -2736,10 +2736,29 @@ try {
             None,
             &allowed_source_paths,
         );
-        args.extend(["--chat-mode".into(), "ask".into()]);
-        let mut command = Command::new(executable);
+        let aider = crate::runtime::resolve_aider_executable(&executable.to_string_lossy())
+            .expect("resolve the isolated Aider executable");
+        let python = crate::runtime::resolve_aider_python(&aider)
+            .expect("resolve the adjacent isolated Aider Python");
+        let guard_path = scratch.path().join("paid_aider_guard.py");
+        std::fs::write(&guard_path, include_str!("paid_aider_guard.py")).unwrap();
+        let allowlist_path = scratch.path().join("allowed-files.json");
+        std::fs::write(
+            &allowlist_path,
+            serde_json::to_vec(&allowed_source_paths).unwrap(),
+        )
+        .unwrap();
+        let (guarded_python, guarded_args) = crate::runtime::guarded_aider_invocation(
+            &python,
+            &guard_path,
+            &project,
+            &allowlist_path,
+            &args,
+        )
+        .expect("construct the production guarded Aider invocation");
+        let mut command = Command::new(guarded_python);
         command
-            .args(args)
+            .args(guarded_args)
             .current_dir(&project)
             .env_clear()
             .stdin(Stdio::null())
@@ -2765,8 +2784,8 @@ try {
             .env("LOCALAPPDATA", &local_appdata)
             .env("XDG_CONFIG_HOME", &profile)
             .env("PYTHONNOUSERSITE", "1")
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "cp1252")
+            .env("PYTHONUTF8", "0")
             .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
             .env("OPENAI_API_BASE", gateway.base_url())
             .env("OPENAI_API_KEY", gateway.child_token())
@@ -2812,6 +2831,19 @@ try {
             stdout,
             stderr
         );
+        assert!(
+            format!("{stdout}\n{stderr}").contains('►'),
+            "Aider/Rich lost the U+25BA output under a CP1252 parent environment: {} {}",
+            stdout,
+            stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("web/theme.css"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "/* synthetic admitted source ► */\n",
+            "guarded Aider did not apply the expected Unicode fixture edit"
+        );
         let sent = captured
             .recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|error| {
@@ -2840,10 +2872,10 @@ try {
             .output()
             .expect("inspect synthetic source repo status");
         assert!(status.status.success());
-        assert!(
-            status.stdout.is_empty(),
-            "paid file-scoped Aider left unexpected source or cache artifacts: {}",
-            String::from_utf8_lossy(&status.stdout)
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout).lines().collect::<Vec<_>>(),
+            vec![" M web/theme.css"],
+            "paid file-scoped Aider must change only the admitted Unicode fixture"
         );
         assert_eq!(budgets.paid_calls_for_parent(&parent_id).unwrap().len(), 1);
         assert_eq!(gateway.usage_totals(), Some((16, 50)));

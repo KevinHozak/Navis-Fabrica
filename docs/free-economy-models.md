@@ -95,3 +95,20 @@ The durable paid-call ledger records zero calls, zero tokens, zero cost, and zer
 A fresh approved run made one Qwen call for the small-bugfix task: 2,322 tokens and $0.000457 accounted cost. Its two host checks failed because the output changed case and did not collapse repeated spaces. The implementation prompt contained only generic acceptance text and did not include the issue requirements, so this result is inconclusive about Qwen's coding capability and is not a valid model-quality score. No verified coding task succeeded; cost per verified success is undefined.
 
 The other two tasks remained at `reconciliation_required` and were blocked before inference because the dispatch guard could not verify source-audited Aider 0.86.2. A later metadata-only probe observed Aider 0.86.2 (exit 0, 7.249 seconds), but the earlier guard did not retain enough detail to identify why verification failed. All three authorized attempts are consumed; no whole-task retries are authorized. The settled ledger has no unresolved usage, and the original attempt evidence remains preserved. No model is qualified, and further trials require new explicit authorization.
+
+## Qwen pilot corrected run — 2026-10-28
+
+The corrected run passed the full stored issue snapshot and complete task acceptance requirements to Aider. The version guard now allows up to 30 seconds for isolated startup, capped by the same task's remaining 120-second deadline, and still requires exact Aider 0.86.2 output. All three Aider starts passed the guard; no fallback, retry, or output repair was used.
+
+| Synthetic task | Calls | Tokens | Accounted API cost | Runner-accounted execution (not API latency) | Behavioral result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Small bugfix | 1 | 2,265 | $0.000315 | 93 s | Passed both host checks |
+| Implementation | 1 | 2,448 | $0.000426 | 23 s | Failed: `parse_positive_limit("0")` returned `0` instead of raising `ValueError` |
+| Multifile edit | 1 | 2,651 | $0.000450 | 25 s | Failed: em-dash handling produced `42cafe` instead of `42-cafe` |
+| **Total** | **3** | **7,364** | **$0.001191** | **141 s** | **1 of 3 tasks passed** |
+
+The batch wall duration was 196.861 seconds. The table reports runner-accounted task execution time; API latency was not retained.
+
+The corrected run's accounted API cost per verified task was $0.001191. Including the earlier inconclusive $0.000457 call, cumulative accounted API cost per verified task is $0.001648. Subscription review cost was not measured. The earlier call is excluded from model-quality scoring because its prompt omitted issue requirements.
+
+The corrected source change was published as `0e3bdbf` (version 1.0.24); all seven declared checks passed, including 345 unit tests, 7 integration tests, 7 helper tests, and the exact-version source probe. Qwen has one valid verified task out of three and is **not qualified**. The pilot is complete; no further live calls, retries, fallbacks, or output repairs are authorized by this run.

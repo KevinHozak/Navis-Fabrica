@@ -40,7 +40,7 @@ const REVIEWED_ENDPOINT_POLICIES_SHA256: &str =
 const REVIEWED_PAID_ENDPOINT_POLICIES_JSON: &[u8] =
     include_bytes!("../config/paid-endpoint-policies.json");
 const REVIEWED_PAID_ENDPOINT_POLICIES_SHA256: &str =
-    "b6ffb294af8897ca2f61bdd0f00b05c7cf563075e130f9303f6f8dd86687d4ca";
+    "589907505d3d2b4eae2a45dd20b0f6e3bafaa27707e2d7aca15e9863bb91b90a";
 const PAID_ENDPOINT_POLICY_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 fn paid_endpoint_policy_digest(bytes: &[u8]) -> String {
@@ -498,6 +498,7 @@ pub fn execute_trial(arguments: TrialRunArguments<'_>) -> TrialReceipt {
             max_cost_micros: 0,
             pricing: pricing.clone(),
             endpoint_pin: None,
+            model_catalog_pricing: None,
         };
         let max_seconds = registry.limits.max_seconds_per_task;
         let budget_policy = crate::budgets::BudgetPolicy {
@@ -1154,6 +1155,47 @@ pub(crate) fn reviewed_paid_endpoint_policy_matches(
             && policy.observed_at_ms <= now_ms
             && now_ms.saturating_sub(policy.observed_at_ms) <= PAID_ENDPOINT_POLICY_MAX_AGE_MS
     })
+}
+
+/// Returns only model/endpoint identities whose full reviewed privacy record
+/// is currently valid. Explicit provider refresh uses this list to bound which
+/// paid endpoint observations it may fetch; preview itself remains offline.
+pub(crate) fn reviewed_paid_endpoint_candidates(now_ms: u64) -> Vec<(String, String, String)> {
+    if paid_endpoint_policy_digest(REVIEWED_PAID_ENDPOINT_POLICIES_JSON)
+        != REVIEWED_PAID_ENDPOINT_POLICIES_SHA256
+    {
+        return Vec::new();
+    }
+    let Ok(registry) = serde_json::from_slice::<ReviewedPaidEndpointPolicies>(
+        REVIEWED_PAID_ENDPOINT_POLICIES_JSON,
+    ) else {
+        return Vec::new();
+    };
+    if registry.schema_version != 1 || registry.policies.is_empty() || registry.policies.len() > 64
+    {
+        return Vec::new();
+    }
+    registry
+        .policies
+        .into_iter()
+        .filter(|policy| {
+            policy.processing_mode == "serverless"
+                && policy.no_training
+                && !policy.persistent_input_storage
+                && !policy.input_content_logging
+                && policy.transient_content_processing
+                && policy.operational_metadata_may_be_logged
+                && policy.legal_process_exceptions_may_apply
+                && policy.provider_slug == policy.endpoint_tag.split('/').next().unwrap_or_default()
+                && valid_endpoint_tag(&policy.endpoint_tag)
+                && !policy.source_urls.is_empty()
+                && policy.source_urls.len() <= 8
+                && policy.source_urls.iter().all(|url| valid_source_url(url))
+                && policy.observed_at_ms <= now_ms
+                && now_ms.saturating_sub(policy.observed_at_ms) <= PAID_ENDPOINT_POLICY_MAX_AGE_MS
+        })
+        .map(|policy| (policy.model_id, policy.canonical_model_id, policy.endpoint_tag))
+        .collect()
 }
 
 fn reviewed_endpoint_policy(model_id: &str, endpoint_id: &str) -> Option<EndpointPrivacyEvidence> {
@@ -2030,6 +2072,7 @@ impl VerifiedEconomyAdmission {
                 observed_at_ms: self.catalog_observed_at_ms,
             },
             endpoint_pin: None,
+            model_catalog_pricing: None,
         }
     }
 
@@ -2302,6 +2345,15 @@ mod tests {
             "parasail/other",
             now,
         ));
+        assert!(reviewed_paid_endpoint_policy_matches(
+            "deepseek/deepseek-v4.1-flash",
+            "deepseek/deepseek-v4.1-flash-20260910",
+            "parasail/fp8",
+            1793215114055,
+        ));
+        assert!(reviewed_paid_endpoint_candidates(1793215114055)
+            .contains(&("deepseek/deepseek-v4.1-flash".into(),
+                "deepseek/deepseek-v4.1-flash-20260910".into(), "parasail/fp8".into())));
         assert!(!reviewed_paid_endpoint_policy_matches(
             "qwen/qwen3-coder-next",
             "qwen/qwen3-coder-next-other",

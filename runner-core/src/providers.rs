@@ -355,6 +355,10 @@ pub struct PinnedPaidEndpointRequirements<'a> {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub requires_tools: bool,
+    /// Optional exact authenticated model-catalog prices for endpoint-pinned
+    /// pilots. When absent, preserve the legacy catalog-vs-ceiling behavior.
+    pub model_catalog_input_micros_per_1m: Option<u64>,
+    pub model_catalog_output_micros_per_1m: Option<u64>,
 }
 
 /// Verify an authenticated model observation and exact active endpoint against
@@ -401,14 +405,20 @@ pub fn openrouter_pinned_paid_endpoint_is_verified(
             .as_deref()
             .and_then(openrouter_price_micros_per_million)
             .is_none_or(|price| {
-                price == 0 || price > requirements.input_price_ceiling_micros_per_1m
+                price == 0
+                    || requirements
+                        .model_catalog_input_micros_per_1m
+                        .map_or(price > requirements.input_price_ceiling_micros_per_1m, |expected| price != expected)
             })
         || model
             .completion_price
             .as_deref()
             .and_then(openrouter_price_micros_per_million)
             .is_none_or(|price| {
-                price == 0 || price > requirements.output_price_ceiling_micros_per_1m
+                price == 0
+                    || requirements
+                        .model_catalog_output_micros_per_1m
+                        .map_or(price > requirements.output_price_ceiling_micros_per_1m, |expected| price != expected)
             })
         || !model
             .input_modalities
@@ -608,7 +618,7 @@ pub fn openrouter_endpoints_http_probe_with_timeout(
     openrouter_endpoints_http_probe_with_aliases(api_key, model_id, &[model_id], timeout)
 }
 
-fn openrouter_endpoints_http_probe_with_aliases(
+pub(crate) fn openrouter_endpoints_http_probe_with_aliases(
     api_key: &str,
     request_model_id: &str,
     allowed_model_ids: &[&str],
@@ -2790,6 +2800,8 @@ mod tests {
                 input_tokens: 16_384,
                 output_tokens: 8_192,
                 requires_tools: true,
+                model_catalog_input_micros_per_1m: None,
+                model_catalog_output_micros_per_1m: None,
             },
         )
     }
@@ -2893,6 +2905,39 @@ mod tests {
             &endpoints,
             &std::collections::BTreeSet::new(),
             requirements,
+        ));
+    }
+
+    #[test]
+    fn pinned_paid_endpoint_accepts_an_exact_endpoint_quote_above_catalog_quote() {
+        let (mut metadata, mut endpoints, _zdr, mut requirements) = paid_pilot_observations();
+        let model = &mut metadata.models[0];
+        model.id = "deepseek/deepseek-v4.1-flash".into();
+        model.canonical_slug = Some("deepseek/deepseek-v4.1-flash-20260910".into());
+        model.prompt_price = Some("0.00000000249".into());
+        model.completion_price = Some("0.000000305".into());
+        let endpoint = &mut endpoints[0];
+        endpoint.model_id = "deepseek/deepseek-v4.1-flash-20260910".into();
+        endpoint.tag = "parasail/fp8".into();
+        endpoint.prompt_price = Some("0.0000003".into());
+        endpoint.completion_price = Some("0.0000012".into());
+        let zdr = std::collections::BTreeSet::from([(
+            "deepseek/deepseek-v4.1-flash-20260910".into(),
+            "parasail/fp8".into(),
+        )]);
+        requirements.model_id = "deepseek/deepseek-v4.1-flash";
+        requirements.canonical_model_id = "deepseek/deepseek-v4.1-flash-20260910";
+        requirements.endpoint_id = "parasail/fp8";
+        requirements.input_price_ceiling_micros_per_1m = 300_000;
+        requirements.output_price_ceiling_micros_per_1m = 1_200_000;
+        requirements.model_catalog_input_micros_per_1m = Some(2_490);
+        requirements.model_catalog_output_micros_per_1m = Some(305_000);
+        assert!(openrouter_pinned_paid_endpoint_is_verified(
+            &metadata, &endpoints, &zdr, requirements
+        ));
+        requirements.model_catalog_input_micros_per_1m = Some(2_491);
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata, &endpoints, &zdr, requirements
         ));
     }
 

@@ -1116,6 +1116,14 @@ fn run_openrouter_paid(
                 input_tokens: policy.model_context_window_tokens,
                 output_tokens: policy.max_output_tokens_per_call,
                 requires_tools: pin.requires_tools,
+                model_catalog_input_micros_per_1m: policy
+                    .model_catalog_pricing
+                    .as_ref()
+                    .map(|quote| quote.input_price_micros_per_1m),
+                model_catalog_output_micros_per_1m: policy
+                    .model_catalog_pricing
+                    .as_ref()
+                    .map(|quote| quote.output_price_micros_per_1m),
             },
             endpoint_timeout,
         )
@@ -4434,6 +4442,7 @@ mod tests {
                 observed_at_ms: 1,
             },
             endpoint_pin: None,
+            model_catalog_pricing: None,
         };
         let files = prepare_paid_aider_files(
             "probe only",
@@ -4482,6 +4491,7 @@ mod tests {
                 observed_at_ms: 1,
             },
             endpoint_pin: None,
+            model_catalog_pricing: None,
         };
         let files =
             prepare_paid_aider_files("probe only", &policy, &["C:/synthetic/source.rs".into()])
@@ -4518,6 +4528,7 @@ mod tests {
                 observed_at_ms: 1,
             },
             endpoint_pin: None,
+            model_catalog_pricing: None,
         };
         let files = prepare_paid_aider_files("prompt", &policy, &["C:/worktree/src/lib.rs".into()])
             .unwrap();

@@ -20,6 +20,26 @@
       "transientContentProcessing": true,
       "operationalMetadataMayBeLogged": true,
       "legalProcessExceptionsMayApply": true
+    },
+    {
+      "modelId": "deepseek/deepseek-v4.1-flash",
+      "canonicalModelId": "deepseek/deepseek-v4.1-flash-20260910",
+      "providerSlug": "parasail",
+      "endpointTag": "parasail/fp8",
+      "observedAtMs": 1793215114055,
+      "sourceUrls": [
+        "https://docs.parasail.io/parasail-docs/security-and-account-management/overview",
+        "https://www.parasail.io/legal/terms-of-service",
+        "https://openrouter.ai/docs/guides/features/zdr",
+        "https://openrouter.ai/api/v1/endpoints/zdr"
+      ],
+      "processingMode": "serverless",
+      "noTraining": true,
+      "persistentInputStorage": false,
+      "inputContentLogging": false,
+      "transientContentProcessing": true,
+      "operationalMetadataMayBeLogged": true,
+      "legalProcessExceptionsMayApply": true
     }
   ]
 }

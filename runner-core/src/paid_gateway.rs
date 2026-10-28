@@ -41,6 +41,17 @@ pub struct PaidPricingCeiling {
     pub observed_at_ms: u64,
 }
 
+/// Authenticated model-catalog prices. Request-level fees are intentionally
+/// absent because the model catalog does not establish an endpoint fee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaidModelCatalogPricing {
+    pub input_price_micros_per_1m: u64,
+    pub output_price_micros_per_1m: u64,
+    pub source: String,
+    pub observed_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PaidModelPolicy {
@@ -57,6 +68,10 @@ pub struct PaidModelPolicy {
     /// Parent run's maximum spend; child calls must collectively remain under it.
     pub max_cost_micros: u64,
     pub pricing: PaidPricingCeiling,
+    /// Optional authenticated model-catalog quote kept separate from a pinned
+    /// endpoint quote. Absent preserves legacy paid JSON and comparisons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_pricing: Option<PaidModelCatalogPricing>,
     /// Optional backend-reviewed endpoint pin for bounded paid pilots. `None`
     /// preserves the existing OpenRouter paid routing behavior and JSON shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +460,20 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
     {
         return Err(PaidGatewayError::Invalid(
             "upstream credential is unavailable",
+        ));
+    }
+    if p.model_catalog_pricing.as_ref().is_some_and(|quote| {
+        p.endpoint_pin.is_none()
+            || quote.input_price_micros_per_1m == 0
+            || quote.output_price_micros_per_1m == 0
+            || quote.source.trim().is_empty()
+            || quote.source.len() > 128
+            || quote.source.chars().any(char::is_control)
+            || quote.observed_at_ms > now_ms()
+            || now_ms().saturating_sub(quote.observed_at_ms) > PRICING_FRESHNESS_MS
+    }) {
+        return Err(PaidGatewayError::Invalid(
+            "separate model-catalog pricing is malformed, stale, or not endpoint-pinned",
         ));
     }
     if crate::economy::is_router_model_id(&p.model_id)
@@ -1172,6 +1201,14 @@ fn refresh_free_endpoint(shared: &Shared) -> bool {
                         input_tokens: policy.model_context_window_tokens,
                         output_tokens: policy.max_output_tokens_per_call,
                         requires_tools: pin.requires_tools,
+                        model_catalog_input_micros_per_1m: policy
+                            .model_catalog_pricing
+                            .as_ref()
+                            .map(|quote| quote.input_price_micros_per_1m),
+                        model_catalog_output_micros_per_1m: policy
+                            .model_catalog_pricing
+                            .as_ref()
+                            .map(|quote| quote.output_price_micros_per_1m),
                     },
                     timeout,
                 )
@@ -1637,6 +1674,7 @@ mod tests {
                 observed_at_ms: now,
             },
             endpoint_pin: None,
+            model_catalog_pricing: None,
         }
     }
 
@@ -1644,6 +1682,7 @@ mod tests {
     fn legacy_paid_policy_serialization_omits_optional_endpoint_pin() {
         let value = serde_json::to_value(policy(now_ms())).unwrap();
         assert!(value.get("endpointPin").is_none());
+        assert!(value.get("modelCatalogPricing").is_none());
         let restored: PaidModelPolicy = serde_json::from_value(value).unwrap();
         assert_eq!(restored.endpoint_pin, None);
     }
@@ -1678,6 +1717,46 @@ mod tests {
         assert_eq!(request["provider"]["max_price"]["completion"], 0.8);
         assert_eq!(request["provider"]["max_price"]["request"], 0);
         assert_eq!(request["provider"]["max_price"]["image"], 0);
+        assert_eq!(request["data_collection"], "deny");
+        assert_eq!(request["zdr"], true);
+    }
+
+    #[test]
+    fn split_catalog_and_endpoint_quotes_keep_endpoint_max_price() {
+        let mut pinned = policy(now_ms());
+        pinned.model_id = "deepseek/deepseek-v4.1-flash".into();
+        pinned.model_context_window_tokens = 262_144;
+        pinned.max_output_tokens_per_call = 8_192;
+        pinned.max_cost_micros = 98_352;
+        pinned.pricing = PaidPricingCeiling {
+            input_price_micros_per_1m: 300_000,
+            output_price_micros_per_1m: 1_200_000,
+            request_fee_micros: 0,
+            source: "OpenRouter authenticated model endpoint".into(),
+            observed_at_ms: now_ms(),
+        };
+        pinned.model_catalog_pricing = Some(PaidModelCatalogPricing {
+            input_price_micros_per_1m: 2_490,
+            output_price_micros_per_1m: 305_000,
+            source: "OpenRouter authenticated user model catalog".into(),
+            observed_at_ms: now_ms(),
+        });
+        pinned.endpoint_pin = Some(PaidEndpointPin {
+            endpoint_id: "parasail/fp8".into(),
+            canonical_model_id: "deepseek/deepseek-v4.1-flash-20260910".into(),
+            requires_tools: true,
+        });
+        let mut request = json!({
+            "model":"deepseek/deepseek-v4.1-flash",
+            "messages":[{"role":"user","content":"synthetic"}],
+            "max_tokens":8192
+        });
+        validate_and_cap_request(&mut request, &pinned).unwrap();
+        assert_eq!(request["provider"]["only"][0], "parasail/fp8");
+        assert_eq!(request["provider"]["max_price"]["prompt"], 0.3);
+        assert_eq!(request["provider"]["max_price"]["completion"], 1.2);
+        assert_eq!(request["provider"]["max_price"]["request"], 0);
+        assert_eq!(request["provider"]["allow_fallbacks"], false);
         assert_eq!(request["data_collection"], "deny");
         assert_eq!(request["zdr"], true);
     }

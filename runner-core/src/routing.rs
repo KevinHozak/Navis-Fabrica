@@ -129,6 +129,10 @@ pub struct CandidateFacts {
     /// Opaque core-minted proof; client JSON cannot supply or persist it.
     #[serde(skip)]
     pub economy_admission: Option<crate::economy::VerifiedEconomyAdmission>,
+    /// Explicit-refresh, backend-validated endpoint quote. It is an
+    /// observation, not caller authority, and cannot be supplied in JSON.
+    #[serde(skip)]
+    pub paid_endpoint_quote: Option<PaidEndpointQuoteObservation>,
     /// Context and tool facts come from refreshed backend observations, not
     /// the configured model label. None is unknown and fails capability checks.
     #[serde(default)]
@@ -141,6 +145,20 @@ pub struct CandidateFacts {
     pub evidence_ready: bool,
     #[serde(default)]
     pub evidence_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaidEndpointQuoteObservation {
+    pub canonical_model_id: String,
+    pub endpoint_id: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub request_fee_micros: u64,
+    pub context_tokens: u64,
+    pub max_prompt_tokens: Option<u64>,
+    pub max_completion_tokens: u64,
+    pub source: String,
+    pub observed_at_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1636,11 +1654,31 @@ mod tests {
             pricing_verified_at_ms: Some(10_100),
             economy_policy: None,
             economy_admission: None,
+            paid_endpoint_quote: None,
             context_tokens: Some(32_768),
             supports_tools: Some(true),
             evidence_ready: true,
             evidence_reasons: Vec::new(),
         }
+    }
+
+    #[test]
+    fn unpinned_paid_cost_estimate_keeps_using_the_catalog_quote() {
+        let mut fact = facts("openrouter", "deepseek/deepseek-v4.1-flash", false, 2_490);
+        fact.output_micros_per_million_tokens = Some(305_000);
+        fact.paid_endpoint_quote = Some(PaidEndpointQuoteObservation {
+            canonical_model_id: "deepseek/deepseek-v4.1-flash-20260910".into(),
+            endpoint_id: "parasail/fp8".into(),
+            input_micros_per_million_tokens: 300_000,
+            output_micros_per_million_tokens: 1_200_000,
+            request_fee_micros: 0,
+            context_tokens: 1_048_576,
+            max_prompt_tokens: None,
+            max_completion_tokens: 943_718,
+            source: "OpenRouter authenticated model endpoint".into(),
+            observed_at_ms: 1_000,
+        });
+        assert_eq!(estimate_cost_micros(&fact, 16_384, 8_192), Some(2_540));
     }
 
     #[test]

@@ -291,6 +291,8 @@ pub struct CommittedPaidQuote {
     pub output_price_micros_per_1m: u64,
     pub request_fee_micros: u64,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_pricing: Option<crate::paid_gateway::PaidModelCatalogPricing>,
     pub max_calls: u32,
     pub max_cost_micros: u64,
     pub context_tokens: u64,
@@ -2438,6 +2440,16 @@ impl Supervisor {
                     .and_then(|fact| fact.pricing_verified_at_ms)
                     .and_then(|value| u64::try_from(value).ok())
             });
+            let refreshed_endpoint_time = refresh_audit.as_ref().and_then(|_| {
+                dispatch_facts
+                    .iter()
+                    .find(|fact| {
+                        fact.provider_id == committed_route.provider_id
+                            && fact.model_id == committed_route.model_id
+                    })
+                    .and_then(|fact| fact.paid_endpoint_quote.as_ref())
+                    .and_then(|quote| u64::try_from(quote.observed_at_ms).ok())
+            });
             let routed = route_task(
                 request,
                 &settings,
@@ -2515,7 +2527,7 @@ impl Supervisor {
                     None
                 };
                 Some(
-                    execution_paid_policy(policy, refreshed_at).map_err(|reason| {
+                    execution_paid_policy(policy, refreshed_at, refreshed_endpoint_time).map_err(|reason| {
                         SupervisorError::Verification(format!("needs_input: {reason}"))
                     })?,
                 )
@@ -5997,6 +6009,7 @@ fn paid_call_token_ceiling(policy: &crate::paid_gateway::PaidModelPolicy) -> Opt
 fn execution_paid_policy(
     committed: &crate::paid_gateway::PaidModelPolicy,
     refreshed_pricing_time_ms: Option<u64>,
+    refreshed_endpoint_time_ms: Option<u64>,
 ) -> Result<crate::paid_gateway::PaidModelPolicy, String> {
     const FRESHNESS_MS: u64 = 24 * 60 * 60 * 1000;
     let mut execution = committed.clone();
@@ -6005,7 +6018,21 @@ fn execution_paid_policy(
         if observed_at_ms > now || now.saturating_sub(observed_at_ms) > FRESHNESS_MS {
             return Err("fresh paid pricing timestamp is outside the 24-hour window".into());
         }
-        execution.pricing.observed_at_ms = observed_at_ms;
+        if execution.endpoint_pin.is_none() {
+            execution.pricing.observed_at_ms = observed_at_ms;
+        }
+        if let Some(catalog) = execution.model_catalog_pricing.as_mut() {
+            catalog.observed_at_ms = observed_at_ms;
+        }
+    }
+    if execution.endpoint_pin.is_some() {
+        if let Some(observed_at_ms) = refreshed_endpoint_time_ms {
+            let now = now_ms().max(0) as u64;
+            if observed_at_ms > now || now.saturating_sub(observed_at_ms) > FRESHNESS_MS {
+                return Err("fresh endpoint quote timestamp is outside the 24-hour window".into());
+            }
+            execution.pricing.observed_at_ms = observed_at_ms;
+        }
     }
     Ok(execution)
 }
@@ -6060,11 +6087,24 @@ fn validate_paid_model_policy(
         || policy.max_cost_micros > request.policy.budget.max_cost_micros
         || max_tokens > task_max_tokens
         || pricing.request_fee_micros != 0
+        || pricing.input_price_micros_per_1m == 0
+        || pricing.output_price_micros_per_1m == 0
         || pricing.source.trim().is_empty()
         || pricing.source.len() > 128
         || pricing.source.chars().any(char::is_control)
         || freshness_timestamp_ms > now_ms().max(0) as u64
         || (now_ms().max(0) as u64).saturating_sub(freshness_timestamp_ms) > 24 * 60 * 60 * 1000
+        || policy.model_catalog_pricing.as_ref().is_some_and(|catalog| {
+            policy.endpoint_pin.is_none()
+                || catalog.input_price_micros_per_1m == 0
+                || catalog.output_price_micros_per_1m == 0
+                || catalog.source != "OpenRouter authenticated user model catalog"
+                || catalog.source.len() > 128
+                || catalog.source.chars().any(char::is_control)
+                || catalog.observed_at_ms > now_ms().max(0) as u64
+                || (now_ms().max(0) as u64).saturating_sub(catalog.observed_at_ms)
+                    > 24 * 60 * 60 * 1000
+        })
         || policy.endpoint_pin.as_ref().is_some_and(|pin| {
             pin.requires_tools
                 != task
@@ -6675,6 +6715,7 @@ fn derive_route_commitments(
                     output_price_micros_per_1m: policy.pricing.output_price_micros_per_1m,
                     request_fee_micros: policy.pricing.request_fee_micros,
                     source: policy.pricing.source.clone(),
+                    model_catalog_pricing: policy.model_catalog_pricing.clone(),
                     max_calls: policy.max_calls,
                     max_cost_micros: policy.max_cost_micros,
                     context_tokens: policy.model_context_window_tokens,
@@ -6820,11 +6861,27 @@ fn check_fresh_paid_quote(
     facts: &crate::routing::CandidateFacts,
 ) -> Result<(), String> {
     if let Some(quote) = &commitment.paid_quote {
-        if facts.billing != crate::routing::BillingPolicy::Paid
-            || facts.input_micros_per_million_tokens != Some(quote.input_price_micros_per_1m)
-            || facts.output_micros_per_million_tokens != Some(quote.output_price_micros_per_1m)
-            || facts.pricing_source.as_deref() != Some(quote.source.as_str())
-        {
+        let model_quote_changed = if let Some(catalog) = quote.model_catalog_pricing.as_ref() {
+            facts.input_micros_per_million_tokens != Some(catalog.input_price_micros_per_1m)
+                || facts.output_micros_per_million_tokens != Some(catalog.output_price_micros_per_1m)
+                || facts.pricing_source.as_deref() != Some(catalog.source.as_str())
+        } else {
+            facts.input_micros_per_million_tokens != Some(quote.input_price_micros_per_1m)
+                || facts.output_micros_per_million_tokens != Some(quote.output_price_micros_per_1m)
+                || facts.pricing_source.as_deref() != Some(quote.source.as_str())
+        };
+        let endpoint_quote_changed = quote.model_catalog_pricing.is_some()
+            && quote.endpoint_pin.as_ref().is_some_and(|pin| {
+            facts.paid_endpoint_quote.as_ref().is_none_or(|endpoint| {
+                endpoint.endpoint_id != pin.endpoint_id
+                    || endpoint.canonical_model_id != pin.canonical_model_id
+                    || endpoint.input_micros_per_million_tokens != quote.input_price_micros_per_1m
+                    || endpoint.output_micros_per_million_tokens != quote.output_price_micros_per_1m
+                    || endpoint.request_fee_micros != quote.request_fee_micros
+                    || endpoint.source != quote.source
+            })
+            });
+        if facts.billing != crate::routing::BillingPolicy::Paid || model_quote_changed || endpoint_quote_changed {
             return Err(
                 "verified paid quote or source changed since preview; new approval is required"
                     .into(),
@@ -6836,6 +6893,79 @@ fn check_fresh_paid_quote(
         );
     }
     Ok(())
+}
+
+fn paid_candidate_quote_matches(
+    facts: &crate::routing::CandidateFacts,
+    policy: &crate::paid_gateway::PaidModelPolicy,
+    requirements: &crate::routing::TaskRoutingRequirements,
+) -> bool {
+    if let Some(pin) = policy.endpoint_pin.as_ref() {
+        if policy.model_catalog_pricing.is_none() {
+            return facts.input_micros_per_million_tokens
+                == Some(policy.pricing.input_price_micros_per_1m)
+                && facts.output_micros_per_million_tokens
+                    == Some(policy.pricing.output_price_micros_per_1m)
+                && facts.pricing_source.as_deref() == Some(policy.pricing.source.as_str());
+        }
+        let Some(endpoint) = facts.paid_endpoint_quote.as_ref() else {
+            return false;
+        };
+        let required_input = requirements.max_input_tokens.unwrap_or(16_384);
+        let required_output = requirements
+            .max_output_tokens
+            .unwrap_or(policy.max_output_tokens_per_call);
+        let Some(total_required) = required_input.checked_add(required_output) else {
+            return false;
+        };
+        let catalog_matches = if let Some(catalog) = policy.model_catalog_pricing.as_ref() {
+            facts.input_micros_per_million_tokens == Some(catalog.input_price_micros_per_1m)
+                && facts.output_micros_per_million_tokens == Some(catalog.output_price_micros_per_1m)
+                && facts.pricing_source.as_deref() == Some(catalog.source.as_str())
+        } else { false };
+        catalog_matches
+            && endpoint.endpoint_id == pin.endpoint_id
+            && endpoint.canonical_model_id == pin.canonical_model_id
+            && endpoint.input_micros_per_million_tokens == policy.pricing.input_price_micros_per_1m
+            && endpoint.output_micros_per_million_tokens == policy.pricing.output_price_micros_per_1m
+            && endpoint.request_fee_micros == policy.pricing.request_fee_micros
+            && endpoint.source == policy.pricing.source
+            && endpoint.observed_at_ms <= now_ms().max(0) as u128
+            && (now_ms().max(0) as u128).saturating_sub(endpoint.observed_at_ms)
+                <= 24 * 60 * 60 * 1000
+            && required_input <= endpoint.context_tokens
+            && total_required <= endpoint.context_tokens
+            && endpoint.max_prompt_tokens.is_none_or(|cap| required_input <= cap)
+            && required_output <= endpoint.max_completion_tokens
+    } else {
+        policy.model_catalog_pricing.is_none()
+            && facts.input_micros_per_million_tokens
+                == Some(policy.pricing.input_price_micros_per_1m)
+            && facts.output_micros_per_million_tokens
+                == Some(policy.pricing.output_price_micros_per_1m)
+            && facts.pricing_source.as_deref() == Some(policy.pricing.source.as_str())
+    }
+}
+
+fn apply_paid_endpoint_quote_for_routing(
+    facts: &mut crate::routing::CandidateFacts,
+    policy: &crate::paid_gateway::PaidModelPolicy,
+    requirements: &crate::routing::TaskRoutingRequirements,
+) -> bool {
+    if policy.endpoint_pin.is_none()
+        || policy.model_catalog_pricing.is_none()
+        || !paid_candidate_quote_matches(facts, policy, requirements)
+    {
+        return false;
+    }
+    let Some(endpoint) = facts.paid_endpoint_quote.as_ref() else {
+        return false;
+    };
+    facts.input_micros_per_million_tokens = Some(endpoint.input_micros_per_million_tokens);
+    facts.output_micros_per_million_tokens = Some(endpoint.output_micros_per_million_tokens);
+    facts.pricing_source = Some(endpoint.source.clone());
+    facts.pricing_verified_at_ms = Some(endpoint.observed_at_ms);
+    true
 }
 
 fn route_task(
@@ -6989,6 +7119,7 @@ fn route_task(
         else {
             continue;
         };
+        let mut endpoint_quote_authorized = false;
         if let Some(profile) = profile {
             if profile.kind == ProviderKind::Custom {
                 observed.evidence_ready = false;
@@ -7055,18 +7186,23 @@ fn route_task(
                             && requirements
                                 .max_output_tokens
                                 .is_none_or(|tokens| tokens <= policy.max_output_tokens_per_call)
-                            && observed.input_micros_per_million_tokens
-                                == Some(policy.pricing.input_price_micros_per_1m)
-                            && observed.output_micros_per_million_tokens
-                                == Some(policy.pricing.output_price_micros_per_1m)
-                            && observed.pricing_source.as_deref()
-                                == Some(policy.pricing.source.as_str())
+                            && paid_candidate_quote_matches(&observed, policy, &requirements)
+                    });
+                endpoint_quote_authorized = policy_ok
+                    && paid_policy.is_some_and(|policy| {
+                        apply_paid_endpoint_quote_for_routing(&mut observed, policy, &requirements)
                     });
                 if !policy_ok {
                     observed.evidence_ready = false;
                     observed.evidence_reasons.push("OpenRouter requires a matching explicit paid policy and current verified catalog pricing for this exact model.".into());
                 }
             }
+        }
+        if !endpoint_quote_authorized {
+            // Endpoint metadata may support a preview only when the exact
+            // split-quote pin was admitted. Unpinned and legacy Paid routing
+            // continue to estimate from the ordinary catalog quote.
+            observed.paid_endpoint_quote = None;
         }
         candidate_facts.push(observed);
     }
@@ -7987,10 +8123,11 @@ mod supervisor_tests {
                 observed_at_ms: now.saturating_sub(24 * 60 * 60 * 1000 + 1),
             },
             endpoint_pin: None,
+            model_catalog_pricing: None,
         };
         let original = reviewed.clone();
 
-        let execution = execution_paid_policy(&reviewed, Some(now)).unwrap();
+        let execution = execution_paid_policy(&reviewed, Some(now), None).unwrap();
         assert_eq!(reviewed, original, "stored approval must remain immutable");
         assert_eq!(execution.pricing.observed_at_ms, now);
         assert_eq!(execution.provider_id, reviewed.provider_id);
@@ -8031,6 +8168,7 @@ mod supervisor_tests {
             pricing_verified_at_ms: Some(now as u128),
             economy_policy: None,
             economy_admission: None,
+            paid_endpoint_quote: None,
             context_tokens: Some(16_384),
             supports_tools: Some(true),
             evidence_ready: true,
@@ -8046,6 +8184,7 @@ mod supervisor_tests {
             max_cost_micros: reviewed.max_cost_micros,
             max_calls: reviewed.max_calls,
             endpoint_pin: None,
+            model_catalog_pricing: None,
         };
         let commitment = RouteSemanticCommitment {
             provider_id: reviewed.provider_id.clone(),
@@ -8080,6 +8219,7 @@ mod supervisor_tests {
             output_price_micros_per_1m: 800_000,
             request_fee_micros: 0,
             source: "authenticated-openrouter-model-and-endpoint-metadata".into(),
+            model_catalog_pricing: None,
             max_calls: 3,
             max_cost_micros: 33_333,
             context_tokens: 16_384,
@@ -8097,6 +8237,119 @@ mod supervisor_tests {
         };
         assert!(check_paid_endpoint_pin_commitment(Some(&pin), Some(&changed)).is_err());
         assert!(check_paid_endpoint_pin_commitment(Some(&pin), None).is_err());
+    }
+
+    #[test]
+    fn split_paid_quote_requires_both_catalog_and_endpoint_identity_but_preserves_legacy_pin() {
+        let now = now_ms().max(0) as u64;
+        let pin = crate::paid_gateway::PaidEndpointPin {
+            endpoint_id: "parasail/fp8".into(),
+            canonical_model_id: "deepseek/deepseek-v4.1-flash-20260910".into(),
+            requires_tools: true,
+        };
+        let mut policy = crate::paid_gateway::PaidModelPolicy {
+            mode: crate::paid_gateway::GatewayMode::Paid,
+            provider_id: "openrouter-profile".into(),
+            model_id: "deepseek/deepseek-v4.1-flash".into(),
+            runtime_id: "aider".into(),
+            model_context_window_tokens: 262_144,
+            max_output_tokens_per_call: 8_192,
+            max_calls: 2,
+            max_cost_micros: 98_352,
+            pricing: crate::paid_gateway::PaidPricingCeiling {
+                input_price_micros_per_1m: 300_000,
+                output_price_micros_per_1m: 1_200_000,
+                request_fee_micros: 0,
+                source: "OpenRouter authenticated model endpoint".into(),
+                observed_at_ms: now,
+            },
+            model_catalog_pricing: Some(crate::paid_gateway::PaidModelCatalogPricing {
+                input_price_micros_per_1m: 2_490,
+                output_price_micros_per_1m: 305_000,
+                source: "OpenRouter authenticated user model catalog".into(),
+                observed_at_ms: now,
+            }),
+            endpoint_pin: Some(pin.clone()),
+        };
+        let mut fact = crate::routing::CandidateFacts {
+            provider_id: policy.provider_id.clone(),
+            model_id: policy.model_id.clone(),
+            runtime_id: "aider:fixture".into(),
+            runtime_installed: true,
+            authenticated: true,
+            healthy: true,
+            health_checked_at_ms: Some(now as u128),
+            model_available: true,
+            local_only: false,
+            billing: crate::routing::BillingPolicy::Paid,
+            input_micros_per_million_tokens: Some(2_490),
+            output_micros_per_million_tokens: Some(305_000),
+            pricing_source: Some("OpenRouter authenticated user model catalog".into()),
+            pricing_verified_at_ms: Some(now as u128),
+            economy_policy: None,
+            economy_admission: None,
+            paid_endpoint_quote: Some(crate::routing::PaidEndpointQuoteObservation {
+                canonical_model_id: pin.canonical_model_id.clone(),
+                endpoint_id: pin.endpoint_id.clone(),
+                input_micros_per_million_tokens: 300_000,
+                output_micros_per_million_tokens: 1_200_000,
+                request_fee_micros: 0,
+                context_tokens: 1_048_576,
+                max_prompt_tokens: None,
+                max_completion_tokens: 943_718,
+                source: "OpenRouter authenticated model endpoint".into(),
+                observed_at_ms: now as u128,
+            }),
+            context_tokens: Some(1_048_576),
+            supports_tools: Some(true),
+            evidence_ready: true,
+            evidence_reasons: Vec::new(),
+        };
+        let requirements = crate::routing::TaskRoutingRequirements {
+            complexity: None,
+            pace: None,
+            require_tools: Some(true),
+            local_only: None,
+            context_tokens: None,
+            desired_completion_minutes: None,
+            max_input_tokens: Some(16_384),
+            max_output_tokens: Some(8_192),
+            allowed_candidates: Vec::new(),
+        };
+        assert!(paid_candidate_quote_matches(&fact, &policy, &requirements));
+        let mut routed_fact = fact.clone();
+        assert!(apply_paid_endpoint_quote_for_routing(
+            &mut routed_fact,
+            &policy,
+            &requirements
+        ));
+        assert_eq!(routed_fact.input_micros_per_million_tokens, Some(300_000));
+        assert_eq!(routed_fact.output_micros_per_million_tokens, Some(1_200_000));
+        fact.input_micros_per_million_tokens = Some(2_491);
+        assert!(!paid_candidate_quote_matches(&fact, &policy, &requirements));
+        fact.input_micros_per_million_tokens = Some(2_490);
+        fact.paid_endpoint_quote.as_mut().unwrap().output_micros_per_million_tokens += 1;
+        assert!(!paid_candidate_quote_matches(&fact, &policy, &requirements));
+        fact.paid_endpoint_quote.as_mut().unwrap().output_micros_per_million_tokens = 1_200_000;
+        fact.paid_endpoint_quote.as_mut().unwrap().endpoint_id = "parasail/other".into();
+        assert!(!paid_candidate_quote_matches(&fact, &policy, &requirements));
+        fact.paid_endpoint_quote.as_mut().unwrap().endpoint_id = pin.endpoint_id.clone();
+        fact.paid_endpoint_quote.as_mut().unwrap().observed_at_ms =
+            u128::from(now.saturating_sub(24 * 60 * 60 * 1000 + 1));
+        assert!(!paid_candidate_quote_matches(&fact, &policy, &requirements));
+
+        policy.model_catalog_pricing = None;
+        policy.pricing.input_price_micros_per_1m = 2_490;
+        policy.pricing.output_price_micros_per_1m = 305_000;
+        policy.pricing.source = "OpenRouter authenticated user model catalog".into();
+        fact.paid_endpoint_quote = None;
+        assert!(paid_candidate_quote_matches(&fact, &policy, &requirements));
+        assert!(!apply_paid_endpoint_quote_for_routing(
+            &mut fact,
+            &policy,
+            &requirements
+        ));
+        assert_eq!(fact.input_micros_per_million_tokens, Some(2_490));
     }
 
     fn budget_request(id: &str) -> ReservationRequest {
@@ -8580,6 +8833,7 @@ mod supervisor_tests {
                             ),
                             pricing_verified_at_ms: None,
                             economy_metadata: None,
+                            paid_endpoint_metadata: None,
                         })
                         .collect(),
                 }

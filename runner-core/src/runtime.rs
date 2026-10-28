@@ -24,6 +24,7 @@ const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_TIMEOUT_SECONDS: u64 = 86_400;
 const CODEX_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_AIDER_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CODEX_MODEL_LIST_PAGES: usize = 16;
 const MAX_CODEX_MODELS: usize = 500;
 const PROVIDER_BILLING_ENV: &[&str] = &[
@@ -1005,7 +1006,7 @@ fn run_openrouter_paid(
     let files = prepare_paid_aider_files(prompt, policy, &source_files)?;
     let aider_executable = resolve_aider_executable(&profile.executable)?;
     let python = resolve_aider_python(&aider_executable)?;
-    let version_timeout = require_time()?.min(Duration::from_secs(15));
+    let version_timeout = aider_version_probe_timeout(require_time()?);
     verify_aider_version(&aider_executable, &files, version_timeout, build_output)?;
     let guard_timeout = require_time()?.min(Duration::from_secs(10));
     verify_aider_guard(&python, &files, build_output, guard_timeout)?;
@@ -2048,12 +2049,24 @@ fn interpreter_path_matches_probe(reported: Option<&Path>, expected: &Path) -> b
         reported == expected
     }
 }
-fn verify_aider_version(
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiderVersionProbe {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output_matches: bool,
+    output_truncated: bool,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    elapsed_ms: u128,
+}
+
+fn capture_aider_version_probe(
     executable: &Path,
     files: &PaidAiderFiles,
     timeout: Duration,
     build_output: Option<&Path>,
-) -> Result<(), RuntimeError> {
+) -> Result<AiderVersionProbe, RuntimeError> {
     let safe_env = isolated_aider_environment_with_build_output(
         files,
         "http://127.0.0.1:1/v1",
@@ -2063,6 +2076,7 @@ fn verify_aider_version(
     .into_iter()
     .map(|(name, value)| (OsString::from(name), OsString::from(value)))
     .collect::<Vec<_>>();
+    let started = Instant::now();
     let result = process::capture_with_environment(
         executable,
         &["--version".into()],
@@ -2077,17 +2091,61 @@ fn verify_aider_version(
             "The paid Aider runtime version could not be verified.",
         )
     })?;
-    let output = String::from_utf8_lossy(&result.stdout).trim().to_owned();
-    if result.timed_out
-        || result.status.and_then(|status| status.code()) != Some(0)
-        || output != "aider 0.86.2"
-    {
+    Ok(AiderVersionProbe {
+        exit_code: result.status.and_then(|status| status.code()),
+        timed_out: result.timed_out,
+        output_matches: aider_version_output_matches(&result.stdout),
+        output_truncated: result.truncated,
+        stdout_bytes: result.stdout.len(),
+        stderr_bytes: result.stderr.len(),
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn aider_version_output_matches(output: &[u8]) -> bool {
+    output == b"aider 0.86.2"
+        || output == b"aider 0.86.2\n"
+        || output == b"aider 0.86.2\r\n"
+}
+
+/// Isolated Windows startup can take several seconds even for `--version`.
+/// Keep bounded headroom while never extending the parent run deadline.
+fn aider_version_probe_timeout(remaining: Duration) -> Duration {
+    remaining.min(MAX_AIDER_VERSION_PROBE_TIMEOUT)
+}
+
+fn validate_aider_version_probe(
+    probe: &AiderVersionProbe,
+) -> Result<(), RuntimeError> {
+    if probe.timed_out {
+        return Err(RuntimeError::new(
+            "AIDER_VERSION_TIMEOUT",
+            "The bounded Aider version probe timed out before confirming the required runtime.",
+        ));
+    }
+    if probe.exit_code != Some(0) {
+        return Err(RuntimeError::new(
+            "AIDER_VERSION_EXIT_FAILED",
+            "The Aider version probe exited unsuccessfully before confirming the required runtime.",
+        ));
+    }
+    if probe.output_truncated || !probe.output_matches {
         return Err(RuntimeError::new(
             "AIDER_VERSION_UNSUPPORTED",
-            "Paid OpenRouter dispatch requires the source-audited Aider 0.86.2 runtime.",
+            "Paid OpenRouter dispatch requires exact Aider version output `aider 0.86.2`.",
         ));
     }
     Ok(())
+}
+
+fn verify_aider_version(
+    executable: &Path,
+    files: &PaidAiderFiles,
+    timeout: Duration,
+    build_output: Option<&Path>,
+) -> Result<(), RuntimeError> {
+    let probe = capture_aider_version_probe(executable, files, timeout, build_output)?;
+    validate_aider_version_probe(&probe)
 }
 
 fn resolve_profile_and_model<'a>(
@@ -4297,6 +4355,108 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn aider_version_failures_distinguish_timeout_exit_and_mismatch() {
+        let probe = |exit_code, timed_out, output_matches| AiderVersionProbe {
+            exit_code,
+            timed_out,
+            output_matches,
+            output_truncated: false,
+            stdout_bytes: 14,
+            stderr_bytes: 0,
+            elapsed_ms: 1,
+        };
+        assert_eq!(
+            validate_aider_version_probe(&probe(None, true, false))
+                .unwrap_err()
+                .code,
+            "AIDER_VERSION_TIMEOUT"
+        );
+        assert_eq!(
+            validate_aider_version_probe(&probe(Some(1), false, false))
+                .unwrap_err()
+                .code,
+            "AIDER_VERSION_EXIT_FAILED"
+        );
+        assert_eq!(
+            validate_aider_version_probe(&probe(Some(0), false, false))
+                .unwrap_err()
+                .code,
+            "AIDER_VERSION_UNSUPPORTED"
+        );
+        assert!(validate_aider_version_probe(&probe(Some(0), false, true)).is_ok());
+        assert!(aider_version_output_matches(b"aider 0.86.2"));
+        assert!(aider_version_output_matches(b"aider 0.86.2\n"));
+        assert!(aider_version_output_matches(b"aider 0.86.2\r\n"));
+        assert!(!aider_version_output_matches(b" aider 0.86.2"));
+        assert!(!aider_version_output_matches(b"aider 0.86.2 \n"));
+        assert!(!aider_version_output_matches(b"aider 0.86.2\nwarning"));
+    }
+
+    #[test]
+    fn aider_version_probe_timeout_has_headroom_but_never_exceeds_parent_deadline() {
+        assert_eq!(
+            aider_version_probe_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            aider_version_probe_timeout(Duration::from_secs(120)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            aider_version_probe_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    #[ignore = "metadata-only: requires FABRICA_AIDER_SMOKE_EXE; invokes only the isolated Aider --version probe"]
+    fn actual_paid_aider_version_guard_probe_reports_bounded_metadata() {
+        let executable = std::env::var_os("FABRICA_AIDER_SMOKE_EXE")
+            .expect("root must provide the already-installed Aider executable");
+        let executable = executable.to_string_lossy();
+        let aider = resolve_aider_executable(&executable).unwrap();
+        let policy = PaidModelPolicy {
+            mode: crate::paid_gateway::GatewayMode::Paid,
+            provider_id: "openrouter".into(),
+            model_id: "vendor/model".into(),
+            runtime_id: "aider".into(),
+            model_context_window_tokens: 4096,
+            max_output_tokens_per_call: 512,
+            max_calls: 1,
+            max_cost_micros: 500,
+            pricing: crate::paid_gateway::PaidPricingCeiling {
+                input_price_micros_per_1m: 1,
+                output_price_micros_per_1m: 1,
+                request_fee_micros: 0,
+                source: "diagnostic-only".into(),
+                observed_at_ms: 1,
+            },
+            endpoint_pin: None,
+        };
+        let files = prepare_paid_aider_files(
+            "probe only",
+            &policy,
+            &["C:/synthetic/source.rs".into()],
+        )
+        .unwrap();
+        let build_output = tempdir().unwrap();
+        let timeout = aider_version_probe_timeout(Duration::from_secs(120));
+        let probe = capture_aider_version_probe(
+            &aider,
+            &files,
+            timeout,
+            Some(build_output.path()),
+        )
+        .unwrap();
+        eprintln!(
+            "AIDER_VERSION_PROBE={}",
+            serde_json::to_string(&probe).unwrap()
+        );
+        validate_aider_version_probe(&probe).unwrap();
+    }
+
     #[test]
     #[ignore = "requires FABRICA_AIDER_SMOKE_EXE; launches only the local isolated Python --probe, never Aider or a provider"]
     fn actual_paid_aider_guard_probe_accepts_normal_and_namespaced_adjacent_python_paths() {

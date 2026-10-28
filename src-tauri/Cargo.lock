@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "navis-fabrica"
-version = "1.0.23"
+version = "1.0.24"
 dependencies = [
  "base64 0.22.1",
  "navis-fabrica-runner-core",

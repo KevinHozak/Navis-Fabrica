@@ -2633,9 +2633,22 @@ impl Supervisor {
                 &json!({"state":"pending"}),
                 now_ms(),
             )?;
+            let issue_snapshot = match authoritative_issue_snapshot(&request.jobs, &claim.job) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    budgets.release_before_dispatch(&reservation_id)?;
+                    return self.finish_attempt(
+                        &claim,
+                        AttemptOutcome::NeedsInput {
+                            summary: "The admitted issue snapshot no longer matches this job; refresh and review the batch.".into(),
+                        },
+                    );
+                }
+            };
             let prompt = implementation_prompt(
                 &claim.job.issue_id,
                 &claim.job.source_fingerprint,
+                issue_snapshot,
                 &task,
                 &claim.plan,
             );
@@ -4003,6 +4016,7 @@ fn verified_predecessors(
 fn implementation_prompt(
     issue_id: &str,
     issue_fingerprint: &str,
+    issue_snapshot: &str,
     task: &PlannedTask,
     plan: &JobPlan,
 ) -> String {
@@ -4019,12 +4033,30 @@ fn implementation_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Implement the selected local issue in this isolated worktree. Do not commit, push, publish, merge, or deploy.\nIssue: {issue_id}\nIssue snapshot fingerprint: {issue_fingerprint}\nTask: {}\nPermitted files:\n{}\nAcceptance criteria:\n{}\nPlan task count: {}\nWork only within the permitted files, run no undeclared external actions, and report a concise completion summary. If blocked by approval, credentials, or required human input, stop and state the specific requirement.",
+        "Implement the selected local issue in this isolated worktree. Do not commit, push, publish, merge, or deploy.\nIssue: {issue_id}\nIssue snapshot fingerprint: {issue_fingerprint}\nAuthoritative issue requirements (stored snapshot):\n{issue_snapshot}\nTask: {}\nPermitted files:\n{}\nAcceptance criteria:\n{}\nPlan task count: {}\nWork only within the permitted files, run no undeclared external actions, and report a concise completion summary. If blocked by approval, credentials, or required human input, stop and state the specific requirement.",
         task.task_id,
         files,
         acceptance,
         plan.tasks.len()
     )
+}
+
+fn authoritative_issue_snapshot<'a>(
+    submitted_jobs: &'a [SubmitJob],
+    job: &Job,
+) -> Result<&'a str, SupervisorError> {
+    let mut matches = submitted_jobs
+        .iter()
+        .filter(|submitted| submitted.issue_id == job.issue_id);
+    let submitted = matches
+        .next()
+        .ok_or_else(|| SupervisorError::NotFound(job.issue_id.clone()))?;
+    if matches.next().is_some() || submitted.source_fingerprint != job.source_fingerprint {
+        return Err(SupervisorError::Conflict(
+            "admitted issue snapshot does not match the claimed job".into(),
+        ));
+    }
+    Ok(&submitted.issue_snapshot)
 }
 
 fn safe_checkpoint_key(value: &str) -> String {
@@ -7465,6 +7497,95 @@ mod supervisor_tests {
             Some("unsupported".into()),
             "an invalid effort on the selected identity must reach the existing runtime validator"
         );
+    }
+
+    #[test]
+    fn implementation_prompt_includes_the_exact_stored_issue_snapshot() {
+        let issue_snapshot = "---\nid: QWENPILOT-S001\n---\n\nNormalize names by collapsing internal whitespace and preserving case.";
+        let task = PlannedTask {
+            task_id: "small_bugfix-implementation".into(),
+            parent_task_id: None,
+            kind: TaskKind::Implementation,
+            files: vec!["name_utils.py".into()],
+            acceptance: vec!["Preserve case while normalizing whitespace.".into()],
+            limits: ResourceLimits {
+                max_attempts: 1,
+                max_tokens: Some(10_000),
+                max_cost_micros: Some(33_333),
+                max_seconds: Some(120),
+                max_concurrency: 1,
+            },
+            provider_id: Some("openRouter-fixture".into()),
+            model_id: Some("qwen/qwen3-coder-next".into()),
+            route_requirements: None,
+        };
+        let plan = JobPlan {
+            tasks: vec![task.clone()],
+            limits: task.limits.clone(),
+        };
+
+        let prompt = implementation_prompt(
+            "QWENPILOT-S001",
+            "stored-revision-fingerprint",
+            issue_snapshot,
+            &task,
+            &plan,
+        );
+
+        assert!(prompt.contains(&format!(
+            "Authoritative issue requirements (stored snapshot):\n{issue_snapshot}\nTask: {}",
+            task.task_id
+        )));
+        assert!(prompt.contains("Acceptance criteria:\n- Preserve case while normalizing whitespace."));
+    }
+
+    #[test]
+    fn authoritative_issue_snapshot_preserves_opaque_caller_fingerprint() {
+        let raw = "---\nid: QWENPILOT-S001\n---\n\nNormalize names by collapsing internal whitespace.";
+        let fingerprint = "opaque-caller-computed-fingerprint".to_owned();
+        let limits = ResourceLimits {
+            max_attempts: 1,
+            max_tokens: Some(10_000),
+            max_cost_micros: Some(33_333),
+            max_seconds: Some(120),
+            max_concurrency: 1,
+        };
+        let submitted = SubmitJob {
+            idempotency_key: "qwenpilot-s001-v1".into(),
+            issue_id: "QWENPILOT-S001".into(),
+            issue_type: "task".into(),
+            parent_issue_ids: Vec::new(),
+            source_fingerprint: fingerprint.clone(),
+            issue_snapshot: raw.into(),
+            plan: JobPlan {
+                tasks: Vec::new(),
+                limits,
+            },
+            dependencies: Vec::new(),
+        };
+        let job = Job {
+            id: 1,
+            issue_id: submitted.issue_id.clone(),
+            source_fingerprint: fingerprint,
+            state: JobState::Queued,
+            completion_gate: "pending".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            attempt_count: 0,
+            max_attempts: 1,
+            cancel_requested: false,
+            lease_owner: None,
+            lease_until_ms: None,
+            fencing_token: 0,
+        };
+
+        assert_eq!(
+            authoritative_issue_snapshot(&[submitted.clone()], &job).unwrap(),
+            raw
+        );
+        let mut wrong_binding = submitted;
+        wrong_binding.source_fingerprint = "different-caller-fingerprint".into();
+        assert!(authoritative_issue_snapshot(&[wrong_binding], &job).is_err());
     }
 
     #[test]

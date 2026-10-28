@@ -17,13 +17,13 @@ use crate::runtime::{
 };
 use crate::settings::{self, Settings};
 use crate::verification::{
-    source_snapshot, validate_check, CheckExecutor, CheckOutput, CheckSpec, ProcessCheckExecutor,
-    RepairProgress, RepairState, ReviewerIdentity, VerificationEnvelope, VerificationOutcome,
-    VerificationService,
+    CheckExecutor, CheckOutput, CheckSpec, ProcessCheckExecutor, RepairProgress, RepairState,
+    ReviewerIdentity, VerificationEnvelope, VerificationOutcome, VerificationService,
+    source_snapshot, validate_check,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1479,7 +1479,7 @@ impl Supervisor {
                         Err(error) => {
                             return Err(SupervisorError::Conflict(format!(
                                 "cannot safely reattach while worker liveness is unknown: {error}"
-                            )))
+                            )));
                         }
                     }
                 } else {
@@ -1964,7 +1964,7 @@ impl Supervisor {
                 other => {
                     return Err(SupervisorError::Store(format!(
                         "unknown persisted batch control {other:?}"
-                    )))
+                    )));
                 }
             }
             if now_ms() >= snapshot.deadline_ms {
@@ -2134,7 +2134,8 @@ impl Supervisor {
         ) {
             Ok(value) => value,
             Err(SupervisorError::Conflict(message)) => {
-                return self.finish_attempt(&claim, AttemptOutcome::NeedsInput { summary: message })
+                return self
+                    .finish_attempt(&claim, AttemptOutcome::NeedsInput { summary: message });
             }
             Err(error) => return Err(error),
         };
@@ -2523,7 +2524,7 @@ impl Supervisor {
                     if reason.starts_with("needs_input:") =>
                 {
                     return self
-                        .finish_attempt(&claim, AttemptOutcome::NeedsInput { summary: reason })
+                        .finish_attempt(&claim, AttemptOutcome::NeedsInput { summary: reason });
                 }
                 Err(error) => return Err(error),
             }
@@ -2591,6 +2592,8 @@ impl Supervisor {
                         parent_reservation_id: &reservation_id,
                         policy,
                         allowed_files: &task.files,
+                        authenticated_canonical_slug: None,
+                        economy_trial_task_id: None,
                         cancel: Arc::clone(&cancel),
                     },
                     &workspace.record.build_output_path,
@@ -2632,7 +2635,7 @@ impl Supervisor {
                         AttemptOutcome::Failed {
                             summary: error.message,
                         },
-                    )
+                    );
                 }
             };
             outputs.push(sink.output);
@@ -3258,8 +3261,7 @@ impl Supervisor {
                 let current_facts = if kind_consented {
                     let remaining = deadline_ms.saturating_sub(now_ms());
                     if remaining < 1000 || lease_lost.load(Ordering::SeqCst) {
-                        let reason =
-                    "batch deadline or verification lease ended before reviewer metadata refresh";
+                        let reason = "batch deadline or verification lease ended before reviewer metadata refresh";
                         let _ = jobs.record_verification_checkpoint(
                             job.id,
                             &job.source_fingerprint,
@@ -3294,8 +3296,7 @@ impl Supervisor {
                         }
                     };
                     if lease_lost.load(Ordering::SeqCst) || now_ms() >= deadline_ms {
-                        let reason =
-                    "batch deadline or verification lease ended during reviewer metadata refresh";
+                        let reason = "batch deadline or verification lease ended during reviewer metadata refresh";
                         let _ = jobs.record_verification_checkpoint(
                             job.id,
                             &job.source_fingerprint,
@@ -3348,9 +3349,11 @@ impl Supervisor {
                         || reviewed_observation_fingerprint != current_observation_fingerprint
                     {
                         return Err(SupervisorError::Verification(format!(
-                    "needs_input: provider routing evidence changed or became unavailable before reviewer dispatch: {}",
-                    observation_problem.unwrap_or_else(|| "observation snapshot fingerprint changed".into())
-                )));
+                            "needs_input: provider routing evidence changed or became unavailable before reviewer dispatch: {}",
+                            observation_problem.unwrap_or_else(|| {
+                                "observation snapshot fingerprint changed".into()
+                            })
+                        )));
                     }
                     facts
                 };
@@ -3880,7 +3883,9 @@ fn verified_predecessors(
         let record = isolation.recover_workspace(prerequisite_issue_id)
             .map_err(|e| SupervisorError::Runtime(format!("verified prerequisite {prerequisite_issue_id} has no recoverable isolation record: {e}")))?;
         let Some(commit) = record.owned_commits.last() else {
-            return Err(SupervisorError::Conflict(format!("prerequisite {prerequisite_issue_id} is verified but has no recorded local commit to integrate; explicit reconciliation/input is required")));
+            return Err(SupervisorError::Conflict(format!(
+                "prerequisite {prerequisite_issue_id} is verified but has no recorded local commit to integrate; explicit reconciliation/input is required"
+            )));
         };
         let evidence = jobs.get_checkpoint(predecessor_job.id, "verification_complete")?
             .unwrap_or_else(|| json!({"completionGate":predecessor_job.completion_gate,"issueFingerprint":predecessor_job.source_fingerprint}));
@@ -3912,7 +3917,13 @@ fn implementation_prompt(
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("Implement the selected local issue in this isolated worktree. Do not commit, push, publish, merge, or deploy.\nIssue: {issue_id}\nIssue snapshot fingerprint: {issue_fingerprint}\nTask: {}\nPermitted files:\n{}\nAcceptance criteria:\n{}\nPlan task count: {}\nWork only within the permitted files, run no undeclared external actions, and report a concise completion summary. If blocked by approval, credentials, or required human input, stop and state the specific requirement.", task.task_id, files, acceptance, plan.tasks.len())
+    format!(
+        "Implement the selected local issue in this isolated worktree. Do not commit, push, publish, merge, or deploy.\nIssue: {issue_id}\nIssue snapshot fingerprint: {issue_fingerprint}\nTask: {}\nPermitted files:\n{}\nAcceptance criteria:\n{}\nPlan task count: {}\nWork only within the permitted files, run no undeclared external actions, and report a concise completion summary. If blocked by approval, credentials, or required human input, stop and state the specific requirement.",
+        task.task_id,
+        files,
+        acceptance,
+        plan.tasks.len()
+    )
 }
 
 fn safe_checkpoint_key(value: &str) -> String {
@@ -3927,11 +3938,7 @@ fn safe_checkpoint_key(value: &str) -> String {
         })
         .take(80)
         .collect::<String>();
-    if key.is_empty() {
-        "task".into()
-    } else {
-        key
-    }
+    if key.is_empty() { "task".into() } else { key }
 }
 
 fn checkpoint_process_identity(value: &Value) -> Option<crate::process::ProcessIdentity> {
@@ -4347,7 +4354,9 @@ fn persist_verification_needs_input(
     let reason = if source_is_current {
         reason.to_owned()
     } else {
-        format!("{reason}; workspace source identity is unavailable, inspect the current workspace before accepting")
+        format!(
+            "{reason}; workspace source identity is unavailable, inspect the current workspace before accepting"
+        )
     };
     jobs.require_manual_acceptance(
         job.id,
@@ -4655,7 +4664,7 @@ where
             Err(BudgetError::Exhausted(reason)) => {
                 return Err(SupervisorError::Verification(format!(
                     "needs_input: provider budget cannot admit this task before dispatch: {reason}"
-                )))
+                )));
             }
             Err(error) => return Err(SupervisorError::Budget(error)),
         }
@@ -5676,7 +5685,10 @@ fn validate_request_inner(
                 .filter(|task| task.kind == TaskKind::Reviewer)
                 .collect::<Vec<_>>();
             if reviewers.len() != 1 {
-                return Err(SupervisorError::Invalid(format!("{} must declare exactly one Reviewer task with explicit provider, model, and resource caps", job.issue_id)));
+                return Err(SupervisorError::Invalid(format!(
+                    "{} must declare exactly one Reviewer task with explicit provider, model, and resource caps",
+                    job.issue_id
+                )));
             }
             let reviewer = reviewers[0];
             if reviewer.task_id != policy.reviewer.task_id
@@ -5688,7 +5700,10 @@ fn validate_request_inner(
                 || reviewer.limits.max_cost_micros.unwrap_or(0)
                     > request.policy.budget.max_cost_micros
             {
-                return Err(SupervisorError::Invalid(format!("{} reviewer policy must exactly match its declared Reviewer task and explicit token, cost, and time caps", job.issue_id)));
+                return Err(SupervisorError::Invalid(format!(
+                    "{} reviewer policy must exactly match its declared Reviewer task and explicit token, cost, and time caps",
+                    job.issue_id
+                )));
             }
         }
     }
@@ -5820,6 +5835,13 @@ fn validate_paid_model_policy(
     policy: &crate::paid_gateway::PaidModelPolicy,
     refreshed_pricing_time_ms: Option<u64>,
 ) -> Result<(), SupervisorError> {
+    if crate::economy::is_router_model_id(model_id) || crate::economy::is_free_variant_id(model_id)
+    {
+        return Err(SupervisorError::Invalid(format!(
+            "paid task {} cannot use a router identity or free model variant",
+            task.task_id
+        )));
+    }
     let model = profile
         .models
         .iter()
@@ -6225,7 +6247,10 @@ fn validate_issue_sources(
             SupervisorError::Invalid(format!("{} Markdown is not UTF-8", job.issue_id))
         })?;
         if crate::issues::revision(raw) != job.source_fingerprint || raw != job.issue_snapshot {
-            return Err(SupervisorError::Conflict(format!("{} issue Markdown changed after its snapshot was created; refresh and preview again",job.issue_id)));
+            return Err(SupervisorError::Conflict(format!(
+                "{} issue Markdown changed after its snapshot was created; refresh and preview again",
+                job.issue_id
+            )));
         }
     }
     Ok(())
@@ -6716,6 +6741,7 @@ fn route_task(
             quality_rating,
             latency_ms: None,
             latency_collected_at_ms: None,
+            economy_evidence_ready: false,
         });
 
         let Some(mut observed) = facts
@@ -7064,9 +7090,11 @@ mod supervisor_tests {
         let unavailable = SupervisorError::Verification(
             "needs_input: reviewer metadata refresh failed before dispatch: exact selected model is unavailable".into(),
         );
-        assert!(unavailable
-            .to_string()
-            .starts_with("verification error: needs_input:"));
+        assert!(
+            unavailable
+                .to_string()
+                .starts_with("verification error: needs_input:")
+        );
         assert!(verification_error_requires_input(&unavailable));
         assert!(!verification_error_requires_input(
             &SupervisorError::Verification("check command failed".into(),)
@@ -7279,13 +7307,15 @@ mod supervisor_tests {
             .write_all(b"\n")
             .unwrap();
 
-        assert!(supervisor
-            .verify_ready_jobs(
-                &request.batch_id,
-                "verification-needs-input-worker",
-                &preview.request
-            )
-            .unwrap());
+        assert!(
+            supervisor
+                .verify_ready_jobs(
+                    &request.batch_id,
+                    "verification-needs-input-worker",
+                    &preview.request
+                )
+                .unwrap()
+        );
         let status = supervisor.status_view(&request.batch_id).unwrap();
         let public_job = &status.jobs[0];
         assert_eq!(public_job.state, JobState::NeedsInput);
@@ -7294,27 +7324,33 @@ mod supervisor_tests {
             .get_checkpoint(claim.job.id, "manual_acceptance_required")
             .unwrap()
             .unwrap();
-        assert!(manual_acceptance["items"][0]
-            .as_str()
-            .unwrap()
-            .contains("needs_input:"));
+        assert!(
+            manual_acceptance["items"][0]
+                .as_str()
+                .unwrap()
+                .contains("needs_input:")
+        );
 
-        assert!(jobs
-            .get_checkpoint(claim.job.id, "verification_route_refresh")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(claim.job.id, "verification_check_0")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(claim.job.id, "verification_review")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(claim.job.id, "verification_repair_round_1")
-            .unwrap()
-            .is_none());
+        assert!(
+            jobs.get_checkpoint(claim.job.id, "verification_route_refresh")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(claim.job.id, "verification_check_0")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(claim.job.id, "verification_review")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(claim.job.id, "verification_repair_round_1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7432,33 +7468,39 @@ mod supervisor_tests {
             .get_checkpoint(job.id, "manual_acceptance_required")
             .unwrap()
             .unwrap();
-        assert!(manual["items"][0]
-            .as_str()
-            .unwrap()
-            .contains("needs_input: workspace ownership recovery"));
+        assert!(
+            manual["items"][0]
+                .as_str()
+                .unwrap()
+                .contains("needs_input: workspace ownership recovery")
+        );
         assert_eq!(manual["codeHead"].as_str(), Some(proposal_head.as_str()));
         assert_eq!(
             manual["codeFingerprint"].as_str(),
             Some(proposal_fingerprint.as_str())
         );
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_check_0")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_review")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_repair_round_1")
-            .unwrap()
-            .is_none());
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_check_0")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_review")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_repair_round_1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn execution_paid_policy_uses_fresh_timestamp_without_mutating_reviewed_quote() {
         let now = now_ms().max(0) as u64;
         let reviewed = crate::paid_gateway::PaidModelPolicy {
+            mode: crate::paid_gateway::GatewayMode::Paid,
             provider_id: "openrouter-fixture".into(),
             model_id: "paid-model".into(),
             runtime_id: "aider".into(),
@@ -7515,6 +7557,7 @@ mod supervisor_tests {
             output_micros_per_million_tokens: Some(20_000),
             pricing_source: Some("verified-fixture-catalog".into()),
             pricing_verified_at_ms: Some(now as u128),
+            economy_policy: None,
             context_tokens: Some(16_384),
             supports_tools: Some(true),
             evidence_ready: true,
@@ -7544,9 +7587,11 @@ mod supervisor_tests {
             }],
             paid_quote: Some(quote),
         };
-        assert!(check_fresh_paid_quote(&commitment, &changed_facts)
-            .unwrap_err()
-            .contains("quote or source changed"));
+        assert!(
+            check_fresh_paid_quote(&commitment, &changed_facts)
+                .unwrap_err()
+                .contains("quote or source changed")
+        );
     }
 
     fn budget_request(id: &str) -> ReservationRequest {
@@ -7636,11 +7681,10 @@ mod supervisor_tests {
             "src-tauri/src/game_view.rs".to_owned(),
             "web/theme.css".to_owned(),
         ];
-        assert!(validate_observed_change_scope(
-            &["src-tauri\\src\\game_view.rs".to_owned()],
-            &allowed,
-        )
-        .is_ok());
+        assert!(
+            validate_observed_change_scope(&["src-tauri\\src\\game_view.rs".to_owned()], &allowed,)
+                .is_ok()
+        );
         let error =
             validate_observed_change_scope(&["web/app.js".to_owned()], &allowed).unwrap_err();
         assert!(error.contains("outside declared task scope"));
@@ -7881,10 +7925,12 @@ mod supervisor_tests {
         let job = jobs.get(batch.job_ids[0]).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(job.attempt_count, 0);
-        assert!(!BatchStore::open(&supervisor.paths().batches)
-            .unwrap()
-            .acquire_verification(&request.batch_id, job.id, "late-verifier", 3, MAX_LEASE_MS)
-            .unwrap());
+        assert!(
+            !BatchStore::open(&supervisor.paths().batches)
+                .unwrap()
+                .acquire_verification(&request.batch_id, job.id, "late-verifier", 3, MAX_LEASE_MS)
+                .unwrap()
+        );
         assert_eq!(
             supervisor.status(&request.batch_id).unwrap().state,
             BatchState::Cancelled
@@ -7999,9 +8045,11 @@ mod supervisor_tests {
         .unwrap();
 
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
-        assert!(batches
-            .reserve_worker(&request.batch_id, "cancel-unknown-worker", 0, 4)
-            .unwrap());
+        assert!(
+            batches
+                .reserve_worker(&request.batch_id, "cancel-unknown-worker", 0, 4)
+                .unwrap()
+        );
         let worker_identity = crate::process::current_process_identity().unwrap();
         batches
             .worker_started(
@@ -8374,39 +8422,49 @@ mod supervisor_tests {
             .unwrap();
         assert_eq!(failure["statusKey"], "workspace_preparation_failure");
         assert_eq!(failure["stage"], "prepare_workspace");
-        assert!(failure["error"]
-            .as_str()
-            .unwrap()
-            .contains("existing issue checkout"));
+        assert!(
+            failure["error"]
+                .as_str()
+                .unwrap()
+                .contains("existing issue checkout")
+        );
         assert!(failure["guidance"].as_str().unwrap().contains("inspect"));
         assert!(failure.to_string().len() < 2048);
         let status = supervisor.status_view(&request.batch_id).unwrap();
         let job_status = &status.jobs[0];
         assert_eq!(job_status.state, JobState::NeedsInput);
-        assert!(job_status
-            .checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.key == "workspace_preparation_failure"));
-        assert!(supervisor
-            .morning_summary(&request.batch_id)
-            .unwrap()
-            .needs_input
-            .contains(&"TEST-L001".into()));
+        assert!(
+            job_status
+                .checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.key == "workspace_preparation_failure")
+        );
+        assert!(
+            supervisor
+                .morning_summary(&request.batch_id)
+                .unwrap()
+                .needs_input
+                .contains(&"TEST-L001".into())
+        );
 
         let reservation = reservation_id(&request.batch_id, job_id, "implement", 1);
-        assert!(BudgetStore::open(&supervisor.paths().budgets)
-            .unwrap()
-            .get_optional(&reservation)
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job_id, "runtime_process_implement")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job_id, "dispatch_implement")
-            .unwrap()
-            .is_none());
+        assert!(
+            BudgetStore::open(&supervisor.paths().budgets)
+                .unwrap()
+                .get_optional(&reservation)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job_id, "runtime_process_implement")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job_id, "dispatch_implement")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fs::read(&ownership_path).unwrap(), original_ownership);
         assert_eq!(
             fs::read(project.join("TEST-L001.md")).unwrap(),
@@ -8635,27 +8693,25 @@ mod supervisor_tests {
 
         let mut changed_privacy = fresh.clone();
         changed_privacy.facts.local_only = !commitment.local_only;
-        assert!(check_fresh_route_commitment(
-            &preview.request,
-            &settings,
-            job,
-            task,
-            &changed_privacy
-        )
-        .unwrap_err()
-        .contains("privacy or billing"));
+        assert!(
+            check_fresh_route_commitment(&preview.request, &settings, job, task, &changed_privacy)
+                .unwrap_err()
+                .contains("privacy or billing")
+        );
 
         let mut changed_capability = fresh.clone();
         changed_capability.facts.supports_tools = Some(false);
-        assert!(check_fresh_route_commitment(
-            &preview.request,
-            &settings,
-            job,
-            task,
-            &changed_capability
-        )
-        .unwrap_err()
-        .contains("tool capability"));
+        assert!(
+            check_fresh_route_commitment(
+                &preview.request,
+                &settings,
+                job,
+                task,
+                &changed_capability
+            )
+            .unwrap_err()
+            .contains("tool capability")
+        );
 
         assert!(matches!(
             crate::provider_observations::ModelFreeRefreshConsent::default(),
@@ -8712,15 +8768,11 @@ mod supervisor_tests {
 
             let mut alternate = refreshed;
             alternate.facts.provider_id = "unreviewed-provider".into();
-            assert!(check_fresh_route_commitment(
-                &preview.request,
-                &settings,
-                job,
-                task,
-                &alternate
-            )
-            .unwrap_err()
-            .contains("different route"));
+            assert!(
+                check_fresh_route_commitment(&preview.request, &settings, job, task, &alternate)
+                    .unwrap_err()
+                    .contains("different route")
+            );
         }
     }
 
@@ -8774,19 +8826,23 @@ mod supervisor_tests {
             .unwrap();
         assert_eq!(audit["state"], "needs_input");
         assert!(audit["reason"].as_str().unwrap().contains("runtime"));
-        assert!(BudgetStore::open(&supervisor.paths().budgets)
-            .unwrap()
-            .get_optional(&reservation_id(&request.batch_id, job.id, "implement", 1))
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "dispatch_implement")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "runtime_process_implement")
-            .unwrap()
-            .is_none());
+        assert!(
+            BudgetStore::open(&supervisor.paths().budgets)
+                .unwrap()
+                .get_optional(&reservation_id(&request.batch_id, job.id, "implement", 1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "dispatch_implement")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "runtime_process_implement")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -8810,10 +8866,12 @@ mod supervisor_tests {
         assert_eq!(checkpoint["statusKey"], "runtime_input_request");
         assert_eq!(checkpoint["threadId"], "thread-local-fixture");
         assert_eq!(checkpoint["requestId"], 17);
-        assert!(checkpoint["method"]
-            .as_str()
-            .unwrap()
-            .contains("requestApproval"));
+        assert!(
+            checkpoint["method"]
+                .as_str()
+                .unwrap()
+                .contains("requestApproval")
+        );
     }
 
     #[test]
@@ -8951,9 +9009,11 @@ mod supervisor_tests {
         supervisor.start(&request, 1).unwrap();
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
         let identity = crate::process::current_process_identity().unwrap();
-        assert!(batches
-            .reserve_worker(&request.batch_id, "persisted-live-worker", 0, 2)
-            .unwrap());
+        assert!(
+            batches
+                .reserve_worker(&request.batch_id, "persisted-live-worker", 0, 2)
+                .unwrap()
+        );
         batches
             .worker_started(
                 "persisted-live-worker",
@@ -8995,10 +9055,12 @@ mod supervisor_tests {
             deadline_ms: now_ms() - 1,
             build_output: PathBuf::new(),
         };
-        assert!(executor
-            .execute(Path::new("."), &check)
-            .unwrap_err()
-            .contains("deadline expired"));
+        assert!(
+            executor
+                .execute(Path::new("."), &check)
+                .unwrap_err()
+                .contains("deadline expired")
+        );
 
         let (_folder, mut request, _worker, _settings_path) = preview_fixture();
         request.policy.max_network_retries = 1;
@@ -9068,10 +9130,12 @@ mod supervisor_tests {
         assert_eq!(aggregate.max_seconds, 100);
 
         request.policy.budget.max_tokens = 1_000;
-        assert!(Supervisor::dry_run_request(&request)
-            .unwrap_err()
-            .to_string()
-            .contains("aggregate job budget exceeds the batch"));
+        assert!(
+            Supervisor::dry_run_request(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("aggregate job budget exceeds the batch")
+        );
 
         request.policy.budget.max_tokens = 10_000;
         assert!(Supervisor::dry_run_request(&request).is_ok());
@@ -9191,9 +9255,11 @@ mod supervisor_tests {
         seed_fixture_provider_observations(&supervisor.paths().root, &request.settings_path);
         supervisor.start(&request, now_ms()).unwrap();
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
-        assert!(batches
-            .reserve_worker(&request.batch_id, "expired-paused-worker", 0, now_ms())
-            .unwrap());
+        assert!(
+            batches
+                .reserve_worker(&request.batch_id, "expired-paused-worker", 0, now_ms())
+                .unwrap()
+        );
         batches
             .worker_started("expired-paused-worker", 4_000_000_000, Some(1), now_ms())
             .unwrap();
@@ -9475,9 +9541,11 @@ mod supervisor_tests {
         seed_fixture_provider_observations(&supervisor.paths().root, &request.settings_path);
         supervisor.start(&request, now_ms()).unwrap();
         let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
-        assert!(batches
-            .reserve_worker(&request.batch_id, "dead-hosted-worker", 0, now_ms())
-            .unwrap());
+        assert!(
+            batches
+                .reserve_worker(&request.batch_id, "dead-hosted-worker", 0, now_ms())
+                .unwrap()
+        );
         batches
             .worker_started("dead-hosted-worker", 4_000_000_000, Some(1), now_ms())
             .unwrap();
@@ -9601,14 +9669,18 @@ mod supervisor_tests {
         )
         .unwrap();
         let status = supervisor.status_view(&request.batch_id).unwrap();
-        assert!(status.jobs[0]
-            .checkpoints
-            .iter()
-            .all(|checkpoint| checkpoint.key != "implementation_proposed"));
-        assert!(status.jobs[0]
-            .checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.key == "runtime_usage"));
+        assert!(
+            status.jobs[0]
+                .checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.key != "implementation_proposed")
+        );
+        assert!(
+            status.jobs[0]
+                .checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.key == "runtime_usage")
+        );
         assert!(status.jobs[0].checkpoints_truncated);
         assert_eq!(status.jobs.len(), MAX_BATCH_JOBS);
     }
@@ -9681,10 +9753,12 @@ mod supervisor_tests {
         let status = supervisor.status_view(&request.batch_id).unwrap();
         assert_eq!(status.jobs.len(), 17);
         assert!(status.jobs[16].checkpoints_truncated);
-        assert!(status.jobs[16]
-            .checkpoints
-            .iter()
-            .all(|checkpoint| checkpoint.key != key));
+        assert!(
+            status.jobs[16]
+                .checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.key != key)
+        );
         let total_status_bytes: usize = status
             .jobs
             .iter()
@@ -9851,9 +9925,11 @@ mod supervisor_tests {
                 .state,
             BatchState::Running
         );
-        assert!(store
-            .reserve_worker("batch-a", "running-worker", 0, 5)
-            .unwrap());
+        assert!(
+            store
+                .reserve_worker("batch-a", "running-worker", 0, 5)
+                .unwrap()
+        );
         assert_eq!(
             store
                 .control("batch-a", "stopping", "finish current work", 6)
@@ -9952,22 +10028,27 @@ mod supervisor_tests {
         assert_eq!(failure["statusKey"], "post_provider_capture_failure");
         assert_eq!(failure["state"], "needs_input");
         assert_eq!(failure["stage"], "allowed_scope_validation");
-        assert!(failure["error"]
-            .as_str()
-            .unwrap()
-            .contains("unexpected.txt"));
-        assert!(jobs
-            .get_checkpoint(job.id, "implementation_proposed")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_review")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_complete")
-            .unwrap()
-            .is_none());
+        assert!(
+            failure["error"]
+                .as_str()
+                .unwrap()
+                .contains("unexpected.txt")
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "implementation_proposed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_review")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_complete")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -9992,14 +10073,16 @@ mod supervisor_tests {
         let record = isolation.recover_workspace(&claim.job.issue_id).unwrap();
         assert_eq!(record.owned_changes, vec!["output.txt"]);
         let jobs = JobsStore::open(&supervisor.paths().jobs).unwrap();
-        assert!(jobs
-            .get_checkpoint(claim.job.id, "implementation_proposed")
-            .unwrap()
-            .is_some());
-        assert!(jobs
-            .get_checkpoint(claim.job.id, "post_provider_capture_failure")
-            .unwrap()
-            .is_none());
+        assert!(
+            jobs.get_checkpoint(claim.job.id, "implementation_proposed")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            jobs.get_checkpoint(claim.job.id, "post_provider_capture_failure")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -10034,14 +10117,16 @@ mod supervisor_tests {
             .unwrap();
         assert_eq!(failure["stage"], "observed_changed_paths");
         assert!(failure["error"].as_str().unwrap().contains("cancelled"));
-        assert!(jobs
-            .get_checkpoint(job.id, "implementation_proposed")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_review")
-            .unwrap()
-            .is_none());
+        assert!(
+            jobs.get_checkpoint(job.id, "implementation_proposed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_review")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             fs::read_to_string(worktree.join("output.txt")).unwrap(),
             "provider result retained"
@@ -10103,14 +10188,16 @@ mod supervisor_tests {
             .unwrap()
             .unwrap();
         assert_eq!(failure["stage"], "source_changed_during_metadata_wait");
-        assert!(jobs
-            .get_checkpoint(job.id, "implementation_proposed")
-            .unwrap()
-            .is_none());
-        assert!(jobs
-            .get_checkpoint(job.id, "verification_review")
-            .unwrap()
-            .is_none());
+        assert!(
+            jobs.get_checkpoint(job.id, "implementation_proposed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.get_checkpoint(job.id, "verification_review")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             fs::read_to_string(worktree.join("output.txt")).unwrap(),
             "external content drift"

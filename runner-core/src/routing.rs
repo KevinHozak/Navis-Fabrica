@@ -49,6 +49,10 @@ pub struct Candidate {
     pub quality_rating: Option<u8>,
     pub latency_ms: Option<u128>,
     pub latency_collected_at_ms: Option<u128>,
+    /// Backend-only proof that dated coding-trial and privacy evidence passed.
+    /// Never accepted from a request or settings file.
+    #[serde(skip)]
+    pub economy_evidence_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +122,10 @@ pub struct CandidateFacts {
     pub output_micros_per_million_tokens: Option<u64>,
     pub pricing_source: Option<String>,
     pub pricing_verified_at_ms: Option<u128>,
+    /// Dated coding trial and endpoint privacy evidence are required before a
+    /// zero-price remote route may be considered for Economy.
+    #[serde(skip)]
+    pub economy_policy: Option<crate::economy::EconomyModelPolicy>,
     /// Context and tool facts come from refreshed backend observations, not
     /// the configured model label. None is unknown and fails capability checks.
     #[serde(default)]
@@ -244,10 +252,19 @@ fn route_assignment(assignment: &AssignmentRequest, facts: &[CandidateFacts]) ->
             fact.provider_id == candidate.provider_id && fact.model_id == candidate.model_id
         });
         let mut reason = None;
+        if crate::economy::is_router_model_id(&candidate.model_id) {
+            reason =
+                Some("Rejected: provider router IDs are not fixed model identities.".to_owned());
+        }
         match fact {
-            None => reason = Some("Rejected: provider runtime, authentication, health, and privacy facts are missing.".to_owned()),
+            None if reason.is_none() => reason = Some("Rejected: provider runtime, authentication, health, and privacy facts are missing.".to_owned()),
+            None => {},
             Some(fact) => {
-                if !fact.evidence_ready { reason = Some(fact.evidence_reasons.first().cloned().unwrap_or_else(|| "Rejected: provider observations are incomplete or stale.".to_owned())); }
+                if reason.is_some() {}
+                else if crate::economy::is_free_variant_id(&candidate.model_id) && fact.economy_policy.is_none() {
+                    reason = Some("Rejected: free model variants require backend verified Economy admission.".into());
+                }
+                else if !fact.evidence_ready { reason = Some(fact.evidence_reasons.first().cloned().unwrap_or_else(|| "Rejected: provider observations are incomplete or stale.".to_owned())); }
                 else if fact.billing == BillingPolicy::Unknown { reason = Some("Rejected: provider billing type is unknown.".into()); }
                 else if !fact.runtime_installed { reason = Some("Rejected: configured runtime is not installed.".into()); }
                 else if assignment.required_runtime_id.as_ref().is_some_and(|runtime| runtime != &fact.runtime_id) { reason = Some("Rejected: candidate does not match the required runtime.".into()); }
@@ -255,6 +272,12 @@ fn route_assignment(assignment: &AssignmentRequest, facts: &[CandidateFacts]) ->
                 else if !fact.authenticated { reason = Some("Rejected: provider credentials or authentication are unavailable.".into()); }
                 else if !fact.healthy || fact.health_checked_at_ms.is_none_or(|checked| checked > assignment.request.now_ms || assignment.request.now_ms.saturating_sub(checked) > 5 * 60 * 1000) { reason = Some("Rejected: provider health is unavailable, stale, or unhealthy.".into()); }
                 else if assignment.request.local_only && (!candidate.is_local || !fact.local_only) { reason = Some("Rejected: local-only privacy excludes this provider.".into()); }
+                else if assignment.request.pace == Pace::Economy
+                    && fact.billing == BillingPolicy::Paid
+                    && fact.input_micros_per_million_tokens == Some(0)
+                    && fact.output_micros_per_million_tokens == Some(0)
+                    && fact.economy_policy.is_none()
+                { reason = Some("Rejected: zero-price remote models need dated coding-trial and endpoint privacy evidence before Economy selection.".into()); }
                 else if fact.billing == BillingPolicy::Paid && (assignment.max_input_tokens.is_none() || assignment.max_output_tokens.is_none()) { reason = Some("Rejected: paid work requires maximum input and output-token policies.".into()); }
                 else if fact.billing == BillingPolicy::Paid && (fact.input_micros_per_million_tokens.is_none() || fact.output_micros_per_million_tokens.is_none() || fact.pricing_source.as_deref().is_none_or(|source|source.trim().is_empty()) || fact.pricing_verified_at_ms.is_none_or(|checked| checked > assignment.request.now_ms || assignment.request.now_ms.saturating_sub(checked) > 24 * 60 * 60 * 1000)) { reason = Some("Rejected: paid work requires fresh verified input and output pricing provenance.".into()); }
             }
@@ -536,7 +559,10 @@ pub fn evaluate_fallback(mut request: FallbackRequest) -> FallbackDecision {
         );
     }
     if !request.effects_reconciled {
-        return denied_fallback(&request, "Completed external effects have not been reconciled; fallback is paused to prevent duplicates.");
+        return denied_fallback(
+            &request,
+            "Completed external effects have not been reconciled; fallback is paused to prevent duplicates.",
+        );
     }
     if request.source_run_id.trim().is_empty()
         || request.source_run_id.len() > 100
@@ -800,6 +826,13 @@ fn latency(candidate: &Candidate, now_ms: u128) -> Option<u128> {
     candidate.latency_ms
 }
 
+fn is_openrouter_free_route(model_id: &str) -> bool {
+    model_id == "openrouter/free"
+        || model_id == "openrouter/auto"
+        || model_id.ends_with(":free")
+        || model_id.ends_with("/free")
+}
+
 fn latency_first(a: Option<u128>, b: Option<u128>) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) => a.cmp(&b),
@@ -900,6 +933,24 @@ pub fn decide(request: Request) -> Decision {
                 Some(false) => { eligible = false; reasons.push("Rejected: model reports no tool support.".into()); },
                 None => { eligible = false; reasons.push("Rejected: tool support is unknown.".into()); },
             }
+        }
+        if crate::economy::is_router_model_id(&candidate.model_id) {
+            eligible = false;
+            reasons.push("Rejected: provider router IDs are not fixed model identities.".into());
+        }
+        if crate::economy::is_free_variant_id(&candidate.model_id)
+            && (request.pace != Pace::Economy || !candidate.economy_evidence_ready)
+        {
+            eligible = false;
+            reasons.push("Rejected: free model variants require backend verified Economy admission and cannot use paid routing.".into());
+        }
+        if request.pace == Pace::Economy
+            && !candidate.is_local
+            && is_openrouter_free_route(&candidate.model_id)
+            && !candidate.economy_evidence_ready
+        {
+            eligible = false;
+            reasons.push("Rejected: this zero-price remote model has no backend-verified coding trial and endpoint privacy evidence.".into());
         }
         if request.local_only && !candidate.is_local {
             eligible = false;
@@ -1098,6 +1149,7 @@ mod tests {
             quality_rating: rating,
             latency_ms: latency,
             latency_collected_at_ms: latency.map(|_| 10_000),
+            economy_evidence_ready: false,
         }
     }
 
@@ -1130,11 +1182,13 @@ mod tests {
         request.require_context_evidence = true;
         let decision = decide(request);
         assert_eq!(decision.selected_provider_id, None);
-        assert!(decision
-            .candidates
-            .iter()
-            .flat_map(|row| &row.reasons)
-            .any(|reason| reason.contains("context capacity is unknown")));
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .flat_map(|row| &row.reasons)
+                .any(|reason| reason.contains("context capacity is unknown"))
+        );
     }
 
     #[test]
@@ -1335,10 +1389,12 @@ mod tests {
         let decision = decide(request);
         assert_eq!(decision.selected_provider_id.as_deref(), Some("faster"));
         assert!(decision.desired_completion_note.contains("soft preference"));
-        assert!(decision.candidates[1]
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("does not predict")));
+        assert!(
+            decision.candidates[1]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("does not predict"))
+        );
     }
 
     fn fallback_request(candidates: Vec<Candidate>) -> FallbackRequest {
@@ -1420,9 +1476,11 @@ mod tests {
         input.routing.manual_model_id = Some("model".into());
         let decision = evaluate_fallback(input);
         assert!(!decision.accepted);
-        assert!(decision
-            .reason
-            .contains("manual fallback override is not eligible"));
+        assert!(
+            decision
+                .reason
+                .contains("manual fallback override is not eligible")
+        );
     }
 
     #[test]
@@ -1579,6 +1637,7 @@ mod tests {
             output_micros_per_million_tokens: Some(price),
             pricing_source: (!local).then(|| "fixture-pricing".into()),
             pricing_verified_at_ms: Some(10_100),
+            economy_policy: None,
             context_tokens: Some(32_768),
             supports_tools: Some(true),
             evidence_ready: true,
@@ -1616,12 +1675,14 @@ mod tests {
             result.implementer.decision.selected_provider_id.as_deref(),
             Some("local")
         );
-        assert!(result
-            .implementer
-            .decision
-            .candidates
-            .iter()
-            .any(|row| row.provider_id == "remote" && !row.eligible));
+        assert!(
+            result
+                .implementer
+                .decision
+                .candidates
+                .iter()
+                .any(|row| row.provider_id == "remote" && !row.eligible)
+        );
         assert_eq!(result.implementer.estimated_cost_micros, Some(0));
     }
 
@@ -1649,12 +1710,52 @@ mod tests {
         };
         let result = route_job(request);
         assert_eq!(result.implementer.decision.selected_provider_id, None);
-        assert!(result
-            .implementer
-            .decision
-            .candidates
-            .iter()
-            .any(|row| row.provider_id == "paid" && row.reasons.join(" ").contains("pricing")));
+        assert!(
+            result
+                .implementer
+                .decision
+                .candidates
+                .iter()
+                .any(|row| row.provider_id == "paid" && row.reasons.join(" ").contains("pricing"))
+        );
+    }
+
+    #[test]
+    fn economy_never_selects_a_zero_price_remote_model_without_backend_evaluation_and_privacy_evidence()
+     {
+        let mut request = request(vec![candidate(
+            "openrouter-main",
+            false,
+            Some(32_000),
+            Some(true),
+            Some(5),
+            Some(20),
+        )]);
+        request.candidates[0].model_id = "vendor/model:free".into();
+        request.pace = Pace::Economy;
+        let mut free = facts("openrouter-main", "vendor/model:free", false, 0);
+        free.input_micros_per_million_tokens = Some(0);
+        free.output_micros_per_million_tokens = Some(0);
+        let result = route_job(JobRoutingRequest {
+            implementer: AssignmentRequest {
+                task_id: "implementation".into(),
+                request,
+                required_runtime_id: Some("runtime-openrouter-main".into()),
+                max_input_tokens: Some(100),
+                max_output_tokens: Some(100),
+            },
+            reviewer: None,
+            candidate_facts: vec![free],
+        });
+        assert_eq!(result.implementer.decision.selected_model_id, None);
+        let row = &result.implementer.decision.candidates[0];
+        assert!(!row.eligible);
+        assert_eq!(row.model_id, "vendor/model:free");
+        assert!(
+            row.reasons
+                .join(" ")
+                .contains("dated coding-trial and endpoint privacy evidence")
+        );
     }
 
     #[test]
@@ -1679,10 +1780,12 @@ mod tests {
             candidate_facts: vec![facts("paid", "model", false, 5)],
         });
         assert_eq!(result.implementer.decision.selected_model_id, None);
-        assert!(result.implementer.decision.candidates[0]
-            .reasons
-            .join(" ")
-            .contains("token"));
+        assert!(
+            result.implementer.decision.candidates[0]
+                .reasons
+                .join(" ")
+                .contains("token")
+        );
     }
 
     #[test]

@@ -1245,6 +1245,7 @@ impl ProviderObservationSnapshot {
                     health_checked_at_ms: observed.health_checked_at_ms,
                     model_available: available && model.model_available.value == Some(true),
                     local_only: privacy && model.local_only.value == Some(true),
+                    economy_policy: None,
                     context_tokens: if context {
                         model.context_tokens.value
                     } else {
@@ -1629,6 +1630,7 @@ mod tests {
         };
         let catalog_model = providers::OpenRouterModel {
             id: "vendor/model".into(),
+            canonical_slug: None,
             name: "Synthetic model".into(),
             context_length: Some(32_000),
             prompt_price: Some("0.000002".into()),

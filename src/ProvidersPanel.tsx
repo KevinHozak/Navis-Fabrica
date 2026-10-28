@@ -38,8 +38,28 @@ import {
   RoutingComplexity,
   RoutingPace,
 } from "./settings";
+import { EconomyModelStatus, EconomyStatusResponse, formatEconomyEvidenceDate, getEconomyModelStatuses } from "./economyModels";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
+
+function economyErrorMessage(error: unknown): string {
+  const message = typeof error === "string" ? error : error instanceof Error ? error.message : "Economy status is unavailable.";
+  return message.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 500) || "Economy status is unavailable.";
+}
+
+function evaluationLabel(status: EconomyModelStatus["evaluationStatus"]): string {
+  return status === "notEvaluated" ? "not evaluated" : status;
+}
+
+function evaluationSummary(model: EconomyModelStatus): string {
+  const count = model.evaluationCases > 0 ? ` · ${model.evaluationPassed}/${model.evaluationCases} cases passed` : "";
+  const evaluatedOn = formatEconomyEvidenceDate(model.evaluationAtMs);
+  const version = model.evaluationRuntimeVersion ?? "runtime unverified";
+  const current = model.currentRuntimeVersion && model.currentRuntimeVersion !== model.evaluationRuntimeVersion
+    ? ` · current ${model.currentRuntimeVersion}`
+    : "";
+  return `${evaluationLabel(model.evaluationStatus)}${count} · ${evaluatedOn} · Aider ${version}${current}`;
+}
 
 const executableDefaults: Record<ProviderKind, string> = {
   codex: "codex",
@@ -66,6 +86,9 @@ export function ProvidersPanel() {
   const [probes, setProbes] = useState<Record<string, AntigravityProbe>>({});
   const [ollamaProbes, setOllamaProbes] = useState<Record<string, OllamaProbe>>({});
   const [openRouterProbes, setOpenRouterProbes] = useState<Record<string, OpenRouterProbe>>({});
+  const [economyStatuses, setEconomyStatuses] = useState<Record<string, EconomyStatusResponse>>({});
+  const [economyStatusErrors, setEconomyStatusErrors] = useState<Record<string, string>>({});
+  const economyStatusRequests = useRef<Record<string, number>>({});
   const [openRouterKeys, setOpenRouterKeys] = useState<Record<string, string>>({});
   const [typeSafeProbe, setTypeSafeProbe] = useState<TypeSafeProbe | null>(null);
   const typeSafeKeyRef = useRef<HTMLInputElement>(null);
@@ -105,6 +128,12 @@ export function ProvidersPanel() {
   const [routingError, setRoutingError] = useState("");
   const routingInputRevision = useRef(0);
   const desktop = isDesktopApp();
+
+  useEffect(() => () => {
+    for (const providerId of Object.keys(economyStatusRequests.current)) {
+      economyStatusRequests.current[providerId] += 1;
+    }
+  }, []);
 
   const selectedProvider = settings?.providers.find((provider) => provider.id === settings.providerSelection.providerId);
   const selectedModel = selectedProvider?.models.find((model) => model.id === settings?.providerSelection.modelId);
@@ -151,6 +180,12 @@ export function ProvidersPanel() {
     setRoutingDecision(null);
     setJevEvaluation(null);
     setRoutingError("");
+  }
+
+  function invalidateEconomyStatus(providerId: string) {
+    economyStatusRequests.current[providerId] = (economyStatusRequests.current[providerId] ?? 0) + 1;
+    setEconomyStatuses((current) => { const next = { ...current }; delete next[providerId]; return next; });
+    setEconomyStatusErrors((current) => { const next = { ...current }; delete next[providerId]; return next; });
   }
 
   async function persist(next: Settings) {
@@ -220,6 +255,7 @@ export function ProvidersPanel() {
     try {
       const saved = await saveOpenRouterCredential(providerId, apiKey);
       setSettings(saved);
+      invalidateEconomyStatus(providerId);
       setOpenRouterKeys((current) => ({ ...current, [providerId]: "" }));
       setMessage("OpenRouter key saved to Windows Credential Manager.");
       setSaveState("saved");
@@ -256,6 +292,7 @@ export function ProvidersPanel() {
   }
 
   async function discoverOpenRouterModels(providerId: string) {
+    invalidateEconomyStatus(providerId);
     setProbingId(providerId);
     try {
       const result = await probeOpenRouter(providerId);
@@ -275,6 +312,22 @@ export function ProvidersPanel() {
       }
     } catch (error) {
       setOpenRouterProbes((current) => ({ ...current, [providerId]: { state: "unavailable", models: [], note: error instanceof Error ? error.message : "OpenRouter discovery failed." } }));
+    } finally { setProbingId(null); }
+  }
+
+  async function checkEconomyStatus(providerId: string) {
+    invalidateEconomyStatus(providerId);
+    const requestId = economyStatusRequests.current[providerId];
+    setProbingId(providerId);
+    try {
+      const statuses = await getEconomyModelStatuses(providerId);
+      if (economyStatusRequests.current[providerId] === requestId) {
+        setEconomyStatuses((current) => ({ ...current, [providerId]: statuses }));
+      }
+    } catch (error) {
+      if (economyStatusRequests.current[providerId] === requestId) {
+        setEconomyStatusErrors((current) => ({ ...current, [providerId]: economyErrorMessage(error) }));
+      }
     } finally { setProbingId(null); }
   }
 
@@ -528,6 +581,7 @@ export function ProvidersPanel() {
           return <li className="provider-card" key={provider.id}>
             <div className="provider-card-heading"><div><strong>{provider.name}</strong><span>{provider.kind} · {provider.executable}</span></div>
               <button className="text-button" type="button" onClick={() => {
+                invalidateEconomyStatus(provider.id);
                 const providers = settings.providers.filter((item) => item.id !== provider.id);
                 const selection = settings.providerSelection.providerId === provider.id ? { providerId: null, modelId: null, reasoningEffort: null, runtimeId: settings.providerSelection.runtimeId } : settings.providerSelection;
                 void persist({ ...settings, providers, providerSelection: selection });
@@ -553,8 +607,18 @@ export function ProvidersPanel() {
             </div>}
             {provider.kind === "openRouter" && <div className="provider-form">
               <label className="settings-field"><span>OpenRouter API key</span><input type="password" autoComplete="new-password" maxLength={4096} value={openRouterKeys[provider.id] ?? ""} onChange={(event) => setOpenRouterKeys((current) => ({ ...current, [provider.id]: event.target.value }))} placeholder={provider.secretRef ? "Enter a replacement key or leave blank" : "Paste key; saved directly to Windows Credential Manager"} /></label>
-              <div className="settings-actions"><button className="button button-secondary" type="button" disabled={!desktop || !openRouterKeys[provider.id]?.trim() || probingId === provider.id} onClick={() => { void saveOpenRouterKey(provider.id); }}>Save key securely</button><button className="button button-secondary" type="button" disabled={!desktop || !provider.secretRef || probingId === provider.id} onClick={() => { void discoverOpenRouterModels(provider.id); }}>{probingId === provider.id ? "Checking OpenRouter…" : "Discover models"}</button></div>
+              <div className="settings-actions"><button className="button button-secondary" type="button" disabled={!desktop || !openRouterKeys[provider.id]?.trim() || probingId === provider.id} onClick={() => { void saveOpenRouterKey(provider.id); }}>Save key securely</button><button className="button button-secondary" type="button" disabled={!desktop || !provider.secretRef || probingId === provider.id} onClick={() => { void discoverOpenRouterModels(provider.id); }}>{probingId === provider.id ? "Checking OpenRouter…" : "Discover models"}</button><button className="button button-secondary" type="button" disabled={!desktop || !provider.secretRef || probingId === provider.id} onClick={() => { void checkEconomyStatus(provider.id); }}>{probingId === provider.id ? "Checking…" : "Check Economy status"}</button></div>
               {openRouterProbes[provider.id] && <div className="provider-feedback" role="status"><strong>{openRouterProbes[provider.id].state}</strong> · {openRouterProbes[provider.id].note}<ul>{openRouterProbes[provider.id].models.slice(0, 100).map((model) => <li key={model.id}>{model.name} ({model.id}) · context {model.contextLength ?? "unknown"} · prompt price {model.promptPrice ?? "unknown"} · completion price {model.completionPrice ?? "unknown"} · input {model.inputModalities?.join(", ") ?? "unknown"} · output {model.outputModalities?.join(", ") ?? "unknown"} · parameters {model.supportedParameters?.join(", ") ?? "unknown"}</li>)}</ul></div>}
+              {(economyStatuses[provider.id] || economyStatusErrors[provider.id]) && <div className="provider-feedback" role="status">
+                <strong>Economy coding choices</strong>
+                <p>Authenticated catalog · {economyStatuses[provider.id] ? `observed ${formatEconomyEvidenceDate(economyStatuses[provider.id].catalogObservedAtMs)}` : "catalog unavailable"} · {economyStatuses[provider.id]?.freeModelDailyRequests ? `daily requests ${economyStatuses[provider.id].freeModelDailyRequests!.used} used · ${economyStatuses[provider.id].freeModelDailyRequests!.remaining} remaining of ${economyStatuses[provider.id].freeModelDailyRequests!.limit} (observed ${formatEconomyEvidenceDate(economyStatuses[provider.id].freeModelDailyRequests!.observedAtMs)})` : "account daily quota unknown"}</p>
+                {economyStatusErrors[provider.id] && <p>{economyStatusErrors[provider.id]}</p>}
+                {economyStatuses[provider.id]?.models.length ? <ul>{economyStatuses[provider.id].models.map((model) => <li key={model.modelId}>
+                  {model.modelId} · context {model.contextTokens ?? "unknown"} · input {model.inputPriceMicrosPer1m ?? "unknown"} μUSD/1M · output {model.outputPriceMicrosPer1m ?? "unknown"} μUSD/1M · evaluation {evaluationSummary(model)} · privacy {model.privacyStatus}{model.privacySource ? ` · ${model.privacySource}` : ""} · {model.selectable ? "eligible choice" : "not selectable"}
+                  {model.reasons.length > 0 && <small> · {model.reasons.join(" ")}</small>}
+                </li>)}</ul> : economyStatuses[provider.id] ? <p>No exact free model metadata entries were returned.</p> : null}
+                <details><summary>Published free-tier limits</summary><p>20 requests/minute; 50/day below 10 lifetime credits or 1,000/day from 9 credits (rounding allowance). Account limits can differ; the authenticated daily counter is shown when available.</p><a href="https://openrouter.ai/docs/api_reference/limits" target="_blank" rel="noreferrer">OpenRouter limits · checked 2026-10-27</a></details>
+              </div>}
             </div>}
           </li>;
         })}</ul> : <div className="provider-empty">No provider profiles yet. Add one below to configure a manual choice.</div>}

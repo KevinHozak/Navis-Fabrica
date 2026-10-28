@@ -24,6 +24,7 @@
     "allow-probe-ollama",
     "allow-save-openrouter-credential",
     "allow-probe-openrouter",
+    "allow-get-economy-model-status",
     "allow-save-typesafe-credential",
     "allow-probe-typesafe",
     "allow-start-openrouter-workflow-run",

@@ -13,9 +13,9 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -195,6 +195,8 @@ pub struct PaidDispatchContext<'a> {
     pub policy: &'a PaidModelPolicy,
     /// Immutable file allowlist admitted by the supervisor for this task.
     pub allowed_files: &'a [String],
+    pub authenticated_canonical_slug: Option<&'a str>,
+    pub economy_trial_task_id: Option<&'a str>,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -468,7 +470,7 @@ pub(crate) fn probe_codex_account_and_models_until(
                         authenticated,
                         model_list_verified: false,
                         models: Vec::new(),
-                    })
+                    });
                 }
             };
             if all_models.len().saturating_add(page_models.len()) > MAX_CODEX_MODELS
@@ -645,12 +647,21 @@ fn run_internal(
         .as_ref()
         .is_some_and(|value| value.len() > 2_048 || value.chars().any(char::is_control))
     {
-        return Err(RuntimeError::new("INVALID_TEST_COMMAND", "The optional test command must be 2,048 characters or fewer without control characters."));
+        return Err(RuntimeError::new(
+            "INVALID_TEST_COMMAND",
+            "The optional test command must be 2,048 characters or fewer without control characters.",
+        ));
     }
     if profile.kind == ProviderKind::OpenRouter {
         if !request.allow_paid {
-            return Ok(outcome(RuntimeState::PaidBudgetUnenforceable, profile, model_id, None, 0,
-                "Paid OpenRouter dispatch requires explicit authorization and a durable budget reservation."));
+            return Ok(outcome(
+                RuntimeState::PaidBudgetUnenforceable,
+                profile,
+                model_id,
+                None,
+                0,
+                "Paid OpenRouter dispatch requires explicit authorization and a durable budget reservation.",
+            ));
         }
         let Some(paid) = paid else {
             return Ok(outcome(
@@ -847,11 +858,24 @@ fn run_openrouter_paid(
         ));
     }
     let policy = paid.policy;
+    if crate::economy::is_router_model_id(model_id)
+        || (matches!(&policy.mode, crate::paid_gateway::GatewayMode::Paid)
+            && crate::economy::is_free_variant_id(model_id))
+    {
+        return Err(RuntimeError::new(
+            "ECONOMY_ADMISSION_REQUIRED",
+            "Router identities and free model variants require a separately admitted Economy route.",
+        ));
+    }
     if policy.provider_id != profile.id
         || policy.model_id != model_id
         || policy.runtime_id != "aider"
         || policy.pricing.request_fee_micros != 0
-        || policy.max_cost_micros == 0
+        || (policy.max_cost_micros == 0
+            && !matches!(
+                &policy.mode,
+                crate::paid_gateway::GatewayMode::SyntheticTrial { .. }
+            ))
     {
         return Err(RuntimeError::new(
             "PAID_POLICY_MISMATCH",
@@ -863,6 +887,41 @@ fn run_openrouter_paid(
     // making the read-only pricing request.
     check_aider_autoload_files(cwd)?;
     let source_files = resolve_paid_aider_source_files(cwd, paid.allowed_files)?;
+    if let Some(task_id) = paid.economy_trial_task_id {
+        let verified = crate::economy::verify_trial_fixture(task_id, cwd).map_err(|_| {
+            RuntimeError::new(
+                "ECONOMY_FIXTURE_CHANGED",
+                "The synthetic trial workspace changed or contains unapproved content.",
+            )
+        })?;
+        let expected = verified
+            .task
+            .seed_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let observed = source_files
+            .iter()
+            .map(|file| {
+                Path::new(file)
+                    .strip_prefix(cwd)
+                    .ok()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+            })
+            .collect::<Option<std::collections::BTreeSet<_>>>();
+        if observed.as_ref().is_none_or(|files| {
+            files
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                != expected
+        }) {
+            return Err(RuntimeError::new(
+                "ECONOMY_FIXTURE_CHANGED",
+                "The synthetic trial source allowlist does not match the approved seed.",
+            ));
+        }
+    }
     let files = prepare_paid_aider_files(prompt, policy, &source_files)?;
     let aider_executable = resolve_aider_executable(&profile.executable)?;
     let python = resolve_aider_python(&aider_executable)?;
@@ -920,6 +979,14 @@ fn run_openrouter_paid(
         .completion_price
         .as_deref()
         .and_then(providers::openrouter_price_micros_per_million);
+    if matches!(&policy.mode, crate::paid_gateway::GatewayMode::Paid)
+        && (current_input == Some(0) || current_output == Some(0))
+    {
+        return Err(RuntimeError::new(
+            "ECONOMY_ADMISSION_REQUIRED",
+            "Zero-priced models require a separately admitted Economy route.",
+        ));
+    }
     if current
         .context_length
         .is_none_or(|tokens| tokens < policy.model_context_window_tokens)
@@ -990,6 +1057,7 @@ fn run_openrouter_paid(
             upstream_api_key: api_key.clone(),
             parent_reservation_id: paid.parent_reservation_id.into(),
             policy: policy.clone(),
+            authenticated_canonical_slug: paid.authenticated_canonical_slug.map(str::to_owned),
             request_timeout: require_time()?.min(Duration::from_secs(300)),
             dispatch_deadline: runtime_started + requested_timeout,
             cancel: paid.cancel.clone(),
@@ -1044,6 +1112,14 @@ fn run_openrouter_paid(
             MAX_OUTPUT_BYTES,
             &process_cancel,
             |identity| {
+                if let Some(task_id) = paid.economy_trial_task_id {
+                    if crate::economy::verify_trial_fixture(task_id, cwd).is_err() {
+                        gateway_error = true;
+                        cancel.store(true, Ordering::Release);
+                        process_cancel.store(true, Ordering::Release);
+                        return ProcessControl::Cancel;
+                    }
+                }
                 let control = sink.borrow_mut().on_event(RuntimeEvent {
                     kind: RuntimeEventKind::ProcessStarted,
                     stream: None,
@@ -1455,9 +1531,19 @@ fn check_aider_autoload_files_from(cwd: &Path, home: Option<&Path>) -> Result<()
     for root in roots {
         for name in AUTOLOAD {
             match std::fs::symlink_metadata(root.join(name)) {
-                Ok(_) => return Err(RuntimeError::new("AIDER_CONFIG_PRESENT", "Paid Aider cannot run while an automatically loaded home or workspace configuration file is present.")),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(_) => return Err(RuntimeError::new("AIDER_CONFIG_CHECK_FAILED", "Paid Aider configuration sources could not be checked safely.")),
+                Ok(_) => {
+                    return Err(RuntimeError::new(
+                        "AIDER_CONFIG_PRESENT",
+                        "Paid Aider cannot run while an automatically loaded home or workspace configuration file is present.",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(RuntimeError::new(
+                        "AIDER_CONFIG_CHECK_FAILED",
+                        "Paid Aider configuration sources could not be checked safely.",
+                    ));
+                }
             }
         }
     }
@@ -1938,17 +2024,19 @@ fn launch_configuration(
             return Err(RuntimeError::new(
                 "UNSUPPORTED_PROVIDER",
                 "Codex uses its bidirectional app-server adapter.",
-            ))
+            ));
         }
-        ProviderKind::OpenRouter => return Err(RuntimeError::new(
-            "PAID_BUDGET_UNENFORCEABLE",
-            "Paid OpenRouter dispatch requires an enforceable whole-run call and token ceiling.",
-        )),
+        ProviderKind::OpenRouter => {
+            return Err(RuntimeError::new(
+                "PAID_BUDGET_UNENFORCEABLE",
+                "Paid OpenRouter dispatch requires an enforceable whole-run call and token ceiling.",
+            ));
+        }
         ProviderKind::Custom => {
             return Err(RuntimeError::new(
                 "UNSUPPORTED_PROVIDER",
                 "No coding runtime is configured for this provider kind.",
-            ))
+            ));
         }
     };
     let mut remove = PROVIDER_BILLING_ENV.to_vec();
@@ -2758,7 +2846,7 @@ fn receive_codex_response(
                 return Err(RuntimeError::new(
                     "CODEX_PROTOCOL_ERROR",
                     "Codex closed its protocol stream unexpectedly.",
-                ))
+                ));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if child.try_wait().ok().flatten().is_some() {
@@ -3304,7 +3392,8 @@ fn build_review_prompt(request: &crate::verification::ReviewRequest) -> Result<S
     });
     let prompt = format!(
         "Review the exact checked workspace read-only as an independent reviewer. Do not edit files, run mutating commands, or claim unobserved behavior. Compare every supplied acceptance criterion and report only actionable findings. acceptanceCriteria contains only criteria assigned to this independent review. Passed contracts in checks are separately verified finite scopes: do not re-review their owned criteria or infer broader correctness from their results. Confirm current Git HEAD equals `source.head`, the checked commit identifier. `source.fingerprint` is a separate digest covering that HEAD, Git status, tracked diff, untracked paths, and untracked contents; it is not a commit hash, and a non-clean worktree can still be the exact checked snapshot. Review the complete changes, including staged, unstaged, and untracked content, against only the baseline explicitly named in the acceptance criteria or review context. Do not silently use `source.head` as the diff baseline if a different BASE is named. Never substitute origin/main or another moving ref. If the required baseline is absent or ambiguous, do not choose one: set passed false and explain the missing baseline as a blocking finding. Do not claim visual rendering, keyboard behavior, or other manual behavior without direct evidence; list any unverified manual criterion in manualAcceptance. `passed` means the independent source/code review found no review findings; it does not mean manual acceptance is complete. You may return passed=true with nonempty manualAcceptance when the source review is otherwise clear and manual criteria remain unverified. Such a result stays blocked for human acceptance and is never an overall completion. A false result always remains a failed review; verification does not use its manualAcceptance items to bypass findings or other review failure. Return exactly one JSON object with keys sourceFingerprint, passed, findings, manualAcceptance, details. sourceFingerprint must equal the supplied source fingerprint. A passed response must have no findings.\nREVIEW_CONTEXT_JSON:\n{}",
-        serde_json::to_string(&context).map_err(|_| "Could not encode review context.".to_string())?
+        serde_json::to_string(&context)
+            .map_err(|_| "Could not encode review context.".to_string())?
     );
     if prompt.len() > MAX_PROMPT_BYTES {
         return Err("Review context exceeds the 60,000 byte prompt limit.".into());
@@ -3617,10 +3706,12 @@ mod review_adapter_tests {
             message["params"]["config"]["tools"]["web_search"]["enabled"],
             false
         );
-        assert!(message["params"]["config"]["mcp_servers"]
-            .as_object()
-            .unwrap()
-            .is_empty());
+        assert!(
+            message["params"]["config"]["mcp_servers"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         let turn = providers::app_server_turn_start_with_output_schema(
             2,
             "review-thread",
@@ -3645,10 +3736,12 @@ mod review_adapter_tests {
             turn["params"]["config"]["tools"]["web_search"]["enabled"],
             false
         );
-        assert!(turn["params"]["config"]["mcp_servers"]
-            .as_object()
-            .unwrap()
-            .is_empty());
+        assert!(
+            turn["params"]["config"]["mcp_servers"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         let implementation = codex_thread_start(1, "C:/Projects/sample", "model", false);
         assert_eq!(implementation["params"]["sandbox"], "workspace-write");
     }
@@ -3985,9 +4078,11 @@ mod tests {
             PathBuf::from(&resolved[1]),
             worktree.canonicalize().unwrap().join("generated/nested.rs")
         );
-        assert!(resolved
-            .iter()
-            .all(|path| Path::new(path).starts_with(worktree.canonicalize().unwrap())));
+        assert!(
+            resolved
+                .iter()
+                .all(|path| Path::new(path).starts_with(worktree.canonicalize().unwrap()))
+        );
     }
 
     #[test]
@@ -3998,11 +4093,13 @@ mod tests {
         for allowed in [
             Vec::new(),
             vec!["../outside.rs".to_string()],
-            vec![folder
-                .path()
-                .join("outside.rs")
-                .to_string_lossy()
-                .into_owned()],
+            vec![
+                folder
+                    .path()
+                    .join("outside.rs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
         ] {
             let error = resolve_paid_aider_source_files(&worktree, &allowed).unwrap_err();
             assert_eq!(error.code, "PAID_ALLOWED_FILES_INVALID");
@@ -4049,6 +4146,7 @@ mod tests {
         let aider = resolve_aider_executable(&executable).unwrap();
         let python = resolve_aider_python(&aider).unwrap();
         let policy = PaidModelPolicy {
+            mode: crate::paid_gateway::GatewayMode::Paid,
             provider_id: "openrouter".into(),
             model_id: "vendor/model".into(),
             runtime_id: "aider".into(),
@@ -4083,6 +4181,7 @@ mod tests {
     #[test]
     fn paid_aider_environment_contains_only_isolated_profile_and_dummy_gateway_secret() {
         let policy = PaidModelPolicy {
+            mode: crate::paid_gateway::GatewayMode::Paid,
             provider_id: "openrouter".into(),
             model_id: "vendor/model".into(),
             runtime_id: "aider".into(),
@@ -4718,10 +4817,11 @@ while ($line = [Console]::In.ReadLine()) {
         let result = run(&settings, &request, &cancel, &mut sink).unwrap();
 
         assert_eq!(result.state, RuntimeState::Completed);
-        assert!(sink
-            .0
-            .iter()
-            .any(|event| event.kind == RuntimeEventKind::ApprovalRequest));
+        assert!(
+            sink.0
+                .iter()
+                .any(|event| event.kind == RuntimeEventKind::ApprovalRequest)
+        );
     }
 
     #[test]
@@ -4851,10 +4951,11 @@ while ($line = [Console]::In.ReadLine()) {
             let mut sink = RecordingSink::default();
             let result = run(&settings, &request, &cancel, &mut sink).unwrap();
             assert_eq!(result.state, RuntimeState::Completed, "{}", kind.label());
-            assert!(sink
-                .0
-                .iter()
-                .any(|event| event.text.contains("synthetic agent output")));
+            assert!(
+                sink.0
+                    .iter()
+                    .any(|event| event.text.contains("synthetic agent output"))
+            );
             if kind == ProviderKind::Ollama {
                 assert_eq!(result.usage.cost_usd, Some(0.0));
                 assert_eq!(result.usage.billing, BillingStatus::LocalNoApiCharge);

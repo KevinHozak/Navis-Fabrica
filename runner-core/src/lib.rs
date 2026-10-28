@@ -4,6 +4,7 @@
 pub mod budgets;
 pub mod contracts;
 pub mod credentials;
+pub mod economy;
 pub mod isolation;
 pub mod issues;
 pub mod jev;

@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "navis-fabrica"
-version = "1.0.20"
+version = "1.0.21"
 dependencies = [
  "base64 0.22.1",
  "navis-fabrica-runner-core",
@@ -1992,6 +1992,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

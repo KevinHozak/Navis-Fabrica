@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "models": [
+    "poolside/laguna-s-2.1:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3.5-lightning:free"
+  ],
+  "limits": {
+    "maxRequestsPerTask": 3,
+    "maxOutputTokensPerRequest": 8192,
+    "maxSecondsPerTask": 120,
+    "maxCostUsd": 0,
+    "retries": 0,
+    "fallbacks": false
+  },
+  "tasks": [
+    {
+      "id": "small_bugfix",
+      "prompt": "Fix normalize_name so it trims surrounding whitespace and collapses internal whitespace to one space. Preserve case.",
+      "seedFiles": [
+        {"path": "name_utils.py", "content": "def normalize_name(value):\n    return value\n"}
+      ],
+      "checks": [{"id": "test_name_utils"}]
+    },
+    {
+      "id": "implementation",
+      "prompt": "Implement parse_positive_limit(value): accept an integer or decimal digit string representing a positive integer; reject booleans, zero, negatives, whitespace, and other types with ValueError.",
+      "seedFiles": [
+        {"path": "limits.py", "content": "def parse_positive_limit(value):\n    raise NotImplementedError\n"}
+      ],
+      "checks": [{"id": "test_limits"}]
+    },
+    {
+      "id": "multifile_edit",
+      "prompt": "Add a shared slugify(text) helper in text_utils.py and use it from catalog.slug_for_title. Slugs are lowercase ASCII alphanumeric words joined by hyphens; treat punctuation and whitespace as separators, normalize Unicode with NFKD, then discard remaining non-ASCII characters. Keep the public catalog function.",
+      "seedFiles": [
+        {"path": "text_utils.py", "content": "# Shared text helpers will live here.\n"},
+        {"path": "catalog.py", "content": "def slug_for_title(title):\n    return title.lower().replace(' ', '-')\n"}
+      ],
+      "checks": [{"id": "test_catalog"}]
+    }
+  ]
+}

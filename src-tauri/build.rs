@@ -27,6 +27,7 @@ fn main() {
             "probe_ollama",
             "save_openrouter_credential",
             "probe_openrouter",
+            "get_economy_model_status",
             "save_typesafe_credential",
             "probe_typesafe",
             "evaluate_jev_routing",

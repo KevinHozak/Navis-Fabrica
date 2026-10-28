@@ -1,0 +1,347 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "syntheticTrialMatrix",
+  "runtime": {
+    "id": "aider",
+    "version": "0.86.2"
+  },
+  "cases": [
+    {
+      "modelId": "poolside/laguna-s-2.1:free",
+      "taskId": "small_bugfix",
+      "status": "passed",
+      "reasonCode": null,
+      "runtime": {
+        "ok": true,
+        "state": "completed",
+        "failureCode": null,
+        "observedModelId": "poolside/laguna-s-2.1:free",
+        "requestCount": 1,
+        "tokensUsed": 2037,
+        "latencyMs": 29131,
+        "receiptSha256": "f3e57cc3e3999cd0672f27830431d3d141e9a3647604f64fa44104c7000c2d8d",
+        "sourceFingerprint": "a36d3b06766a9f468effbcf1fed3acfa91339f0ee053efb0f4ba2c166ec7b452"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "3d4024eb2196bd2da521fcdd344aa9e1db3f90675610aa9ac67448a350abc9de"
+      },
+      "hostCheck": {
+        "status": "passed",
+        "source": "journal-verification",
+        "checkHashes": {
+          "test_name_utils.py": "fb1895d6e382f37d2c0664d4f5801bad94c8d3f95036c86280cde6c108e7d00f"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "passed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "poolside/laguna-s-2.1:free",
+      "taskId": "implementation",
+      "status": "passed",
+      "reasonCode": null,
+      "runtime": {
+        "ok": true,
+        "state": "completed",
+        "failureCode": null,
+        "observedModelId": "poolside/laguna-s-2.1:free",
+        "requestCount": 1,
+        "tokensUsed": 2227,
+        "latencyMs": 38310,
+        "receiptSha256": "bf77d602c8405223db7d0d91b739a0aee1da170e7bd521d581a8f3baa8ed51a7",
+        "sourceFingerprint": "27cba92b822311daccc1fe644f28899146ba002540b4ced4b25972c2112093d1"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "08606db67ed00908bfcefe0cae4f364543a856ff3c3fd4cf2e5c870f1b968fdc"
+      },
+      "hostCheck": {
+        "status": "passed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_limits.py": "4322c8bf92ba7e1fbdb4666f5e210fedb6c2b78b416113be8211be804bd42a57"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "passed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "poolside/laguna-s-2.1:free",
+      "taskId": "multifile_edit",
+      "status": "failed",
+      "reasonCode": "independent_review_failed_or_inventory_mismatch",
+      "runtime": {
+        "ok": true,
+        "state": "completed",
+        "failureCode": null,
+        "observedModelId": "poolside/laguna-s-2.1:free",
+        "requestCount": 1,
+        "tokensUsed": 2318,
+        "latencyMs": 43533,
+        "receiptSha256": "74f085890f714737c4edb010e458cef302a7b99500e61445353317b4c98b5121",
+        "sourceFingerprint": "9d18c3a031380398ef306a55f04562d5d673515c8570e42d9c8f80643bd1e762"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "e277d7f3e65aa897a049c5b29df004d29f43b7c31c4d9ef1eb6fbbf8d92bc74d"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "journal-verification",
+        "checkHashes": {
+          "test_catalog.py": "3dbba32bc785931c832e3ebc57229d72760454fe1cc334ca506f3933d558f308"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "taskId": "small_bugfix",
+      "status": "failed",
+      "reasonCode": "RUNTIME_FAILED",
+      "runtime": {
+        "ok": false,
+        "state": "failed",
+        "failureCode": "RUNTIME_FAILED",
+        "observedModelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "requestCount": 1,
+        "tokensUsed": 2209,
+        "latencyMs": 39256,
+        "receiptSha256": "6b0402a40ac724912a62b2adc278660cdc513a6cde68e7c0f2ad249daddf33ae",
+        "sourceFingerprint": "a36d3b06766a9f468effbcf1fed3acfa91339f0ee053efb0f4ba2c166ec7b452"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "e9cd0604f568bca6fd459cecc0a294c3ef4a3dae623f74d536eb0755cd2c7930"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_name_utils.py": "fb1895d6e382f37d2c0664d4f5801bad94c8d3f95036c86280cde6c108e7d00f"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "taskId": "implementation",
+      "status": "failed",
+      "reasonCode": "RUNTIME_FAILED",
+      "runtime": {
+        "ok": false,
+        "state": "failed",
+        "failureCode": "RUNTIME_FAILED",
+        "observedModelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "requestCount": 1,
+        "tokensUsed": 2726,
+        "latencyMs": 52520,
+        "receiptSha256": "798360884adc2d013e10b8a4ac914e418ba7f1590cab66b00c8cdcfbb29bdf4c",
+        "sourceFingerprint": "27cba92b822311daccc1fe644f28899146ba002540b4ced4b25972c2112093d1"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "420a4dbd24169d73fd30f44df8dd16da408a19db972d7080a50b777d0044905a"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_limits.py": "4322c8bf92ba7e1fbdb4666f5e210fedb6c2b78b416113be8211be804bd42a57"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "taskId": "multifile_edit",
+      "status": "failed",
+      "reasonCode": "RUNTIME_FAILED",
+      "runtime": {
+        "ok": false,
+        "state": "failed",
+        "failureCode": "RUNTIME_FAILED",
+        "observedModelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "requestCount": 1,
+        "tokensUsed": 2519,
+        "latencyMs": 40704,
+        "receiptSha256": "f2b9fa8ff37cf7205cb7361313c4002b39e0062d66c35db9bf171cc84a46d290",
+        "sourceFingerprint": "9d18c3a031380398ef306a55f04562d5d673515c8570e42d9c8f80643bd1e762"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "a3b6764c6fa72bbbcd947585084f82db54152338545af667e977e6ac9032222d"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_catalog.py": "3dbba32bc785931c832e3ebc57229d72760454fe1cc334ca506f3933d558f308"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "nvidia/nemotron-3.5-lightning:free",
+      "taskId": "small_bugfix",
+      "status": "failed",
+      "reasonCode": "RUNTIME_FAILED",
+      "runtime": {
+        "ok": false,
+        "state": "failed",
+        "failureCode": "RUNTIME_FAILED",
+        "observedModelId": "nvidia/nemotron-3.5-lightning:free",
+        "requestCount": 1,
+        "tokensUsed": 4348,
+        "latencyMs": 58570,
+        "receiptSha256": "56068f653f1963081a301d3aee700f6ffcec0fa20f21ecf16ede1cf8dc4abb64",
+        "sourceFingerprint": "a36d3b06766a9f468effbcf1fed3acfa91339f0ee053efb0f4ba2c166ec7b452"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "69a1f52cb8390aaa9456e171c28e7f24c51b6ef19a49e3a9b8b519ffb278fe15"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_name_utils.py": "fb1895d6e382f37d2c0664d4f5801bad94c8d3f95036c86280cde6c108e7d00f"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "nvidia/nemotron-3.5-lightning:free",
+      "taskId": "implementation",
+      "status": "failed",
+      "reasonCode": "RUNTIME_FAILED",
+      "runtime": {
+        "ok": false,
+        "state": "failed",
+        "failureCode": "RUNTIME_FAILED",
+        "observedModelId": "nvidia/nemotron-3.5-lightning:free",
+        "requestCount": 1,
+        "tokensUsed": 4492,
+        "latencyMs": 64703,
+        "receiptSha256": "4af687edc9938aa76e67be45b46b2526b72c9aa18a1783b4a6e8132818f66b50",
+        "sourceFingerprint": "27cba92b822311daccc1fe644f28899146ba002540b4ced4b25972c2112093d1"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "2d625de6f1112940a3016a0011da71228dd8909c54fdfd0fc3810c42c17dc351"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_limits.py": "4322c8bf92ba7e1fbdb4666f5e210fedb6c2b78b416113be8211be804bd42a57"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    },
+    {
+      "modelId": "nvidia/nemotron-3.5-lightning:free",
+      "taskId": "multifile_edit",
+      "status": "failed",
+      "reasonCode": "RUNTIME_FAILED",
+      "runtime": {
+        "ok": false,
+        "state": "failed",
+        "failureCode": "RUNTIME_FAILED",
+        "observedModelId": "nvidia/nemotron-3.5-lightning:free",
+        "requestCount": 1,
+        "tokensUsed": 9376,
+        "latencyMs": 108657,
+        "receiptSha256": "0e826516ac847e6486f6f534f645d443e772269a2f1f0f4bc994fc781b5c3457",
+        "sourceFingerprint": "9d18c3a031380398ef306a55f04562d5d673515c8570e42d9c8f80643bd1e762"
+      },
+      "source": {
+        "inventoryMatchesReview": true,
+        "sourceJournalSha256": "83ebc122da11deea104860563b622c2dcc2f90cff7316b356b77922bac97f103"
+      },
+      "hostCheck": {
+        "status": "failed",
+        "source": "independent-host-check.json",
+        "checkHashes": {
+          "test_catalog.py": "3dbba32bc785931c832e3ebc57229d72760454fe1cc334ca506f3933d558f308"
+        },
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true
+      },
+      "independentReview": {
+        "status": "failed",
+        "reviewedInventoryMatchesSource": true
+      }
+    }
+  ],
+  "models": [
+    {
+      "modelId": "poolside/laguna-s-2.1:free",
+      "status": "failed",
+      "passedCases": 2,
+      "totalCases": 3,
+      "reasonCodes": [
+        "independent_review_failed_or_inventory_mismatch"
+      ]
+    },
+    {
+      "modelId": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "status": "failed",
+      "passedCases": 0,
+      "totalCases": 3,
+      "reasonCodes": [
+        "RUNTIME_FAILED"
+      ]
+    },
+    {
+      "modelId": "nvidia/nemotron-3.5-lightning:free",
+      "status": "failed",
+      "passedCases": 0,
+      "totalCases": 3,
+      "reasonCodes": [
+        "RUNTIME_FAILED"
+      ]
+    }
+  ],
+  "evaluatedAtMs": 1793059200000,
+  "fixtureSetSha256": "241b035435bf127ee7d5d2cdc164b04bfff23c5322c92d89e89d5b6e5bac119c"
+}

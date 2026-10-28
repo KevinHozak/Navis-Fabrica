@@ -23,9 +23,12 @@ fn run() -> i32 {
     if command == "--help" || command == "help" {
         println!(
             "{}",
-            serde_json::json!({"protocolVersion":PROTOCOL_VERSION,"usage":"fabrica-runner <capabilities|doctor|issues-list|issues-page|issues-show|issues-create|issues-update|issues-delete|issues-validate|plan|provider-settings|providers-doctor|provider-observations-refresh|runtime-run|batch-preview|submit|run-batch|status|events|pause|resume|stop|cancel|reconcile|recover> [--project PATH --config PATH] [--settings PATH] [--data-root PATH --batch-id ID --worker-executable EXE] [--cursor N --limit N] [--batch-request PATH] [--preview-fingerprint HASH] [--offset N] [--live-probe] [--id ID] [--expected-revision HASH]","input":"issues-create and issues-update read one IssueRecord JSON object; runtime-run reads one RuntimeRequest JSON object; batch-preview, submit, and run-batch read one BatchRequest JSON object from stdin or --batch-request PATH; provider-observations-refresh requires --settings PATH and --data-root PATH, and --live-probe explicitly permits a live OpenRouter catalog/auth probe; recover reads one RecoveryRequest JSON object","output":"one JSON CoreResponse per invocation"})
+            serde_json::json!({"protocolVersion":PROTOCOL_VERSION,"usage":"fabrica-runner <capabilities|doctor|issues-list|issues-page|issues-show|issues-create|issues-update|issues-delete|issues-validate|plan|provider-settings|providers-doctor|provider-observations-refresh|runtime-run|economy-trial-run|batch-preview|submit|run-batch|status|events|pause|resume|stop|cancel|reconcile|recover> [--project PATH --config PATH] [--settings PATH] [--data-root PATH --batch-id ID --worker-executable EXE] [--cursor N --limit N] [--batch-request PATH] [--preview-fingerprint HASH] [--offset N] [--live-probe] [--id ID] [--expected-revision HASH]","input":"economy-trial-run requires --settings PATH --data-root NEW_PRIVATE_PATH --model-id EXACT --task-id FIXTURE_ID --fixture-dir PATH --synthetic-policy-consent and dispatches one fixed synthetic fixture pair; issues-create and issues-update read one IssueRecord JSON object; runtime-run reads one RuntimeRequest JSON object; batch-preview, submit, and run-batch read one BatchRequest JSON object from stdin or --batch-request PATH; provider-observations-refresh requires --settings PATH and --data-root PATH, and --live-probe explicitly permits a live OpenRouter catalog/auth probe; recover reads one RecoveryRequest JSON object","output":"one JSON CoreResponse per normal invocation; flat bounded TrialReceipt for economy-trial-run"})
         );
         return 0;
+    }
+    if command == "economy-trial-run" {
+        return run_economy_trial(args);
     }
     let Some(operation) = Operation::from_cli(&command) else {
         return emit_error(
@@ -258,6 +261,114 @@ fn run() -> i32 {
         preview_fingerprint,
         recovery,
     }))
+}
+
+fn run_economy_trial(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut settings = None;
+    let mut data_root = None;
+    let mut model_id = None;
+    let mut task_id = None;
+    let mut fixture_dir = None;
+    let mut consent = false;
+    while let Some(flag) = args.next() {
+        if flag == "--synthetic-policy-consent" {
+            if consent {
+                return emit_trial_error(
+                    "INVALID_TRIAL_ARGUMENT",
+                    model_id.as_deref(),
+                    task_id.as_deref(),
+                );
+            }
+            consent = true;
+            continue;
+        }
+        let Some(value) = args.next() else {
+            return emit_trial_error(
+                "INVALID_TRIAL_ARGUMENT",
+                model_id.as_deref(),
+                task_id.as_deref(),
+            );
+        };
+        let target = match flag.as_str() {
+            "--settings" => &mut settings,
+            "--data-root" => &mut data_root,
+            "--model-id" => &mut model_id,
+            "--task-id" => &mut task_id,
+            "--fixture-dir" => &mut fixture_dir,
+            _ => {
+                return emit_trial_error(
+                    "INVALID_TRIAL_ARGUMENT",
+                    model_id.as_deref(),
+                    task_id.as_deref(),
+                )
+            }
+        };
+        if target.is_some() {
+            return emit_trial_error(
+                "INVALID_TRIAL_ARGUMENT",
+                model_id.as_deref(),
+                task_id.as_deref(),
+            );
+        }
+        *target = Some(value);
+    }
+    let (Some(settings), Some(data_root), Some(model_id), Some(task_id), Some(fixture_dir)) = (
+        settings,
+        data_root,
+        model_id.clone(),
+        task_id.clone(),
+        fixture_dir,
+    ) else {
+        return emit_trial_error(
+            "INVALID_TRIAL_ARGUMENT",
+            model_id.as_deref(),
+            task_id.as_deref(),
+        );
+    };
+    let receipt = navis_fabrica_runner_core::economy::execute_trial(
+        navis_fabrica_runner_core::economy::TrialRunArguments {
+            settings_path: std::path::Path::new(&settings),
+            data_root: std::path::Path::new(&data_root),
+            model_id: &model_id,
+            task_id: &task_id,
+            fixture_dir: std::path::Path::new(&fixture_dir),
+            synthetic_policy_consent: consent,
+        },
+    );
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).expect("trial receipt serializes")
+    );
+    if receipt.ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn emit_trial_error(message: &str, model_id: Option<&str>, task_id: Option<&str>) -> i32 {
+    let receipt = navis_fabrica_runner_core::economy::TrialReceipt {
+        schema_version: 1,
+        ok: false,
+        task_id: task_id.unwrap_or_default().to_owned(),
+        model_id: model_id.unwrap_or_default().to_owned(),
+        provider_id: String::new(),
+        runtime_id: "aider".into(),
+        runtime_version: String::new(),
+        state: "failed".into(),
+        request_count: 0,
+        tokens_used: None,
+        latency_ms: 0,
+        billing: "zeroCost".into(),
+        source_fingerprint: None,
+        failure_code: Some(message.into()),
+        observed_model_id: None,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).expect("trial receipt serializes")
+    );
+    2
 }
 
 fn emit(response: CoreResponse) -> i32 {

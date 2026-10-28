@@ -222,6 +222,7 @@ pub fn typesafe_http_probe(profile: &TypeSafeProfile, api_key: Option<&str>) -> 
 #[serde(rename_all = "camelCase")]
 pub struct OpenRouterModel {
     pub id: String,
+    pub canonical_slug: Option<String>,
     pub name: String,
     pub context_length: Option<u64>,
     pub prompt_price: Option<String>,
@@ -229,6 +230,160 @@ pub struct OpenRouterModel {
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
     pub supported_parameters: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenRouterEndpoint {
+    pub model_id: String,
+    pub tag: String,
+    pub context_length: Option<u64>,
+    pub prompt_price: Option<String>,
+    pub completion_price: Option<String>,
+    pub request_price: Option<String>,
+    pub status: Option<i64>,
+    pub zdr: Option<bool>,
+}
+
+pub fn parse_openrouter_endpoints(value: &Value, model_id: &str) -> Vec<OpenRouterEndpoint> {
+    value
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("endpoints"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|endpoint| {
+            let tag = endpoint.get("tag")?.as_str()?.trim();
+            let endpoint_model = endpoint.get("model_id").and_then(Value::as_str)?;
+            if endpoint_model != model_id || !valid_endpoint_tag(tag) {
+                return None;
+            }
+            let pricing = endpoint.get("pricing");
+            Some(OpenRouterEndpoint {
+                model_id: endpoint_model.to_owned(),
+                tag: tag.to_owned(),
+                context_length: endpoint.get("context_length").and_then(Value::as_u64),
+                prompt_price: pricing
+                    .and_then(|v| v.get("prompt"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                completion_price: pricing
+                    .and_then(|v| v.get("completion"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                request_price: pricing
+                    .and_then(|v| v.get("request"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                status: endpoint.get("status").and_then(Value::as_i64),
+                zdr: endpoint.get("zdr").and_then(Value::as_bool),
+            })
+        })
+        .take(256)
+        .collect()
+}
+
+fn valid_endpoint_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+}
+
+pub fn openrouter_endpoints_http_probe_with_timeout(
+    api_key: &str,
+    model_id: &str,
+    timeout: Duration,
+) -> Result<Vec<OpenRouterEndpoint>, String> {
+    if !valid_openrouter_key(api_key)
+        || !model_id.contains('/')
+        || model_id.len() > 160
+        || model_id
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | ':')))
+    {
+        return Err("OpenRouter endpoint request identity is invalid.".into());
+    }
+    let client = blocking_http_client_builder()
+        .connect_timeout(timeout.min(Duration::from_secs(3)))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "OpenRouter endpoint metadata client is unavailable.".to_string())?;
+    let response = client
+        .get(format!("{OPENROUTER_API_BASE}/models/{model_id}/endpoints"))
+        .bearer_auth(api_key)
+        .send()
+        .map_err(|_| "OpenRouter endpoint metadata could not be refreshed.".to_string())?;
+    if response.status().as_u16() == 429 {
+        return Err("OpenRouter rate limit was reached during endpoint refresh.".into());
+    }
+    if !response.status().is_success() {
+        return Err("OpenRouter endpoint metadata was rejected.".into());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > OPENROUTER_MAX_RESPONSE_BYTES as u64)
+    {
+        return Err("OpenRouter endpoint metadata exceeded its response limit.".into());
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(OPENROUTER_MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "OpenRouter endpoint metadata could not be read.".to_string())?;
+    if bytes.len() > OPENROUTER_MAX_RESPONSE_BYTES {
+        return Err("OpenRouter endpoint metadata exceeded its response limit.".into());
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "OpenRouter endpoint metadata was malformed.".to_string())?;
+    let endpoints = parse_openrouter_endpoints(&value, model_id);
+    if endpoints.is_empty() {
+        return Err("No exact OpenRouter endpoint is available for this model.".into());
+    }
+    Ok(endpoints)
+}
+
+pub fn validate_openrouter_free_endpoint(
+    api_key: &str,
+    model_id: &str,
+    endpoint_tag: &str,
+    minimum_context: u64,
+    require_zdr: bool,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let endpoints = openrouter_endpoints_http_probe_with_timeout(api_key, model_id, timeout)?;
+    let matches = endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.tag == endpoint_tag
+                && endpoint.model_id == model_id
+                && endpoint.status == Some(0)
+                && endpoint
+                    .context_length
+                    .is_some_and(|context| context >= minimum_context)
+                && endpoint
+                    .prompt_price
+                    .as_deref()
+                    .and_then(openrouter_price_micros_per_million)
+                    == Some(0)
+                && endpoint
+                    .completion_price
+                    .as_deref()
+                    .and_then(openrouter_price_micros_per_million)
+                    == Some(0)
+                && endpoint
+                    .request_price
+                    .as_deref()
+                    .is_none_or(|price| openrouter_price_micros_per_million(price) == Some(0))
+                && (!require_zdr || endpoint.zdr == Some(true))
+        })
+        .count();
+    Ok(matches == 1)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -261,6 +416,10 @@ pub fn parse_openrouter_models(value: &Value) -> Vec<OpenRouterModel> {
             let pricing = item.get("pricing");
             Some(OpenRouterModel {
                 id: id.to_owned(),
+                canonical_slug: item
+                    .get("canonical_slug")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 name: name.to_owned(),
                 context_length: item.get("context_length").and_then(Value::as_u64),
                 prompt_price: pricing
@@ -354,6 +513,33 @@ pub struct OpenRouterMetadataObservation {
     /// None means the key endpoint omitted a required execution-eligibility field.
     pub authenticated_for_execution: Option<bool>,
     pub models: Vec<OpenRouterModel>,
+    /// Account-specific free-model request counters only; balances and spend
+    /// metadata are intentionally never retained.
+    pub free_model_daily_requests: Option<FreeModelDailyRequests>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FreeModelDailyRequests {
+    pub used: u64,
+    pub limit: u64,
+    pub remaining: u64,
+}
+
+fn parse_free_model_daily_requests(data: &Value) -> Option<FreeModelDailyRequests> {
+    let value = data.get("free_model_daily_requests")?.as_object()?;
+    let used = value.get("used")?.as_u64()?;
+    let limit = value.get("limit")?.as_u64()?;
+    let remaining = value.get("remaining")?.as_u64()?;
+    (used <= limit
+        && remaining <= limit
+        && used.checked_add(remaining) == Some(limit)
+        && limit <= 1_000_000)
+        .then_some(FreeModelDailyRequests {
+            used,
+            limit,
+            remaining,
+        })
 }
 
 /// Verify the current key separately from the user-scoped model catalog. Only
@@ -370,6 +556,7 @@ where
         return Ok(OpenRouterMetadataObservation {
             authenticated_for_execution: Some(false),
             models: Vec::new(),
+            free_model_daily_requests: None,
         });
     }
     let key = match request("/key", api_key) {
@@ -378,8 +565,10 @@ where
             return Ok(OpenRouterMetadataObservation {
                 authenticated_for_execution: Some(false),
                 models: Vec::new(),
+                free_model_daily_requests: None,
             })
         }
+        Err(429) => return Err("OpenRouter rate limit was reached during metadata refresh.".into()),
         Err(_) => return Err("OpenRouter key metadata could not be verified.".into()),
     };
     let data = key
@@ -397,6 +586,7 @@ where
             return Ok(OpenRouterMetadataObservation {
                 authenticated_for_execution: None,
                 models: Vec::new(),
+                free_model_daily_requests: None,
             })
         }
     };
@@ -404,10 +594,15 @@ where
         return Ok(OpenRouterMetadataObservation {
             authenticated_for_execution: Some(false),
             models: Vec::new(),
+            free_model_daily_requests: None,
         });
     }
-    let catalog = request("/models/user", api_key).map_err(|_| {
-        "OpenRouter user-scoped model availability could not be verified.".to_string()
+    let catalog = request("/models/user", api_key).map_err(|status| {
+        if status == 429 {
+            "OpenRouter rate limit was reached during metadata refresh.".to_string()
+        } else {
+            "OpenRouter user-scoped model availability could not be verified.".to_string()
+        }
     })?;
     let rows = catalog
         .get("data")
@@ -425,6 +620,7 @@ where
     Ok(OpenRouterMetadataObservation {
         authenticated_for_execution: Some(true),
         models,
+        free_model_daily_requests: parse_free_model_daily_requests(&key["data"]),
     })
 }
 
@@ -585,6 +781,9 @@ pub fn aider_paid_gateway_arguments(
         "--no-suggest-shell-commands".into(),
         "--no-stream".into(),
         "--no-pretty".into(),
+        // `--no-pretty` does not disable prompt_toolkit's interactive session
+        // in Aider 0.86.2; headless Fabrica workers must opt out explicitly.
+        "--no-fancy-input".into(),
         "--no-show-model-warnings".into(),
         "--no-browser".into(),
         "--env-file".into(),
@@ -1842,6 +2041,11 @@ struct RuntimeProbe {
     note: &'static str,
 }
 
+pub fn probe_aider_runtime_version(executable: &Path) -> Option<String> {
+    let probe = probe_aider(executable);
+    probe.supported.then_some(probe.version).flatten()
+}
+
 fn probe_aider(executable: &Path) -> RuntimeProbe {
     let Ok(temp) = tempfile::tempdir() else {
         return RuntimeProbe {
@@ -2188,6 +2392,32 @@ pub fn validate_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aider_runtime_version_normalizes_prefixed_output() {
+        assert_eq!(safe_version(b"aider 0.86.2\n"), Some("0.86.2".into()));
+        assert_eq!(safe_version(b"0.86.2\n"), Some("0.86.2".into()));
+    }
+
+    #[test]
+    fn openrouter_free_quota_parser_requires_consistent_bounded_counters() {
+        let valid = serde_json::json!({"free_model_daily_requests":{"used":7,"limit":50,"remaining":43}, "rate_limit":{"limit":999}});
+        assert_eq!(parse_free_model_daily_requests(&valid["data"]), None);
+        let data = serde_json::json!({"free_model_daily_requests":{"used":7,"limit":50,"remaining":43}, "rate_limit":{"limit":999}});
+        assert_eq!(
+            parse_free_model_daily_requests(&data),
+            Some(FreeModelDailyRequests {
+                used: 7,
+                limit: 50,
+                remaining: 43
+            })
+        );
+        let inconsistent =
+            serde_json::json!({"free_model_daily_requests":{"used":7,"limit":50,"remaining":44}});
+        assert_eq!(parse_free_model_daily_requests(&inconsistent), None);
+        let oversized = serde_json::json!({"free_model_daily_requests":{"used":1,"limit":1_000_001,"remaining":1_000_000}});
+        assert_eq!(parse_free_model_daily_requests(&oversized), None);
+    }
 
     #[test]
     fn aider_probe_environment_isolated_from_user_config_and_external_model_cost_fetches() {
@@ -2816,6 +3046,8 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|items| items == ["--config", "C:/temp/empty-config.yml"]));
+        assert!(args.iter().any(|argument| argument == "--no-fancy-input"));
+        assert!(args.iter().any(|argument| argument == "--no-pretty"));
         assert_eq!(
             &args[args.len() - 2..],
             ["C:/worktree/src/lib.rs", "C:/worktree/new.rs"]

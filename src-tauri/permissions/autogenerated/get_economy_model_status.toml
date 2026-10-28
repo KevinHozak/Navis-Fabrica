@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-economy-model-status"
+description = "Enables the get_economy_model_status command without any pre-configured scope."
+commands.allow = ["get_economy_model_status"]
+
+[[permission]]
+identifier = "deny-get-economy-model-status"
+description = "Denies the get_economy_model_status command without any pre-configured scope."
+commands.deny = ["get_economy_model_status"]

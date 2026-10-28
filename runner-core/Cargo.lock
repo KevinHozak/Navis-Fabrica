@@ -541,6 +541,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

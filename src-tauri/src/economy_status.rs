@@ -1,0 +1,101 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tauri::AppHandle;
+
+use crate::{load_settings, providers, resolve_openrouter_credential, settings_path};
+use navis_fabrica_runner_core::economy::{self, EconomyModelStatus};
+
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(12);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeModelDailyRequests {
+    pub used: u64,
+    pub limit: u64,
+    pub remaining: u64,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EconomyStatusResponse {
+    pub models: Vec<EconomyModelStatus>,
+    pub free_model_daily_requests: Option<FreeModelDailyRequests>,
+    pub catalog_observed_at_ms: u64,
+}
+
+/// Reads current, user-authenticated OpenRouter metadata only. Network work is
+/// isolated from Tauri's async executor and bounded by the core probe deadline.
+#[tauri::command]
+pub async fn get_economy_model_status(
+    app: AppHandle,
+    provider_id: String,
+) -> Result<EconomyStatusResponse, String> {
+    if provider_id.is_empty() || provider_id.len() > 80 {
+        return Err("Choose a valid OpenRouter provider profile.".into());
+    }
+    let settings = load_settings(&settings_path(&app)?)?;
+    let profile = settings
+        .providers
+        .into_iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or_else(|| "The OpenRouter provider profile no longer exists.".to_string())?;
+    if profile.kind != providers::ProviderKind::OpenRouter {
+        return Err("Choose an OpenRouter provider profile.".into());
+    }
+    let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref())
+        .ok_or_else(|| "Save a valid OpenRouter credential for this profile first.".to_string())?;
+    let provider_id = profile.id;
+    let runtime_executable = profile.executable;
+
+    let catalog_probe = tauri::async_runtime::spawn_blocking(move || {
+        providers::openrouter_metadata_http_probe_with_timeout(&key, CATALOG_TIMEOUT)
+    });
+    let runtime_probe = tauri::async_runtime::spawn_blocking(move || {
+        let path = std::env::var_os("PATH");
+        providers::find_executable(&runtime_executable, path.as_deref())
+            .and_then(|executable| providers::probe_aider_runtime_version(&executable))
+    });
+
+    let observation_result = catalog_probe
+        .await
+        .map_err(|_| "OpenRouter model status check did not complete.".to_string())?;
+    let runtime_result = runtime_probe
+        .await
+        .map_err(|_| "Aider runtime check did not complete.".to_string())?;
+    let observation = observation_result?;
+    let runtime_version = runtime_result.unwrap_or_else(|| "unverified".into());
+    if observation.authenticated_for_execution != Some(true) {
+        return Err(
+            "OpenRouter execution access could not be verified for this credential.".into(),
+        );
+    }
+    let observed_at = now_ms();
+    Ok(EconomyStatusResponse {
+        models: economy::statuses_from_catalog(
+            &provider_id,
+            &observation.models,
+            observed_at,
+            "aider",
+            &runtime_version,
+            observed_at,
+        ),
+        free_model_daily_requests: observation.free_model_daily_requests.map(|quota| {
+            FreeModelDailyRequests {
+                used: quota.used,
+                limit: quota.limit,
+                remaining: quota.remaining,
+                observed_at_ms: observed_at,
+            }
+        }),
+        catalog_observed_at_ms: observed_at,
+    })
+}

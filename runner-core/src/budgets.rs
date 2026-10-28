@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// A single paid provider attempt, bounded by its already-admitted parent run.
 /// These records deliberately do not participate in global policy totals: the
@@ -39,6 +39,32 @@ pub struct PaidCall {
     pub dispatched_at_ms: u64,
     pub actual_tokens: Option<u64>,
     pub actual_cost_micros: Option<u64>,
+    pub settlement_source: Option<String>,
+}
+
+/// A zero-price OpenRouter request, stored separately from paid call accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeCallRequest {
+    pub parent_reservation_id: String,
+    pub call_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub runtime_id: String,
+    pub max_tokens: u64,
+    pub max_calls: u32,
+    pub pricing_source: String,
+    pub pricing_verified_at_ms: u64,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeCall {
+    pub parent_reservation_id: String,
+    pub call_id: String,
+    pub max_tokens: u64,
+    pub state: PaidCallState,
+    pub dispatched_at_ms: u64,
+    pub actual_tokens: Option<u64>,
     pub settlement_source: Option<String>,
 }
 
@@ -252,9 +278,20 @@ impl BudgetStore {
                     pricing_source TEXT NOT NULL,
                     pricing_verified_at_ms INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS paid_call_ledger_parent ON paid_call_ledger(parent_reservation_id,state);
+                CREATE TABLE IF NOT EXISTS free_call_ledger(
+                    call_id TEXT PRIMARY KEY,
+                    parent_reservation_id TEXT NOT NULL,
+                    max_tokens INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('dispatched','settled','unresolved')),
+                    dispatched_at_ms INTEGER NOT NULL,
+                    pricing_source TEXT NOT NULL,
+                    pricing_verified_at_ms INTEGER NOT NULL,
+                    actual_tokens INTEGER,
+                    settlement_source TEXT);
+                CREATE INDEX IF NOT EXISTS free_call_ledger_parent ON free_call_ledger(parent_reservation_id,state);
                 CREATE INDEX IF NOT EXISTS budget_reservations_batch ON budget_reservations(batch_id,state);
                 CREATE INDEX IF NOT EXISTS budget_reservations_job ON budget_reservations(job_id,state);
-                PRAGMA user_version=2;
+                PRAGMA user_version=3;
                 COMMIT;").map_err(BudgetError::Sql)?;
         } else if version == 1 {
             connection.execute_batch("BEGIN IMMEDIATE;
@@ -271,7 +308,33 @@ impl BudgetStore {
                     pricing_source TEXT NOT NULL,
                     pricing_verified_at_ms INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS paid_call_ledger_parent ON paid_call_ledger(parent_reservation_id,state);
-                PRAGMA user_version=2;
+                CREATE TABLE IF NOT EXISTS free_call_ledger(
+                    call_id TEXT PRIMARY KEY,
+                    parent_reservation_id TEXT NOT NULL,
+                    max_tokens INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('dispatched','settled','unresolved')),
+                    dispatched_at_ms INTEGER NOT NULL,
+                    pricing_source TEXT NOT NULL,
+                    pricing_verified_at_ms INTEGER NOT NULL,
+                    actual_tokens INTEGER,
+                    settlement_source TEXT);
+                CREATE INDEX IF NOT EXISTS free_call_ledger_parent ON free_call_ledger(parent_reservation_id,state);
+                PRAGMA user_version=3;
+                COMMIT;").map_err(BudgetError::Sql)?;
+        } else if version == 2 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS free_call_ledger(
+                    call_id TEXT PRIMARY KEY,
+                    parent_reservation_id TEXT NOT NULL,
+                    max_tokens INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('dispatched','settled','unresolved')),
+                    dispatched_at_ms INTEGER NOT NULL,
+                    pricing_source TEXT NOT NULL,
+                    pricing_verified_at_ms INTEGER NOT NULL,
+                    actual_tokens INTEGER,
+                    settlement_source TEXT);
+                CREATE INDEX IF NOT EXISTS free_call_ledger_parent ON free_call_ledger(parent_reservation_id,state);
+                PRAGMA user_version=3;
                 COMMIT;").map_err(BudgetError::Sql)?;
         }
         Ok(store)
@@ -653,6 +716,121 @@ impl BudgetStore {
         Ok(call)
     }
 
+    /// Record a strictly zero-price request under a separate, explicitly
+    /// zero-cost parent reservation. The paid-call API continues to reject
+    /// zero-cost requests.
+    pub fn reserve_free_call(&self, request: &FreeCallRequest) -> Result<FreeCall, BudgetError> {
+        for value in [
+            request.parent_reservation_id.as_str(),
+            request.call_id.as_str(),
+            request.provider_id.as_str(),
+            request.model_id.as_str(),
+            request.runtime_id.as_str(),
+            request.pricing_source.as_str(),
+        ] {
+            validate_scope(value)?;
+        }
+        if request.max_tokens == 0 || request.max_calls == 0 || request.max_calls > 1000 {
+            return Err(BudgetError::Invalid(
+                "free call token and request ceilings must be positive and bounded".into(),
+            ));
+        }
+        if request.pricing_verified_at_ms > request.now_ms
+            || request
+                .now_ms
+                .saturating_sub(request.pricing_verified_at_ms)
+                > 24 * 60 * 60 * 1000
+        {
+            return Err(BudgetError::Invalid(
+                "free model pricing must be freshly verified".into(),
+            ));
+        }
+        let mut connection = self.connect()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let parent = read_reservation(&tx, &request.parent_reservation_id)?;
+        if parent.state != ReservationState::Dispatched
+            || parent.max_cost_micros != 0
+            || parent.provider_id != request.provider_id
+            || parent.model_id != request.model_id
+            || parent.runtime_id != request.runtime_id
+            || parent.pricing_source.as_deref() != Some(request.pricing_source.as_str())
+            || parent.pricing_verified_at_ms != Some(request.pricing_verified_at_ms)
+        {
+            return Err(BudgetError::Conflict(
+                "free call requires an exactly matching dispatched zero-cost parent reservation"
+                    .into(),
+            ));
+        }
+        let stopped: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM budget_stops WHERE (scope_type='batch' AND scope_id=?1) OR (scope_type='job' AND scope_id=?2))",
+            params![parent.batch_id, parent.job_id], |row| row.get(0))?;
+        if stopped {
+            return Err(BudgetError::Exhausted(
+                "parent budget scope is stopped for review".into(),
+            ));
+        }
+        let (count, tokens): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN state='settled' THEN actual_tokens ELSE max_tokens END),0) FROM free_call_ledger WHERE parent_reservation_id=?1",
+            [&request.parent_reservation_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        if count >= i64::from(request.max_calls) {
+            return Err(BudgetError::Exhausted(
+                "free model request count ceiling is exhausted".into(),
+            ));
+        }
+        if tokens as i128 + request.max_tokens as i128 > parent.max_tokens as i128 {
+            return Err(BudgetError::Exhausted(
+                "free model token ceiling exceeds the parent reservation".into(),
+            ));
+        }
+        tx.execute("INSERT INTO free_call_ledger(call_id,parent_reservation_id,max_tokens,state,dispatched_at_ms,pricing_source,pricing_verified_at_ms) VALUES(?1,?2,?3,'dispatched',?4,?5,?6)", params![request.call_id, request.parent_reservation_id, to_i64(request.max_tokens)?, to_i64(request.now_ms)?, request.pricing_source, to_i64(request.pricing_verified_at_ms)?])?;
+        let call = read_free_call(&tx, &request.call_id)?;
+        tx.commit()?;
+        Ok(call)
+    }
+
+    pub fn settle_free_call(
+        &self,
+        call_id: &str,
+        actual_tokens: Option<u64>,
+        source: &str,
+    ) -> Result<FreeCall, BudgetError> {
+        validate_scope(call_id)?;
+        validate_scope(source)?;
+        let mut connection = self.connect()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_free_call(&tx, call_id)?;
+        if current.state != PaidCallState::Dispatched {
+            return Err(BudgetError::Conflict(
+                "only a dispatched free call can be settled".into(),
+            ));
+        }
+        let (state, tokens) = match actual_tokens {
+            Some(tokens) => ("settled", Some(tokens)),
+            None => ("unresolved", None),
+        };
+        tx.execute("UPDATE free_call_ledger SET state=?2,actual_tokens=?3,settlement_source=?4 WHERE call_id=?1", params![call_id, state, tokens.map(to_i64).transpose()?, source])?;
+        if tokens.is_some_and(|value| value > current.max_tokens) {
+            let parent = read_reservation(&tx, &current.parent_reservation_id)?;
+            record_stop(
+                &tx,
+                "batch",
+                &parent.batch_id,
+                "free provider call exceeded its reserved token ceiling",
+                current.dispatched_at_ms,
+            )?;
+            record_stop(
+                &tx,
+                "job",
+                &parent.job_id,
+                "free provider call exceeded its reserved token ceiling",
+                current.dispatched_at_ms,
+            )?;
+        }
+        let result = read_free_call(&tx, call_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Settle a paid call from provider-reported usage and cost. Unknown data
     /// leaves the maximum charged as unresolved; it never fabricates zero use.
     pub fn settle_paid_call(
@@ -723,6 +901,20 @@ impl BudgetStore {
             .collect::<Result<Vec<_>, _>>()?;
         ids.iter()
             .map(|id| read_paid_call(&connection, id))
+            .collect()
+    }
+
+    pub fn free_calls_for_parent(&self, parent_id: &str) -> Result<Vec<FreeCall>, BudgetError> {
+        validate_scope(parent_id)?;
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT call_id FROM free_call_ledger WHERE parent_reservation_id=?1 ORDER BY dispatched_at_ms,call_id",
+        )?;
+        let ids = statement
+            .query_map([parent_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| read_free_call(&connection, id))
             .collect()
     }
 }
@@ -918,6 +1110,30 @@ fn read_paid_call(c: &Connection, id: &str) -> Result<PaidCall, BudgetError> {
     }))
 }
 
+fn read_free_call(c: &Connection, id: &str) -> Result<FreeCall, BudgetError> {
+    c.query_row(
+        "SELECT parent_reservation_id,call_id,max_tokens,state,dispatched_at_ms,actual_tokens,settlement_source FROM free_call_ledger WHERE call_id=?1",
+        [id],
+        |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        )),
+    )
+    .optional()?
+    .ok_or_else(|| BudgetError::Invalid("free call was not found".into()))
+    .and_then(|value| Ok(FreeCall {
+        parent_reservation_id: value.0,
+        call_id: value.1,
+        max_tokens: u64::try_from(value.2).map_err(|_| BudgetError::Invalid("stored free call token ceiling is invalid".into()))?,
+        state: PaidCallState::parse(&value.3)?,
+        dispatched_at_ms: u64::try_from(value.4).map_err(|_| BudgetError::Invalid("stored free call dispatch time is invalid".into()))?,
+        actual_tokens: value.5.map(u64::try_from).transpose().map_err(|_| BudgetError::Invalid("stored free call usage is invalid".into()))?,
+        settlement_source: value.6,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,8 +1214,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert!(ledger_exists);
+        let free_ledger_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='free_call_ledger')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(free_ledger_exists);
     }
     fn request(id: &str, job: &str) -> ReservationRequest {
         ReservationRequest {
@@ -1091,6 +1313,70 @@ mod tests {
         assert!(matches!(
             store.settle_paid_call("call-1", Some(0), Some(0), "fake-retry-zero"),
             Err(BudgetError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn free_child_uses_separate_zero_cost_ledger_and_keeps_paid_guard() {
+        let (_dir, store) = setup();
+        let mut parent_request = request("free-parent", "job-a");
+        parent_request.max_cost_micros = Some(0);
+        parent_request.is_paid = false;
+        parent_request.model_id = "vendor/model:free".into();
+        parent_request.runtime_id = "aider".into();
+        parent_request.pricing_source = Some("verified-zero-price".into());
+        parent_request.pricing_verified_at_ms = Some(1);
+        let parent = store.reserve(&parent_request, 1).unwrap();
+        store.mark_dispatched(&parent.reservation_id, 2).unwrap();
+        let child = FreeCallRequest {
+            parent_reservation_id: "free-parent".into(),
+            call_id: "free-call-1".into(),
+            provider_id: "provider-a".into(),
+            model_id: "vendor/model:free".into(),
+            runtime_id: "aider".into(),
+            max_tokens: 100,
+            max_calls: 1,
+            pricing_source: "verified-zero-price".into(),
+            pricing_verified_at_ms: 1,
+            now_ms: 3,
+        };
+        let call = store.reserve_free_call(&child).unwrap();
+        assert_eq!(call.state, PaidCallState::Dispatched);
+        let settled = store
+            .settle_free_call(
+                &child.call_id,
+                Some(50),
+                "openrouter-response-usage|model=vendor/model:free",
+            )
+            .unwrap();
+        assert_eq!(settled.actual_tokens, Some(50));
+        assert_eq!(
+            settled.settlement_source.as_deref(),
+            Some("openrouter-response-usage|model=vendor/model:free")
+        );
+        let mut duplicate = child.clone();
+        duplicate.call_id = "free-call-2".into();
+        assert!(matches!(
+            store.reserve_free_call(&duplicate),
+            Err(BudgetError::Exhausted(_))
+        ));
+
+        let paid_zero = PaidCallRequest {
+            parent_reservation_id: "missing".into(),
+            call_id: "paid-zero".into(),
+            provider_id: "provider-a".into(),
+            model_id: "vendor/model:free".into(),
+            runtime_id: "aider".into(),
+            max_tokens: 100,
+            max_cost_micros: 0,
+            max_calls: 1,
+            pricing_source: "verified-zero-price".into(),
+            pricing_verified_at_ms: 1,
+            now_ms: 3,
+        };
+        assert!(matches!(
+            store.reserve_paid_call(&paid_zero),
+            Err(BudgetError::Invalid(_))
         ));
     }
 

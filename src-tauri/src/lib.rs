@@ -21,6 +21,7 @@ mod github;
 mod inventory;
 mod issue_work;
 mod issue_work_inference;
+mod economy_status;
 pub use navis_fabrica_runner_core as runner_core;
 pub mod jev;
 mod process;
@@ -3033,6 +3034,7 @@ pub fn run() {
             probe_ollama,
             save_openrouter_credential,
             probe_openrouter,
+            economy_status::get_economy_model_status,
             save_typesafe_credential,
             probe_typesafe,
             create_provider_handoff,

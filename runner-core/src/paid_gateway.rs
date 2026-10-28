@@ -2,8 +2,8 @@
 //! run. The child receives only a random loopback token; the OpenRouter key
 //! stays in this process and all upstream traffic uses one fixed HTTPS URL.
 
-use crate::budgets::{BudgetError, BudgetStore, PaidCallRequest};
-use crate::providers::OPENROUTER_API_BASE;
+use crate::budgets::{BudgetError, BudgetStore, FreeCallRequest, PaidCallRequest};
+use crate::providers::{self, OPENROUTER_API_BASE};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -11,11 +11,11 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -44,6 +44,8 @@ pub struct PaidPricingCeiling {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PaidModelPolicy {
+    #[serde(default, skip_serializing_if = "GatewayMode::is_paid")]
+    pub mode: GatewayMode,
     pub provider_id: String,
     pub model_id: String,
     pub runtime_id: String,
@@ -57,10 +59,38 @@ pub struct PaidModelPolicy {
     pub pricing: PaidPricingCeiling,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+pub enum GatewayMode {
+    Paid,
+    Economy {
+        endpoint_id: String,
+    },
+    SyntheticTrial {
+        endpoint_id: String,
+        allow_training: bool,
+    },
+}
+
+impl Default for GatewayMode {
+    fn default() -> Self {
+        Self::Paid
+    }
+}
+
+impl GatewayMode {
+    fn is_paid(mode: &Self) -> bool {
+        matches!(mode, Self::Paid)
+    }
+}
+
 pub struct PaidGatewayConfig {
     pub upstream_api_key: String,
     pub parent_reservation_id: String,
     pub policy: PaidModelPolicy,
+    /// Ephemeral alias learned from authenticated provider metadata during
+    /// this synthetic trial admission; never deserialized or persisted as policy.
+    pub authenticated_canonical_slug: Option<String>,
     pub request_timeout: Duration,
     /// Monotonic deadline for the parent runtime, shared with admission checks.
     pub dispatch_deadline: Instant,
@@ -285,6 +315,24 @@ impl PaidGateway {
     /// upstream call has a settled usage record. A missing/unknown result stays
     /// `None` so callers preserve the parent reservation's full ceiling.
     pub fn usage_totals(&self) -> Option<(u64, u64)> {
+        if matches!(
+            &self.shared.config.policy.mode,
+            GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. }
+        ) {
+            let calls = self
+                .shared
+                .budgets
+                .free_calls_for_parent(&self.shared.config.parent_reservation_id)
+                .ok()?;
+            return calls
+                .into_iter()
+                .try_fold((0_u64, 0_u64), |(tokens, _), call| {
+                    if call.state != crate::budgets::PaidCallState::Settled {
+                        return None;
+                    }
+                    Some((tokens.checked_add(call.actual_tokens?)?, 0))
+                });
+        }
         let calls = self
             .shared
             .budgets
@@ -348,13 +396,54 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
             "upstream credential is unavailable",
         ));
     }
+    if crate::economy::is_router_model_id(&p.model_id)
+        || (matches!(&p.mode, GatewayMode::Paid) && crate::economy::is_free_variant_id(&p.model_id))
+    {
+        return Err(PaidGatewayError::Invalid(
+            "router identities and free model variants cannot use the paid gateway",
+        ));
+    }
+    if matches!(&p.mode, GatewayMode::SyntheticTrial { .. })
+        && config
+            .authenticated_canonical_slug
+            .as_deref()
+            .is_none_or(|slug| {
+                slug.is_empty()
+                    || slug.len() > 160
+                    || slug.chars().any(char::is_control)
+                    || slug == "openrouter/free"
+                    || slug == "openrouter/auto"
+            })
+    {
+        return Err(PaidGatewayError::Invalid(
+            "synthetic trial has no authenticated canonical model identity",
+        ));
+    }
+    let (is_free, max_calls) = match &p.mode {
+        GatewayMode::Paid => (false, 1_000),
+        GatewayMode::Economy { endpoint_id } => {
+            validate_endpoint_id(endpoint_id)?;
+            (true, 1_000)
+        }
+        GatewayMode::SyntheticTrial { endpoint_id, .. } => {
+            validate_endpoint_id(endpoint_id)?;
+            (true, 3)
+        }
+    };
     if p.model_context_window_tokens == 0
         || p.max_output_tokens_per_call == 0
         || p.max_calls == 0
-        || p.max_calls > 1_000
-        || p.max_cost_micros == 0
-        || p.pricing.input_price_micros_per_1m == 0
-        || p.pricing.output_price_micros_per_1m == 0
+        || p.max_calls > max_calls
+        || (matches!(p.mode, GatewayMode::SyntheticTrial { .. })
+            && p.max_output_tokens_per_call > 8_192)
+        || (is_free
+            && (p.max_cost_micros != 0
+                || p.pricing.input_price_micros_per_1m != 0
+                || p.pricing.output_price_micros_per_1m != 0))
+        || (!is_free
+            && (p.max_cost_micros == 0
+                || p.pricing.input_price_micros_per_1m == 0
+                || p.pricing.output_price_micros_per_1m == 0))
         || p.pricing.request_fee_micros != 0
     {
         return Err(PaidGatewayError::Invalid(
@@ -370,6 +459,17 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
     if config.request_timeout.is_zero() || config.request_timeout > MAX_TIMEOUT {
         return Err(PaidGatewayError::Invalid(
             "upstream timeout must be between 1 and 300 seconds",
+        ));
+    }
+    if matches!(p.mode, GatewayMode::SyntheticTrial { .. })
+        && (config.request_timeout > Duration::from_secs(120)
+            || config
+                .dispatch_deadline
+                .saturating_duration_since(Instant::now())
+                > Duration::from_secs(120))
+    {
+        return Err(PaidGatewayError::Invalid(
+            "synthetic trial exceeds its 120-second task limit",
         ));
     }
     let call_tokens = p
@@ -390,6 +490,24 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
     if call_cost > p.max_cost_micros {
         return Err(PaidGatewayError::Invalid(
             "one worst-case call exceeds the parent task cost ceiling",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_endpoint_id(endpoint_id: &str) -> Result<(), PaidGatewayError> {
+    if endpoint_id.is_empty()
+        || endpoint_id.len() > 128
+        || endpoint_id.chars().any(char::is_control)
+        || !endpoint_id.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+    {
+        return Err(PaidGatewayError::Invalid(
+            "provider endpoint identity is invalid",
         ));
     }
     Ok(())
@@ -622,6 +740,13 @@ fn forward_request(
             )
         })?;
     let policy = &shared.config.policy;
+    if !refresh_free_endpoint(&shared) {
+        close_for_unknown_billing(&shared);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "free endpoint identity, price, status, context, or privacy eligibility changed",
+        ));
+    }
     let call_tokens = policy
         .model_context_window_tokens
         .checked_add(policy.max_output_tokens_per_call)
@@ -644,20 +769,46 @@ fn forward_request(
             "secure call identifier unavailable",
         )
     })?;
-    let call_id = format!("paid-{}-{call_nonce}", now_ms());
-    if let Err(error) = shared.budgets.reserve_paid_call(&PaidCallRequest {
-        parent_reservation_id: shared.config.parent_reservation_id.clone(),
-        call_id: call_id.clone(),
-        provider_id: policy.provider_id.clone(),
-        model_id: policy.model_id.clone(),
-        runtime_id: policy.runtime_id.clone(),
-        max_tokens: call_tokens,
-        max_cost_micros: call_cost,
-        max_calls: policy.max_calls,
-        pricing_source: policy.pricing.source.clone(),
-        pricing_verified_at_ms: policy.pricing.observed_at_ms,
-        now_ms: now_ms(),
-    }) {
+    let call_prefix = if matches!(&policy.mode, GatewayMode::Paid) {
+        "paid"
+    } else {
+        "free"
+    };
+    let call_id = format!("{call_prefix}-{}-{call_nonce}", now_ms());
+    let reserved = match &policy.mode {
+        GatewayMode::Paid => shared
+            .budgets
+            .reserve_paid_call(&PaidCallRequest {
+                parent_reservation_id: shared.config.parent_reservation_id.clone(),
+                call_id: call_id.clone(),
+                provider_id: policy.provider_id.clone(),
+                model_id: policy.model_id.clone(),
+                runtime_id: policy.runtime_id.clone(),
+                max_tokens: call_tokens,
+                max_cost_micros: call_cost,
+                max_calls: policy.max_calls,
+                pricing_source: policy.pricing.source.clone(),
+                pricing_verified_at_ms: policy.pricing.observed_at_ms,
+                now_ms: now_ms(),
+            })
+            .map(|_| ()),
+        GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. } => shared
+            .budgets
+            .reserve_free_call(&FreeCallRequest {
+                parent_reservation_id: shared.config.parent_reservation_id.clone(),
+                call_id: call_id.clone(),
+                provider_id: policy.provider_id.clone(),
+                model_id: policy.model_id.clone(),
+                runtime_id: policy.runtime_id.clone(),
+                max_tokens: call_tokens,
+                max_calls: policy.max_calls,
+                pricing_source: policy.pricing.source.clone(),
+                pricing_verified_at_ms: policy.pricing.observed_at_ms,
+                now_ms: now_ms(),
+            })
+            .map(|_| ()),
+    };
+    if let Err(error) = reserved {
         if let BudgetError::Exhausted(reason) = error {
             let refusal = classify_policy_refusal(&reason);
             if let Ok(mut gate) = shared.gate.lock() {
@@ -673,19 +824,29 @@ fn forward_request(
     // The durable ledger row exists before this only network boundary. The
     // client has automatic retries and redirects explicitly disabled.
     if !admission_open(&shared.config) || !gate_is_open(&shared) {
-        let _ =
-            shared
-                .budgets
-                .settle_paid_call(&call_id, None, None, "gateway-closed-before-upstream");
+        settle_unknown_call(&shared, &call_id, "gateway-closed-before-upstream");
         close_for_unknown_billing(&shared);
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "paid dispatch stopped before provider response",
         ));
     }
+    let upstream_remaining = shared
+        .config
+        .dispatch_deadline
+        .saturating_duration_since(Instant::now());
+    if upstream_remaining.is_zero() {
+        settle_unknown_call(&shared, &call_id, "gateway-deadline-before-upstream");
+        close_for_unknown_billing(&shared);
+        return Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "run deadline expired before provider dispatch",
+        ));
+    }
     let upstream_result = shared
         .client
         .post(&shared.upstream_url)
+        .timeout(upstream_remaining)
         .bearer_auth(&shared.config.upstream_api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&request)
@@ -693,12 +854,7 @@ fn forward_request(
     let upstream = match upstream_result {
         Ok(response) => response,
         Err(_) => {
-            let _ = shared.budgets.settle_paid_call(
-                &call_id,
-                None,
-                None,
-                "openrouter-response-unknown",
-            );
+            settle_unknown_call(&shared, &call_id, "openrouter-response-unknown");
             close_for_unknown_billing(&shared);
             return Err((
                 StatusCode::BAD_GATEWAY,
@@ -715,10 +871,7 @@ fn forward_request(
         .is_err()
         || response_bytes.len() > MAX_RESPONSE_BYTES
     {
-        let _ =
-            shared
-                .budgets
-                .settle_paid_call(&call_id, None, None, "openrouter-response-truncated");
+        settle_unknown_call(&shared, &call_id, "openrouter-response-truncated");
         close_for_unknown_billing(&shared);
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -726,9 +879,7 @@ fn forward_request(
         ));
     }
     if !status.is_success() {
-        let _ = shared
-            .budgets
-            .settle_paid_call(&call_id, None, None, "openrouter-error-response");
+        settle_unknown_call(&shared, &call_id, "openrouter-error-response");
         close_for_unknown_billing(&shared);
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -738,12 +889,7 @@ fn forward_request(
     let response_value: Value = match serde_json::from_slice(&response_bytes) {
         Ok(value) => value,
         Err(_) => {
-            let _ = shared.budgets.settle_paid_call(
-                &call_id,
-                None,
-                None,
-                "openrouter-invalid-response",
-            );
+            settle_unknown_call(&shared, &call_id, "openrouter-invalid-response");
             close_for_unknown_billing(&shared);
             return Err((
                 StatusCode::BAD_GATEWAY,
@@ -751,36 +897,68 @@ fn forward_request(
             ));
         }
     };
-    if response_value.get("model").and_then(Value::as_str) != Some(policy.model_id.as_str()) {
-        let _ = shared
-            .budgets
-            .settle_paid_call(&call_id, None, None, "openrouter-model-mismatch");
+    let observed_model = response_value.get("model").and_then(Value::as_str);
+    let identity_matches = observed_model == Some(policy.model_id.as_str())
+        || (matches!(&policy.mode, GatewayMode::SyntheticTrial { .. })
+            && observed_model == shared.config.authenticated_canonical_slug.as_deref());
+    if !identity_matches {
+        let mismatch_source = observed_model.map_or_else(
+            || "openrouter-model-mismatch-missing".to_owned(),
+            |value| {
+                if safe_observed_model(value) {
+                    format!("openrouter-model-mismatch|model={value}")
+                } else {
+                    format!(
+                        "openrouter-model-mismatch-hash-{}",
+                        sha256_prefix(value.as_bytes())
+                    )
+                }
+            },
+        );
+        settle_unknown_call(&shared, &call_id, &mismatch_source);
         close_for_unknown_billing(&shared);
         return Err((
             StatusCode::BAD_GATEWAY,
             "provider model could not be verified; paid calls are closed",
         ));
     }
-    let Some((tokens, cost)) = parse_usage(&response_value) else {
-        let _ = shared
-            .budgets
-            .settle_paid_call(&call_id, None, None, "openrouter-usage-unknown");
+    let usage = match &shared.config.policy.mode {
+        GatewayMode::Paid => parse_usage(&response_value),
+        GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. } => {
+            parse_free_usage(&response_value)
+        }
+    };
+    let Some((tokens, cost)) = usage else {
+        settle_unknown_call(&shared, &call_id, "openrouter-usage-unknown");
         close_for_unknown_billing(&shared);
         return Err((
             StatusCode::BAD_GATEWAY,
             "provider usage could not be verified; paid calls are closed",
         ));
     };
-    if shared
-        .budgets
-        .settle_paid_call(
-            &call_id,
-            Some(tokens),
-            Some(cost),
-            "openrouter-response-usage",
-        )
-        .is_err()
-    {
+    let settled = match &shared.config.policy.mode {
+        GatewayMode::Paid => shared
+            .budgets
+            .settle_paid_call(
+                &call_id,
+                Some(tokens),
+                Some(cost),
+                "openrouter-response-usage",
+            )
+            .map(|_| ()),
+        GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. } => shared
+            .budgets
+            .settle_free_call(
+                &call_id,
+                Some(tokens),
+                &format!(
+                    "openrouter-response-usage|model={}",
+                    observed_model.unwrap_or_default()
+                ),
+            )
+            .map(|_| ()),
+    };
+    if settled.is_err() {
         close_for_unknown_billing(&shared);
         return Err((
             StatusCode::PAYMENT_REQUIRED,
@@ -788,6 +966,14 @@ fn forward_request(
         ));
     }
     Ok((StatusCode::OK, Bytes::from(response_bytes)))
+}
+
+fn safe_observed_model(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "/:._-".contains(character))
 }
 
 fn classify_policy_refusal(reason: &str) -> PaidPolicyRefusal {
@@ -802,6 +988,98 @@ fn classify_policy_refusal(reason: &str) -> PaidPolicyRefusal {
     } else {
         PaidPolicyRefusal::OtherLimit
     }
+}
+
+fn refresh_free_endpoint(shared: &Shared) -> bool {
+    let policy = &shared.config.policy;
+    let (endpoint_id, require_zdr, expected_canonical) = match &policy.mode {
+        GatewayMode::Paid => return true,
+        GatewayMode::Economy { endpoint_id } => (endpoint_id, true, None),
+        GatewayMode::SyntheticTrial {
+            endpoint_id,
+            allow_training,
+        } => {
+            if !allow_training {
+                return false;
+            }
+            (
+                endpoint_id,
+                false,
+                shared.config.authenticated_canonical_slug.as_deref(),
+            )
+        }
+    };
+    let now = Instant::now();
+    let remaining = shared
+        .config
+        .dispatch_deadline
+        .saturating_duration_since(now);
+    if remaining.is_zero() {
+        return false;
+    }
+    let timeout = remaining.min(Duration::from_secs(10));
+    let metadata = providers::openrouter_metadata_http_probe_with_timeout(
+        &shared.config.upstream_api_key,
+        timeout,
+    );
+    let Ok(metadata) = metadata else {
+        return false;
+    };
+    if metadata.authenticated_for_execution != Some(true) {
+        return false;
+    }
+    let Some(model) = metadata
+        .models
+        .iter()
+        .find(|model| model.id == policy.model_id)
+    else {
+        return false;
+    };
+    let current_input = model
+        .prompt_price
+        .as_deref()
+        .and_then(providers::openrouter_price_micros_per_million);
+    let current_output = model
+        .completion_price
+        .as_deref()
+        .and_then(providers::openrouter_price_micros_per_million);
+    if current_input != Some(0)
+        || current_output != Some(0)
+        || model
+            .context_length
+            .is_none_or(|context| context < policy.model_context_window_tokens)
+        || expected_canonical
+            .is_some_and(|expected| model.canonical_slug.as_deref() != Some(expected))
+    {
+        return false;
+    }
+    let endpoint_remaining = shared
+        .config
+        .dispatch_deadline
+        .saturating_duration_since(Instant::now());
+    if endpoint_remaining.is_zero() {
+        return false;
+    }
+    providers::validate_openrouter_free_endpoint(
+        &shared.config.upstream_api_key,
+        &policy.model_id,
+        endpoint_id,
+        policy.model_context_window_tokens,
+        require_zdr,
+        endpoint_remaining
+            .min(shared.config.request_timeout)
+            .min(Duration::from_secs(10)),
+    )
+    .is_ok_and(|eligible| eligible)
+}
+
+fn sha256_prefix(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn validate_and_cap_request(request: &mut Value, policy: &PaidModelPolicy) -> Result<usize, ()> {
@@ -872,17 +1150,39 @@ fn validate_and_cap_request(request: &mut Value, policy: &PaidModelPolicy) -> Re
     );
     object.remove("max_completion_tokens");
     object.insert("stream".into(), Value::Bool(false));
-    object.insert(
-        "provider".into(),
-        json!({
-            "allow_fallbacks": false,
-            "max_price": {
-                "prompt": dollars_per_million(policy.pricing.input_price_micros_per_1m)?,
-                "completion": dollars_per_million(policy.pricing.output_price_micros_per_1m)?,
-                "request": 0
-            }
-        }),
-    );
+    let mut provider = json!({
+        "only": match &policy.mode {
+            GatewayMode::Paid => Vec::<String>::new(),
+            GatewayMode::Economy { endpoint_id } | GatewayMode::SyntheticTrial { endpoint_id, .. } => vec![endpoint_id.clone()],
+        },
+        "allow_fallbacks": false,
+        "require_parameters": true,
+        "max_price": {
+            "prompt": dollars_per_million(policy.pricing.input_price_micros_per_1m)?,
+            "completion": dollars_per_million(policy.pricing.output_price_micros_per_1m)?,
+            "request": 0,
+            "image": 0
+        }
+    });
+    if let Some(provider) = provider.as_object_mut() {
+        if matches!(&policy.mode, GatewayMode::Paid) {
+            provider.remove("only");
+        }
+    }
+    object.insert("provider".into(), provider);
+    match &policy.mode {
+        GatewayMode::Paid => {}
+        GatewayMode::Economy { .. } => {
+            object.insert("data_collection".into(), json!("deny"));
+            object.insert("zdr".into(), Value::Bool(true));
+        }
+        GatewayMode::SyntheticTrial { allow_training, .. } => {
+            object.insert(
+                "data_collection".into(),
+                json!(if *allow_training { "allow" } else { "deny" }),
+            );
+        }
+    }
     Ok(bounded_input)
 }
 
@@ -904,6 +1204,29 @@ fn parse_usage(response: &Value) -> Option<(u64, u64)> {
         _ => return None,
     };
     Some((total, decimal_to_micros_ceil(&decimal)?))
+}
+
+fn parse_tokens(response: &Value) -> Option<u64> {
+    let usage = response.get("usage")?;
+    let input = usage.get("prompt_tokens")?.as_u64()?;
+    let output = usage.get("completion_tokens")?.as_u64()?;
+    input.checked_add(output)
+}
+
+fn parse_free_usage(response: &Value) -> Option<(u64, u64)> {
+    let tokens = parse_tokens(response)?;
+    let usage = response.get("usage")?;
+    if let Some(cost) = usage.get("cost") {
+        let decimal = match cost {
+            Value::Number(number) => number.to_string(),
+            Value::String(value) => value.clone(),
+            _ => return None,
+        };
+        if decimal_to_micros_ceil(&decimal)? != 0 {
+            return None;
+        }
+    }
+    Some((tokens, 0))
 }
 
 /// Convert a nonnegative decimal dollar amount to integer micros, rounding up.
@@ -953,6 +1276,17 @@ fn close_for_unknown_billing(shared: &Shared) {
     }
 }
 
+fn settle_unknown_call(shared: &Shared, call_id: &str, source: &str) {
+    match &shared.config.policy.mode {
+        GatewayMode::Paid => {
+            let _ = shared.budgets.settle_paid_call(call_id, None, None, source);
+        }
+        GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. } => {
+            let _ = shared.budgets.settle_free_call(call_id, None, source);
+        }
+    }
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -995,6 +1329,7 @@ mod tests {
 
     fn policy(now: u64) -> PaidModelPolicy {
         PaidModelPolicy {
+            mode: GatewayMode::Paid,
             provider_id: "openrouter-profile".into(),
             model_id: "vendor/model-a".into(),
             runtime_id: "aider".into(),
@@ -1048,6 +1383,29 @@ mod tests {
         store.reserve(&request, now).unwrap();
         store.mark_dispatched(&request.reservation_id, now).unwrap();
         (dir, store, request.reservation_id, now)
+    }
+
+    #[test]
+    fn paid_gateway_rejects_free_and_router_ids_even_with_positive_quote() {
+        let (_dir, _budgets, parent_id, now) = budget_store();
+        let mut config = PaidGatewayConfig {
+            upstream_api_key: "sk-or-test".into(),
+            parent_reservation_id: parent_id,
+            policy: policy(now),
+            authenticated_canonical_slug: None,
+            request_timeout: Duration::from_secs(5),
+            dispatch_deadline: Instant::now() + Duration::from_secs(60),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        for model_id in ["vendor/model:free", "openrouter/free", "openrouter/auto"] {
+            config.policy.model_id = model_id.into();
+            assert!(matches!(
+                validate_config(&config),
+                Err(PaidGatewayError::Invalid(_))
+            ));
+        }
+        config.policy.model_id = "vendor/normal-paid-model".into();
+        assert!(validate_config(&config).is_ok());
     }
 
     fn fake_upstream(body: Value) -> (String, Receiver<Value>, JoinHandle<()>) {
@@ -1218,6 +1576,7 @@ mod tests {
                 upstream_api_key: "sk-or-never-leaves-process".into(),
                 parent_reservation_id: parent_id.clone(),
                 policy: policy(priced_at),
+                authenticated_canonical_slug: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1285,6 +1644,7 @@ mod tests {
                     upstream_api_key: "sk-or-test".into(),
                     parent_reservation_id: parent_id.clone(),
                     policy: policy(priced_at),
+                    authenticated_canonical_slug: None,
                     request_timeout: Duration::from_secs(10),
                     dispatch_deadline: deadline,
                     cancel,
@@ -1305,10 +1665,12 @@ mod tests {
                 .send()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(budgets
-                .paid_calls_for_parent(&parent_id)
-                .unwrap()
-                .is_empty());
+            assert!(
+                budgets
+                    .paid_calls_for_parent(&parent_id)
+                    .unwrap()
+                    .is_empty()
+            );
             gateway.stop();
         }
     }
@@ -1327,6 +1689,7 @@ mod tests {
                     upstream_api_key: "sk-or-test".into(),
                     parent_reservation_id: parent_id.clone(),
                     policy: policy(priced_at),
+                    authenticated_canonical_slug: None,
                     request_timeout: Duration::from_secs(10),
                     dispatch_deadline,
                     cancel: cancel.clone(),
@@ -1366,10 +1729,12 @@ mod tests {
                 .send()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(budgets
-                .paid_calls_for_parent(&parent_id)
-                .unwrap()
-                .is_empty());
+            assert!(
+                budgets
+                    .paid_calls_for_parent(&parent_id)
+                    .unwrap()
+                    .is_empty()
+            );
             gateway.stop();
         }
     }
@@ -1399,6 +1764,7 @@ mod tests {
             upstream_api_key: "sk-or-test".into(),
             parent_reservation_id: parent_id,
             policy: p,
+            authenticated_canonical_slug: None,
             request_timeout: Duration::from_secs(10),
             dispatch_deadline: Instant::now() + Duration::from_secs(60),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1449,6 +1815,7 @@ mod tests {
                 upstream_api_key: "sk-or-test".into(),
                 parent_reservation_id: parent_id.clone(),
                 policy: policy(priced_at),
+                authenticated_canonical_slug: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1507,6 +1874,7 @@ mod tests {
                 upstream_api_key: "sk-or-test".into(),
                 parent_reservation_id: parent_id.clone(),
                 policy: policy(priced_at),
+                authenticated_canonical_slug: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1544,8 +1912,8 @@ mod tests {
     #[test]
     fn paid_call_cap_refusal_cancels_retrying_child_and_preserves_settled_usage() {
         use crate::process::{self, ProcessControl};
-        use std::sync::atomic::AtomicBool;
         use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
 
         let (_dir, budgets, parent_id, priced_at) = budget_store();
         let response_body = json!({
@@ -1563,6 +1931,7 @@ mod tests {
                 upstream_api_key: "sk-or-never-leaves-process".into(),
                 parent_reservation_id: parent_id.clone(),
                 policy: capped_policy,
+                authenticated_canonical_slug: None,
                 request_timeout: Duration::from_secs(10),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1704,6 +2073,7 @@ try {
                 upstream_api_key: "sk-or-never-real-smoke-key".into(),
                 parent_reservation_id: parent_id.clone(),
                 policy: smoke_policy,
+                authenticated_canonical_slug: None,
                 request_timeout: Duration::from_secs(30),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2167,6 +2537,7 @@ try {
                 upstream_api_key: "sk-or-never-real-guard-fixture".into(),
                 parent_reservation_id: parent_id.clone(),
                 policy: smoke_policy,
+                authenticated_canonical_slug: None,
                 request_timeout: Duration::from_secs(30),
                 dispatch_deadline: Instant::now() + Duration::from_secs(60),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2349,9 +2720,11 @@ try {
         assert!(!project.join(".aider.tags.cache.v4").exists());
         let paid_calls = budgets.paid_calls_for_parent(&parent_id).unwrap();
         assert_eq!(paid_calls.len(), sent_requests.len());
-        assert!(paid_calls
-            .iter()
-            .all(|call| call.state == PaidCallState::Settled));
+        assert!(
+            paid_calls
+                .iter()
+                .all(|call| call.state == PaidCallState::Settled)
+        );
         assert_eq!(
             gateway.usage_totals(),
             Some((

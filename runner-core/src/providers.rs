@@ -56,6 +56,7 @@ impl ProviderKind {
 
 pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub const OPENROUTER_MAX_MODELS: usize = 500;
+const OPENROUTER_MAX_ENDPOINT_ROWS: usize = 2048;
 pub const OPENROUTER_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 pub const TYPESAFE_API_BASE: &str = "https://api.typesafe.ai/v1";
@@ -258,56 +259,269 @@ pub struct OpenRouterEndpoint {
 }
 
 pub fn parse_openrouter_endpoints(value: &Value, model_id: &str) -> Vec<OpenRouterEndpoint> {
-    value
+    parse_openrouter_endpoints_for_models(value, &[model_id])
+}
+
+fn parse_openrouter_endpoints_for_models(
+    value: &Value,
+    allowed_model_ids: &[&str],
+) -> Vec<OpenRouterEndpoint> {
+    let Some(endpoints) = value
         .get("data")
         .and_then(Value::as_object)
         .and_then(|data| data.get("endpoints"))
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|endpoint| {
-            let tag = endpoint.get("tag")?.as_str()?.trim();
-            let endpoint_model = endpoint.get("model_id").and_then(Value::as_str)?;
-            if endpoint_model != model_id || !valid_endpoint_tag(tag) {
-                return None;
-            }
-            let pricing = endpoint.get("pricing");
-            Some(OpenRouterEndpoint {
-                model_id: endpoint_model.to_owned(),
-                tag: tag.to_owned(),
-                context_length: endpoint.get("context_length").and_then(Value::as_u64),
-                max_prompt_tokens: endpoint.get("max_prompt_tokens").and_then(Value::as_u64),
-                max_completion_tokens: endpoint
-                    .get("max_completion_tokens")
-                    .and_then(Value::as_u64),
-                prompt_price: pricing
-                    .and_then(|v| v.get("prompt"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                completion_price: pricing
-                    .and_then(|v| v.get("completion"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                request_price: pricing
-                    .and_then(|v| v.get("request"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                status: endpoint.get("status").and_then(Value::as_i64),
-                zdr: endpoint.get("zdr").and_then(Value::as_bool),
-                supported_parameters: endpoint
-                    .get("supported_parameters")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    }),
+    else {
+        return Vec::new();
+    };
+    if endpoints.len() > OPENROUTER_MAX_ENDPOINT_ROWS {
+        return Vec::new();
+    }
+    let mut parsed = Vec::new();
+    for endpoint in endpoints {
+        let Some(endpoint_model) = endpoint.get("model_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !allowed_model_ids.contains(&endpoint_model) {
+            continue;
+        }
+        let Some(tag) = endpoint.get("tag").and_then(Value::as_str).map(str::trim) else {
+            // Do not silently discard an in-scope row: it could hide a second
+            // provider row with the same pinned identity.
+            return Vec::new();
+        };
+        if !valid_endpoint_tag(tag) {
+            return Vec::new();
+        }
+        let pricing = endpoint.get("pricing");
+        let max_prompt_tokens = match endpoint.get("max_prompt_tokens") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64() {
+                Some(value) => Some(value),
+                None => return Vec::new(),
+            },
+        };
+        let request_price = match pricing.and_then(|value| value.get("request")) {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_str() {
+                Some(value) => Some(value.to_owned()),
+                None => return Vec::new(),
+            },
+        };
+        parsed.push(OpenRouterEndpoint {
+            model_id: endpoint_model.to_owned(),
+            tag: tag.to_owned(),
+            context_length: endpoint.get("context_length").and_then(Value::as_u64),
+            max_prompt_tokens,
+            max_completion_tokens: endpoint
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64),
+            prompt_price: pricing
+                .and_then(|v| v.get("prompt"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            completion_price: pricing
+                .and_then(|v| v.get("completion"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            request_price,
+            status: endpoint.get("status").and_then(Value::as_i64),
+            zdr: endpoint.get("zdr").and_then(Value::as_bool),
+            supported_parameters: endpoint
+                .get("supported_parameters")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                }),
+        });
+        if parsed.len() > 256 {
+            return Vec::new();
+        }
+    }
+    parsed
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedPaidEndpointRequirements<'a> {
+    pub model_id: &'a str,
+    pub canonical_model_id: &'a str,
+    pub endpoint_id: &'a str,
+    pub input_price_ceiling_micros_per_1m: u64,
+    pub output_price_ceiling_micros_per_1m: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub requires_tools: bool,
+}
+
+/// Verify an authenticated model observation and exact active endpoint against
+/// the reviewed pilot envelope. A missing request-fee quote stays unknown and
+/// is bounded by the gateway's mandatory `max_price.request=0`; an explicit
+/// malformed or positive quote fails. A missing prompt-only cap stays unknown
+/// and is bounded by the observed combined context window, without inventing a
+/// prompt-cap observation. Exact ZDR membership is authoritative; a nullable
+/// endpoint `zdr` property is only a veto.
+pub fn openrouter_pinned_paid_endpoint_is_verified(
+    metadata: &OpenRouterMetadataObservation,
+    endpoints: &[OpenRouterEndpoint],
+    zdr: &std::collections::BTreeSet<(String, String)>,
+    requirements: PinnedPaidEndpointRequirements<'_>,
+) -> bool {
+    if metadata.authenticated_for_execution != Some(true)
+        || requirements.input_tokens == 0
+        || requirements.output_tokens == 0
+        || requirements.model_id.is_empty()
+        || requirements.canonical_model_id.is_empty()
+        || requirements.endpoint_id.is_empty()
+    {
+        return false;
+    }
+    let Some(model) = metadata
+        .models
+        .iter()
+        .find(|model| model.id == requirements.model_id)
+    else {
+        return false;
+    };
+    let Some(total_context) = requirements
+        .input_tokens
+        .checked_add(requirements.output_tokens)
+    else {
+        return false;
+    };
+    if model.canonical_slug.as_deref() != Some(requirements.canonical_model_id)
+        || model
+            .context_length
+            .is_none_or(|context| context < total_context)
+        || model
+            .prompt_price
+            .as_deref()
+            .and_then(openrouter_price_micros_per_million)
+            .is_none_or(|price| {
+                price == 0 || price > requirements.input_price_ceiling_micros_per_1m
             })
+        || model
+            .completion_price
+            .as_deref()
+            .and_then(openrouter_price_micros_per_million)
+            .is_none_or(|price| {
+                price == 0 || price > requirements.output_price_ceiling_micros_per_1m
+            })
+        || !model
+            .input_modalities
+            .as_ref()
+            .is_some_and(|values| values.iter().any(|value| value == "text"))
+        || !model
+            .output_modalities
+            .as_ref()
+            .is_some_and(|values| values.iter().any(|value| value == "text"))
+        || !supports_parameters(
+            model.supported_parameters.as_deref(),
+            requirements.requires_tools,
+        )
+    {
+        return false;
+    }
+    let matching = endpoints
+        .iter()
+        .filter(|endpoint| {
+            (endpoint.model_id == requirements.model_id
+                || endpoint.model_id == requirements.canonical_model_id)
+                && endpoint.tag == requirements.endpoint_id
         })
-        .take(256)
-        .collect()
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return false;
+    }
+    let endpoint = matching[0];
+    endpoint.status == Some(0)
+        && endpoint.zdr != Some(false)
+        && endpoint
+            .context_length
+            .is_some_and(|context| context >= total_context)
+        && endpoint
+            .max_prompt_tokens
+            .is_none_or(|tokens| tokens >= requirements.input_tokens)
+        && endpoint
+            .max_completion_tokens
+            .is_some_and(|tokens| tokens >= requirements.output_tokens)
+        && endpoint
+            .prompt_price
+            .as_deref()
+            .and_then(openrouter_price_micros_per_million)
+            .is_some_and(|price| {
+                price > 0 && price <= requirements.input_price_ceiling_micros_per_1m
+            })
+        && endpoint
+            .completion_price
+            .as_deref()
+            .and_then(openrouter_price_micros_per_million)
+            .is_some_and(|price| {
+                price > 0 && price <= requirements.output_price_ceiling_micros_per_1m
+            })
+        && endpoint
+            .request_price
+            .as_deref()
+            .is_none_or(|price| openrouter_price_micros_per_million(price) == Some(0))
+        && supports_parameters(
+            endpoint.supported_parameters.as_deref(),
+            requirements.requires_tools,
+        )
+        && (zdr.contains(&(
+            requirements.model_id.to_owned(),
+            requirements.endpoint_id.to_owned(),
+        )) || zdr.contains(&(
+            requirements.canonical_model_id.to_owned(),
+            requirements.endpoint_id.to_owned(),
+        )))
+}
+
+fn supports_parameters(parameters: Option<&[String]>, require_tools: bool) -> bool {
+    let Some(parameters) = parameters else {
+        return false;
+    };
+    parameters.iter().any(|value| value == "max_tokens")
+        && (!require_tools
+            || parameters.iter().any(|value| value == "tools")
+                && parameters.iter().any(|value| value == "tool_choice"))
+}
+
+/// Refresh authenticated model, endpoint and ZDR observations under one shared
+/// deadline. No raw provider response is returned or persisted.
+pub fn openrouter_pinned_paid_endpoint_probe_with_timeout(
+    api_key: &str,
+    requirements: PinnedPaidEndpointRequirements<'_>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let metadata = openrouter_metadata_http_probe_with_timeout(
+        api_key,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
+    let aliases = [requirements.model_id, requirements.canonical_model_id];
+    let endpoint_timeout = deadline.saturating_duration_since(Instant::now());
+    if endpoint_timeout.is_zero() {
+        return Err("OpenRouter endpoint validation deadline expired.".into());
+    }
+    let endpoints = openrouter_endpoints_http_probe_with_aliases(
+        api_key,
+        requirements.model_id,
+        &aliases,
+        endpoint_timeout,
+    )?;
+    let zdr_timeout = deadline.saturating_duration_since(Instant::now());
+    if zdr_timeout.is_zero() {
+        return Err("OpenRouter endpoint validation deadline expired.".into());
+    }
+    let zdr = openrouter_zdr_endpoints_http_probe_with_timeout(api_key, zdr_timeout)?;
+    if openrouter_pinned_paid_endpoint_is_verified(&metadata, &endpoints, &zdr, requirements) {
+        Ok(())
+    } else {
+        Err("Pinned paid endpoint identity, quote, capability, context, status or ZDR evidence changed.".into())
+    }
 }
 
 /// Exact endpoint identities in OpenRouter's current ZDR inventory. The
@@ -391,10 +605,19 @@ pub fn openrouter_endpoints_http_probe_with_timeout(
     model_id: &str,
     timeout: Duration,
 ) -> Result<Vec<OpenRouterEndpoint>, String> {
+    openrouter_endpoints_http_probe_with_aliases(api_key, model_id, &[model_id], timeout)
+}
+
+fn openrouter_endpoints_http_probe_with_aliases(
+    api_key: &str,
+    request_model_id: &str,
+    allowed_model_ids: &[&str],
+    timeout: Duration,
+) -> Result<Vec<OpenRouterEndpoint>, String> {
     if !valid_openrouter_key(api_key)
-        || !model_id.contains('/')
-        || model_id.len() > 160
-        || model_id
+        || !request_model_id.contains('/')
+        || request_model_id.len() > 160
+        || request_model_id
             .chars()
             .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | ':')))
     {
@@ -407,7 +630,9 @@ pub fn openrouter_endpoints_http_probe_with_timeout(
         .build()
         .map_err(|_| "OpenRouter endpoint metadata client is unavailable.".to_string())?;
     let response = client
-        .get(format!("{OPENROUTER_API_BASE}/models/{model_id}/endpoints"))
+        .get(format!(
+            "{OPENROUTER_API_BASE}/models/{request_model_id}/endpoints"
+        ))
         .bearer_auth(api_key)
         .send()
         .map_err(|_| "OpenRouter endpoint metadata could not be refreshed.".to_string())?;
@@ -433,7 +658,7 @@ pub fn openrouter_endpoints_http_probe_with_timeout(
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| "OpenRouter endpoint metadata was malformed.".to_string())?;
-    let endpoints = parse_openrouter_endpoints(&value, model_id);
+    let endpoints = parse_openrouter_endpoints_for_models(&value, allowed_model_ids);
     if endpoints.is_empty() {
         return Err("No exact OpenRouter endpoint is available for this model.".into());
     }
@@ -2508,6 +2733,245 @@ pub fn validate_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paid_pilot_observations() -> (
+        OpenRouterMetadataObservation,
+        Vec<OpenRouterEndpoint>,
+        std::collections::BTreeSet<(String, String)>,
+        PinnedPaidEndpointRequirements<'static>,
+    ) {
+        let selected = "qwen/qwen3-coder-next";
+        let canonical = "qwen/qwen3-coder-next-2025-02-03";
+        let endpoint = "parasail/bf16";
+        (
+            OpenRouterMetadataObservation {
+                authenticated_for_execution: Some(true),
+                models: vec![OpenRouterModel {
+                    id: selected.into(),
+                    canonical_slug: Some(canonical.into()),
+                    name: "Qwen Coder Next".into(),
+                    context_length: Some(32_768),
+                    prompt_price: Some("0.00000012".into()),
+                    completion_price: Some("0.00000080".into()),
+                    input_modalities: Some(vec!["text".into()]),
+                    output_modalities: Some(vec!["text".into()]),
+                    supported_parameters: Some(vec![
+                        "max_tokens".into(),
+                        "tools".into(),
+                        "tool_choice".into(),
+                    ]),
+                }],
+                free_model_daily_requests: None,
+            },
+            vec![OpenRouterEndpoint {
+                model_id: canonical.into(),
+                tag: endpoint.into(),
+                context_length: Some(32_768),
+                max_prompt_tokens: Some(16_384),
+                max_completion_tokens: Some(8_192),
+                prompt_price: Some("0.00000012".into()),
+                completion_price: Some("0.00000080".into()),
+                request_price: Some("0".into()),
+                status: Some(0),
+                zdr: None,
+                supported_parameters: Some(vec![
+                    "max_tokens".into(),
+                    "tools".into(),
+                    "tool_choice".into(),
+                ]),
+            }],
+            std::collections::BTreeSet::from([(canonical.into(), endpoint.into())]),
+            PinnedPaidEndpointRequirements {
+                model_id: selected,
+                canonical_model_id: canonical,
+                endpoint_id: endpoint,
+                input_price_ceiling_micros_per_1m: 120_000,
+                output_price_ceiling_micros_per_1m: 800_000,
+                input_tokens: 16_384,
+                output_tokens: 8_192,
+                requires_tools: true,
+            },
+        )
+    }
+
+    #[test]
+    fn pinned_paid_endpoint_requires_authenticated_exact_alias_quote_limits_and_zdr() {
+        let (metadata, endpoints, zdr, requirements) = paid_pilot_observations();
+        assert!(openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &endpoints,
+            &zdr,
+            requirements,
+        ));
+
+        let mut changed = metadata.clone();
+        changed.authenticated_for_execution = Some(false);
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &changed,
+            &endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed = metadata.clone();
+        changed.models[0].canonical_slug = Some("qwen/other".into());
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &changed,
+            &endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed = metadata.clone();
+        changed.models[0].prompt_price = Some("0.00000013".into());
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &changed,
+            &endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].status = Some(1);
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].max_prompt_tokens = None;
+        assert!(openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        assert_eq!(
+            changed_endpoints[0].max_prompt_tokens, None,
+            "unknown prompt cap remains unknown"
+        );
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].request_price = None;
+        assert!(openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].request_price = Some("0.000001".into());
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].max_prompt_tokens = Some(16_383);
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].context_length = Some(24_575);
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        let mut changed_endpoints = endpoints.clone();
+        changed_endpoints[0].supported_parameters = Some(vec!["max_tokens".into()]);
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &changed_endpoints,
+            &zdr,
+            requirements
+        ));
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(
+            &metadata,
+            &endpoints,
+            &std::collections::BTreeSet::new(),
+            requirements,
+        ));
+    }
+
+    #[test]
+    fn pinned_endpoint_parser_rejects_malformed_present_limits_and_request_prices() {
+        let base = serde_json::json!({
+            "data": {"endpoints": [{
+                "model_id": "qwen/qwen3-coder-next-2025-02-03",
+                "tag": "parasail/bf16",
+                "max_prompt_tokens": null,
+                "pricing": {"request": null}
+            }]}
+        });
+        let selected = "qwen/qwen3-coder-next-2025-02-03";
+        let parsed = parse_openrouter_endpoints(&base, selected);
+        assert_eq!(parsed.len(), 1, "absent/null remains unknown");
+        assert_eq!(parsed[0].max_prompt_tokens, None);
+        assert_eq!(parsed[0].request_price, None);
+
+        for malformed in [
+            serde_json::json!(-1),
+            serde_json::json!("16384"),
+            serde_json::json!(1.5),
+        ] {
+            let mut response = base.clone();
+            response["data"]["endpoints"][0]["max_prompt_tokens"] = malformed;
+            assert!(
+                parse_openrouter_endpoints(&response, selected).is_empty(),
+                "malformed present prompt cap must discard endpoint"
+            );
+        }
+        for malformed in [
+            serde_json::json!(0),
+            serde_json::json!(false),
+            serde_json::json!({}),
+        ] {
+            let mut response = base.clone();
+            response["data"]["endpoints"][0]["pricing"]["request"] = malformed;
+            assert!(
+                parse_openrouter_endpoints(&response, selected).is_empty(),
+                "malformed present request fee must discard endpoint"
+            );
+        }
+
+        let mut duplicate_alias = base.clone();
+        let mut malformed_alias = duplicate_alias["data"]["endpoints"][0].clone();
+        malformed_alias["model_id"] = serde_json::json!("qwen/qwen3-coder-next");
+        malformed_alias["pricing"]["request"] = serde_json::json!({"unexpected": "object"});
+        duplicate_alias["data"]["endpoints"]
+            .as_array_mut()
+            .unwrap()
+            .push(malformed_alias);
+        assert!(
+            parse_openrouter_endpoints_for_models(
+                &duplicate_alias,
+                &["qwen/qwen3-coder-next", selected]
+            )
+            .is_empty(),
+            "a malformed alias row must not be hidden by a valid canonical row"
+        );
+
+        let mut oversized = base.clone();
+        let row = oversized["data"]["endpoints"][0].clone();
+        oversized["data"]["endpoints"] =
+            serde_json::json!(vec![row; OPENROUTER_MAX_ENDPOINT_ROWS + 1]);
+        assert!(
+            parse_openrouter_endpoints(&oversized, selected).is_empty(),
+            "oversized endpoint responses fail closed before scanning"
+        );
+
+        let mut observed_zero = base;
+        observed_zero["data"]["endpoints"][0]["pricing"]["request"] = serde_json::json!("0");
+        assert_eq!(
+            parse_openrouter_endpoints(&observed_zero, selected)[0]
+                .request_price
+                .as_deref(),
+            Some("0")
+        );
+    }
 
     #[test]
     fn aider_runtime_version_normalizes_prefixed_output() {

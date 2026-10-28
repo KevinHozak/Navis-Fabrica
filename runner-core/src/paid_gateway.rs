@@ -57,6 +57,21 @@ pub struct PaidModelPolicy {
     /// Parent run's maximum spend; child calls must collectively remain under it.
     pub max_cost_micros: u64,
     pub pricing: PaidPricingCeiling,
+    /// Optional backend-reviewed endpoint pin for bounded paid pilots. `None`
+    /// preserves the existing OpenRouter paid routing behavior and JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_pin: Option<PaidEndpointPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PaidEndpointPin {
+    /// Exact OpenRouter endpoint tag, for example `parasail/bf16`.
+    pub endpoint_id: String,
+    /// Canonical slug learned from authenticated metadata during admission.
+    pub canonical_model_id: String,
+    /// Bind tool capability requirements from the planned task.
+    pub requires_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +181,8 @@ struct Shared {
     gate: Mutex<Gate>,
     policy_stop: Arc<AtomicBool>,
     client: reqwest::blocking::Client,
+    #[cfg(test)]
+    endpoint_validation_fixture: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 pub struct PaidGateway {
@@ -195,6 +212,30 @@ impl PaidGateway {
         budgets: BudgetStore,
         upstream_url: String,
     ) -> Result<Self, PaidGatewayError> {
+        Self::bind_to_upstream_inner(
+            config,
+            budgets,
+            upstream_url,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn bind_to_upstream_with_endpoint_fixture(
+        config: PaidGatewayConfig,
+        budgets: BudgetStore,
+        upstream_url: String,
+    ) -> Result<Self, PaidGatewayError> {
+        Self::bind_to_upstream_inner(config, budgets, upstream_url, Some(Arc::new(|| true)))
+    }
+
+    fn bind_to_upstream_inner(
+        config: PaidGatewayConfig,
+        budgets: BudgetStore,
+        upstream_url: String,
+        #[cfg(test)] endpoint_validation_fixture: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<Self, PaidGatewayError> {
         validate_config(&config)?;
         crate::initialize_crypto_provider();
         let token = random_hex(32)?;
@@ -222,6 +263,8 @@ impl PaidGateway {
             gate: Mutex::new(Gate::default()),
             policy_stop: Arc::new(AtomicBool::new(false)),
             client,
+            #[cfg(test)]
+            endpoint_validation_fixture,
         });
         let (shutdown, receiver) = watch::channel(false);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -410,6 +453,33 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
         return Err(PaidGatewayError::Invalid(
             "router identities and free model variants cannot use the paid gateway",
         ));
+    }
+    match (&p.mode, p.endpoint_pin.as_ref()) {
+        (GatewayMode::Paid, Some(pin)) => {
+            validate_endpoint_id(&pin.endpoint_id)?;
+            if pin.canonical_model_id.trim().is_empty()
+                || pin.canonical_model_id.len() > 160
+                || pin.canonical_model_id.chars().any(char::is_control)
+                || crate::economy::is_router_model_id(&pin.canonical_model_id)
+                || !crate::economy::reviewed_paid_endpoint_policy_matches(
+                    &p.model_id,
+                    &pin.canonical_model_id,
+                    &pin.endpoint_id,
+                    now_ms(),
+                )
+            {
+                return Err(PaidGatewayError::Invalid(
+                    "paid endpoint pin has no fresh backend-reviewed privacy evidence",
+                ));
+            }
+        }
+        (GatewayMode::Paid, None) => {}
+        (GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. }, Some(_)) => {
+            return Err(PaidGatewayError::Invalid(
+                "paid endpoint pin cannot authorize a free or synthetic route",
+            ));
+        }
+        (GatewayMode::Economy { .. } | GatewayMode::SyntheticTrial { .. }, None) => {}
     }
     match &p.mode {
         GatewayMode::Economy { .. } => {
@@ -969,6 +1039,10 @@ fn forward_request(
     };
     let observed_model = response_value.get("model").and_then(Value::as_str);
     let identity_matches = observed_model == Some(policy.model_id.as_str())
+        || policy
+            .endpoint_pin
+            .as_ref()
+            .is_some_and(|pin| observed_model == Some(pin.canonical_model_id.as_str()))
         || (matches!(&policy.mode, GatewayMode::SyntheticTrial { .. })
             && observed_model == shared.config.authenticated_canonical_slug.as_deref());
     if !identity_matches {
@@ -1063,7 +1137,46 @@ fn classify_policy_refusal(reason: &str) -> PaidPolicyRefusal {
 fn refresh_free_endpoint(shared: &Shared) -> bool {
     let policy = &shared.config.policy;
     let (endpoint_id, require_zdr, expected_canonical) = match &policy.mode {
-        GatewayMode::Paid => return true,
+        GatewayMode::Paid => {
+            let Some(pin) = policy.endpoint_pin.as_ref() else {
+                return true;
+            };
+            if !crate::economy::reviewed_paid_endpoint_policy_matches(
+                &policy.model_id,
+                &pin.canonical_model_id,
+                &pin.endpoint_id,
+                now_ms(),
+            ) {
+                return false;
+            }
+            #[cfg(test)]
+            if let Some(validate) = shared.endpoint_validation_fixture.as_ref() {
+                return validate();
+            }
+            let remaining = shared
+                .config
+                .dispatch_deadline
+                .saturating_duration_since(Instant::now());
+            let timeout = remaining.min(Duration::from_secs(15));
+            return !timeout.is_zero()
+                && providers::openrouter_pinned_paid_endpoint_probe_with_timeout(
+                    &shared.config.upstream_api_key,
+                    providers::PinnedPaidEndpointRequirements {
+                        model_id: &policy.model_id,
+                        canonical_model_id: &pin.canonical_model_id,
+                        endpoint_id: &pin.endpoint_id,
+                        input_price_ceiling_micros_per_1m: policy.pricing.input_price_micros_per_1m,
+                        output_price_ceiling_micros_per_1m: policy
+                            .pricing
+                            .output_price_micros_per_1m,
+                        input_tokens: policy.model_context_window_tokens,
+                        output_tokens: policy.max_output_tokens_per_call,
+                        requires_tools: pin.requires_tools,
+                    },
+                    timeout,
+                )
+                .is_ok();
+        }
         GatewayMode::Economy { endpoint_id } => {
             let Some(admission) = shared.config.economy_admission.as_ref() else {
                 return false;
@@ -1323,7 +1436,11 @@ fn validate_and_cap_request(request: &mut Value, policy: &PaidModelPolicy) -> Re
     object.insert("stream".into(), Value::Bool(false));
     let mut provider = json!({
         "only": match &policy.mode {
-            GatewayMode::Paid => Vec::<String>::new(),
+            GatewayMode::Paid => policy
+                .endpoint_pin
+                .as_ref()
+                .map(|pin| vec![pin.endpoint_id.clone()])
+                .unwrap_or_default(),
             GatewayMode::Economy { endpoint_id } | GatewayMode::SyntheticTrial { endpoint_id, .. } => vec![endpoint_id.clone()],
         },
         "allow_fallbacks": false,
@@ -1336,12 +1453,16 @@ fn validate_and_cap_request(request: &mut Value, policy: &PaidModelPolicy) -> Re
         }
     });
     if let Some(provider) = provider.as_object_mut() {
-        if matches!(&policy.mode, GatewayMode::Paid) {
+        if matches!(&policy.mode, GatewayMode::Paid) && policy.endpoint_pin.is_none() {
             provider.remove("only");
         }
     }
     object.insert("provider".into(), provider);
     match &policy.mode {
+        GatewayMode::Paid if policy.endpoint_pin.is_some() => {
+            object.insert("data_collection".into(), json!("deny"));
+            object.insert("zdr".into(), Value::Bool(true));
+        }
         GatewayMode::Paid => {}
         GatewayMode::Economy { .. } => {
             object.insert("data_collection".into(), json!("deny"));
@@ -1515,7 +1636,50 @@ mod tests {
                 source: "test-catalog".into(),
                 observed_at_ms: now,
             },
+            endpoint_pin: None,
         }
+    }
+
+    #[test]
+    fn legacy_paid_policy_serialization_omits_optional_endpoint_pin() {
+        let value = serde_json::to_value(policy(now_ms())).unwrap();
+        assert!(value.get("endpointPin").is_none());
+        let restored: PaidModelPolicy = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.endpoint_pin, None);
+    }
+
+    #[test]
+    fn pinned_paid_request_builder_enforces_fixed_endpoint_and_privacy_fields() {
+        let mut pinned = policy(now_ms());
+        pinned.model_id = "qwen/qwen3-coder-next".into();
+        pinned.model_context_window_tokens = 16_384;
+        pinned.max_output_tokens_per_call = 8_192;
+        pinned.max_cost_micros = 100_000;
+        pinned.pricing.input_price_micros_per_1m = 120_000;
+        pinned.pricing.output_price_micros_per_1m = 800_000;
+        pinned.endpoint_pin = Some(PaidEndpointPin {
+            endpoint_id: "parasail/bf16".into(),
+            canonical_model_id: "qwen/qwen3-coder-next-2025-02-03".into(),
+            requires_tools: true,
+        });
+        let mut request = json!({
+            "model":"qwen/qwen3-coder-next",
+            "messages":[{"role":"user","content":"synthetic"}],
+            "max_tokens": 50_000,
+            "stream": true
+        });
+        validate_and_cap_request(&mut request, &pinned).unwrap();
+        assert_eq!(request["max_tokens"], 8_192);
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["provider"]["only"][0], "parasail/bf16");
+        assert_eq!(request["provider"]["allow_fallbacks"], false);
+        assert_eq!(request["provider"]["require_parameters"], true);
+        assert_eq!(request["provider"]["max_price"]["prompt"], 0.12);
+        assert_eq!(request["provider"]["max_price"]["completion"], 0.8);
+        assert_eq!(request["provider"]["max_price"]["request"], 0);
+        assert_eq!(request["provider"]["max_price"]["image"], 0);
+        assert_eq!(request["data_collection"], "deny");
+        assert_eq!(request["zdr"], true);
     }
 
     fn budget_store() -> (tempfile::TempDir, BudgetStore, String, u64) {
@@ -1800,6 +1964,118 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].state, PaidCallState::Settled);
         assert_eq!(calls[0].max_tokens, 1_100);
+        assert_eq!(calls[0].actual_tokens, Some(16));
+        assert_eq!(calls[0].actual_cost_micros, Some(50));
+        gateway.stop();
+        upstream_worker.join().unwrap();
+    }
+
+    #[test]
+    fn pinned_paid_gateway_routes_canonical_response_to_exact_zdr_endpoint_and_settles_paid_usage()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let budgets = BudgetStore::open(dir.path().join("budget.sqlite3")).unwrap();
+        let policy_limits = BudgetPolicy {
+            max_tokens: 73_728,
+            max_cost_micros: 100_000,
+            max_seconds: 120,
+            max_concurrency: 1,
+        };
+        budgets
+            .configure("pilot", "qwen", &policy_limits, &policy_limits)
+            .unwrap();
+        let now = now_ms();
+        let parent_id = "pinned-qwen-run".to_owned();
+        let source = "authenticated-openrouter-model-and-endpoint-metadata".to_owned();
+        let reservation = ReservationRequest {
+            reservation_id: parent_id.clone(),
+            batch_id: "pilot".into(),
+            job_id: "qwen".into(),
+            task_id: "small_bugfix".into(),
+            provider_id: "openrouter-profile".into(),
+            model_id: "qwen/qwen3-coder-next".into(),
+            runtime_id: "aider".into(),
+            max_tokens: 73_728,
+            max_cost_micros: Some(100_000),
+            max_seconds: 120,
+            is_paid: true,
+            pricing_source: Some(source.clone()),
+            pricing_verified_at_ms: Some(now),
+        };
+        budgets.reserve(&reservation, now).unwrap();
+        budgets.mark_dispatched(&parent_id, now).unwrap();
+
+        let mut pinned = policy(now);
+        pinned.provider_id = "openrouter-profile".into();
+        pinned.model_id = "qwen/qwen3-coder-next".into();
+        pinned.model_context_window_tokens = 16_384;
+        pinned.max_output_tokens_per_call = 8_192;
+        pinned.max_calls = 3;
+        pinned.max_cost_micros = 100_000;
+        pinned.pricing = PaidPricingCeiling {
+            input_price_micros_per_1m: 120_000,
+            output_price_micros_per_1m: 800_000,
+            request_fee_micros: 0,
+            source,
+            observed_at_ms: now,
+        };
+        pinned.endpoint_pin = Some(PaidEndpointPin {
+            endpoint_id: "parasail/bf16".into(),
+            canonical_model_id: "qwen/qwen3-coder-next-2025-02-03".into(),
+            requires_tools: true,
+        });
+        let response_body = json!({
+            "id": "chatcmpl-pinned-qwen",
+            "model": "qwen/qwen3-coder-next-2025-02-03",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+            "usage": {"prompt_tokens":12,"completion_tokens":4,"total_tokens":16,"cost":0.00005}
+        });
+        let (upstream_url, captured, upstream_worker) = fake_upstream(response_body);
+        let mut gateway = PaidGateway::bind_to_upstream_with_endpoint_fixture(
+            PaidGatewayConfig {
+                upstream_api_key: "sk-or-never-leaves-process".into(),
+                parent_reservation_id: parent_id.clone(),
+                policy: pinned,
+                authenticated_canonical_slug: None,
+                economy_admission: None,
+                synthetic_trial_consent: false,
+                synthetic_trial_fixture: None,
+                request_timeout: Duration::from_secs(10),
+                dispatch_deadline: Instant::now() + Duration::from_secs(60),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            budgets.clone(),
+            upstream_url,
+        )
+        .unwrap();
+        gateway.authorize_parent_dispatch().unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{}/chat/completions", gateway.base_url()))
+            .bearer_auth(gateway.child_token())
+            .json(&json!({
+                "model":"qwen/qwen3-coder-next",
+                "messages":[{"role":"user","content":"synthetic fixed-endpoint smoke"}],
+                "max_tokens": 50_000,
+                "stream": true
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(sent["request"]["model"], "qwen/qwen3-coder-next");
+        assert_eq!(sent["request"]["max_tokens"], 8_192);
+        assert_eq!(sent["request"]["provider"]["only"][0], "parasail/bf16");
+        assert_eq!(sent["request"]["provider"]["allow_fallbacks"], false);
+        assert_eq!(sent["request"]["provider"]["require_parameters"], true);
+        assert_eq!(sent["request"]["provider"]["max_price"]["prompt"], 0.12);
+        assert_eq!(sent["request"]["provider"]["max_price"]["completion"], 0.8);
+        assert_eq!(sent["request"]["provider"]["max_price"]["request"], 0);
+        assert_eq!(sent["request"]["provider"]["max_price"]["image"], 0);
+        assert_eq!(sent["request"]["data_collection"], "deny");
+        assert_eq!(sent["request"]["zdr"], true);
+        let calls = budgets.paid_calls_for_parent(&parent_id).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].state, PaidCallState::Settled);
         assert_eq!(calls[0].actual_tokens, Some(16));
         assert_eq!(calls[0].actual_cost_micros, Some(50));
         gateway.stop();

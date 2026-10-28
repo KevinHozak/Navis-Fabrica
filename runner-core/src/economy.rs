@@ -37,6 +37,54 @@ const REVIEWED_ENDPOINT_POLICIES_JSON: &[u8] =
     include_bytes!("../config/economy-endpoint-policies.json");
 const REVIEWED_ENDPOINT_POLICIES_SHA256: &str =
     "65757ee5733e7c371c77fc5efc87ba6fd957c485b201ee978f695cd224d2dcb8";
+const REVIEWED_PAID_ENDPOINT_POLICIES_JSON: &[u8] =
+    include_bytes!("../config/paid-endpoint-policies.json");
+const REVIEWED_PAID_ENDPOINT_POLICIES_SHA256: &str =
+    "b6ffb294af8897ca2f61bdd0f00b05c7cf563075e130f9303f6f8dd86687d4ca";
+const PAID_ENDPOINT_POLICY_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+fn paid_endpoint_policy_digest(bytes: &[u8]) -> String {
+    // This is a new registry with a line-ending-independent semantic hash.
+    // Existing free-economy registry hashes intentionally retain their prior
+    // byte-for-byte behavior.
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    sha256_hex(&normalized)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewedPaidEndpointPolicies {
+    schema_version: u32,
+    policies: Vec<ReviewedPaidEndpointPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewedPaidEndpointPolicy {
+    model_id: String,
+    canonical_model_id: String,
+    provider_slug: String,
+    endpoint_tag: String,
+    observed_at_ms: u64,
+    source_urls: Vec<String>,
+    processing_mode: String,
+    no_training: bool,
+    persistent_input_storage: bool,
+    input_content_logging: bool,
+    transient_content_processing: bool,
+    operational_metadata_may_be_logged: bool,
+    legal_process_exceptions_may_apply: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -449,6 +497,7 @@ pub fn execute_trial(arguments: TrialRunArguments<'_>) -> TrialReceipt {
             max_calls,
             max_cost_micros: 0,
             pricing: pricing.clone(),
+            endpoint_pin: None,
         };
         let max_seconds = registry.limits.max_seconds_per_task;
         let budget_policy = crate::budgets::BudgetPolicy {
@@ -1062,6 +1111,49 @@ fn valid_reviewed_endpoint_policies() -> bool {
     sha256_hex(REVIEWED_ENDPOINT_POLICIES_JSON) == REVIEWED_ENDPOINT_POLICIES_SHA256
         && serde_json::from_slice::<ReviewedEndpointPolicies>(REVIEWED_ENDPOINT_POLICIES_JSON)
             .is_ok_and(|registry| registry.schema_version == 1)
+}
+
+/// The endpoint privacy evidence is compiled into the runner and hash-bound.
+/// Its content-retention wording is intentionally scoped: temporary content
+/// processing to generate output is recorded, and operational metadata or
+/// legal-process exceptions are not represented as impossible.
+pub(crate) fn reviewed_paid_endpoint_policy_matches(
+    model_id: &str,
+    canonical_model_id: &str,
+    endpoint_id: &str,
+    now_ms: u64,
+) -> bool {
+    if paid_endpoint_policy_digest(REVIEWED_PAID_ENDPOINT_POLICIES_JSON)
+        != REVIEWED_PAID_ENDPOINT_POLICIES_SHA256
+    {
+        return false;
+    }
+    let Ok(registry) = serde_json::from_slice::<ReviewedPaidEndpointPolicies>(
+        REVIEWED_PAID_ENDPOINT_POLICIES_JSON,
+    ) else {
+        return false;
+    };
+    if registry.schema_version != 1 || registry.policies.len() > 64 {
+        return false;
+    }
+    registry.policies.iter().any(|policy| {
+        policy.model_id == model_id
+            && policy.canonical_model_id == canonical_model_id
+            && policy.endpoint_tag == endpoint_id
+            && policy.provider_slug == endpoint_id.split('/').next().unwrap_or_default()
+            && policy.processing_mode == "serverless"
+            && policy.no_training
+            && !policy.persistent_input_storage
+            && !policy.input_content_logging
+            && policy.transient_content_processing
+            && policy.operational_metadata_may_be_logged
+            && policy.legal_process_exceptions_may_apply
+            && !policy.source_urls.is_empty()
+            && policy.source_urls.len() <= 8
+            && policy.source_urls.iter().all(|url| valid_source_url(url))
+            && policy.observed_at_ms <= now_ms
+            && now_ms.saturating_sub(policy.observed_at_ms) <= PAID_ENDPOINT_POLICY_MAX_AGE_MS
+    })
 }
 
 fn reviewed_endpoint_policy(model_id: &str, endpoint_id: &str) -> Option<EndpointPrivacyEvidence> {
@@ -1937,6 +2029,7 @@ impl VerifiedEconomyAdmission {
                 source: "authenticated-openrouter-model-and-zdr-endpoint-metadata".into(),
                 observed_at_ms: self.catalog_observed_at_ms,
             },
+            endpoint_pin: None,
         }
     }
 
@@ -2193,6 +2286,61 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paid_endpoint_policy_is_exact_fresh_and_records_processing_scope() {
+        let now = 1793145600000;
+        assert!(reviewed_paid_endpoint_policy_matches(
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3-coder-next-2025-02-03",
+            "parasail/bf16",
+            now,
+        ));
+        assert!(!reviewed_paid_endpoint_policy_matches(
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3-coder-next-2025-02-03",
+            "parasail/other",
+            now,
+        ));
+        assert!(!reviewed_paid_endpoint_policy_matches(
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3-coder-next-other",
+            "parasail/bf16",
+            now,
+        ));
+        assert!(!reviewed_paid_endpoint_policy_matches(
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3-coder-next-2025-02-03",
+            "parasail/bf16",
+            now + PAID_ENDPOINT_POLICY_MAX_AGE_MS + 1,
+        ));
+        assert!(!reviewed_paid_endpoint_policy_matches(
+            "qwen/qwen3-coder-next",
+            "qwen/qwen3-coder-next-2025-02-03",
+            "parasail/bf16",
+            now - 1,
+        ));
+    }
+
+    #[test]
+    fn paid_endpoint_policy_digest_is_stable_across_windows_line_endings() {
+        let lf = b"{\n  \"schemaVersion\": 1\n}\n";
+        let crlf = b"{\r\n  \"schemaVersion\": 1\r\n}\r\n";
+        let changed = b"{\n  \"schemaVersion\": 2\n}\n";
+
+        assert_eq!(
+            paid_endpoint_policy_digest(lf),
+            paid_endpoint_policy_digest(crlf)
+        );
+        assert_ne!(
+            paid_endpoint_policy_digest(lf),
+            paid_endpoint_policy_digest(changed)
+        );
+        assert_eq!(
+            paid_endpoint_policy_digest(REVIEWED_PAID_ENDPOINT_POLICIES_JSON),
+            REVIEWED_PAID_ENDPOINT_POLICIES_SHA256
+        );
+    }
 
     #[test]
     fn economy_request_envelope_obeys_model_and_endpoint_context_boundaries() {

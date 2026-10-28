@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "policies": [
+    {
+      "modelId": "qwen/qwen3-coder-next",
+      "canonicalModelId": "qwen/qwen3-coder-next-2025-02-03",
+      "providerSlug": "parasail",
+      "endpointTag": "parasail/bf16",
+      "observedAtMs": 1793145600000,
+      "sourceUrls": [
+        "https://docs.parasail.io/parasail-docs/security-and-account-management/overview",
+        "https://www.parasail.io/legal/terms-of-service",
+        "https://openrouter.ai/docs/guides/features/zdr",
+        "https://openrouter.ai/api/v1/endpoints/zdr"
+      ],
+      "processingMode": "serverless",
+      "noTraining": true,
+      "persistentInputStorage": false,
+      "inputContentLogging": false,
+      "transientContentProcessing": true,
+      "operationalMetadataMayBeLogged": true,
+      "legalProcessExceptionsMayApply": true
+    }
+  ]
+}

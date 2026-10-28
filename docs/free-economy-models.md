@@ -71,3 +71,21 @@ OpenRouter's dated published free-model limits are 20 requests per minute and ei
 - [Free-model limits and key metadata](https://openrouter.ai/docs/api/reference/limits)
 
 Original observation receipts and operational logs remain in caller-private evidence storage. Sanitized trial artifacts may be published after source and privacy review. Passing offline checks alone does not certify a model or complete FAB-S001.
+
+## Low-cost paid candidate preparation — 2026-10-28
+
+FAB-S001 now includes low-cost paid coding models. Selection should compare cost per successfully verified task, including failed attempts, token use, latency and review effort. Qwen3-Coder-Next, DeepSeek V4.1 Flash and GLM 5.3 Flash are research leads; none inherits qualification from a free variant or advertised benchmark.
+
+The optional paid endpoint pin keeps ordinary paid billing and durable reservations. It binds a selected model, authenticated canonical identity and exact endpoint through the reviewed route commitment. Admission and each call recheck current endpoint identity, capability, context, prices, ZDR membership and dated reviewed policy. Requests restrict the endpoint, disable fallback and require the approved price and privacy ceilings. A paid pin cannot supply a free Economy admission proof or turn a paid receipt into zero-cost usage. Existing paid requests without a pin retain their prior behavior.
+
+The Qwen pilot uses only synthetic fixtures and the approved aggregate USD ceiling. Public and authenticated metadata identify `qwen/qwen3-coder-next` at `parasail/bf16`; this is metadata and policy evidence, not tested coding readiness. Parasail's serverless terms limit content retention to generation and delivery, while allowing operational metadata. OpenRouter's ZDR exceptions still apply. No zero-logging claim covers operational metadata.
+
+Optional endpoint fields remain distinguishable from observations. An omitted request fee is not recorded as an observed zero: a pinned paid request requires an enforced zero per-request-fee ceiling and rejects an explicit positive or malformed fee. A missing separate prompt limit stays unknown; the local input/output envelope must fit the observed total context, and any explicit prompt/output limits must also fit. These controls do not promise that an endpoint will accept every request.
+
+Sources: [provider price ceilings](https://openrouter.ai/docs/guides/routing/provider-selection), [ZDR](https://openrouter.ai/docs/guides/features/zdr), [Parasail security and retention](https://docs.parasail.io/parasail-docs/security-and-account-management/overview), and [serverless terms](https://www.parasail.io/legal/terms-of-service).
+
+## Qwen pilot attempt — 2026-10-28
+
+The user approved an aggregate USD 0.10 ceiling for three synthetic tasks, with at most three Qwen calls per task. Three tasks were admitted, each with one attempt. All three stopped before Aider started because the batch passed the selected Codex reasoning effort to the Qwen runtime, which correctly rejected an effort not configured for that provider/model. The bounded source repair keeps the effort attached to its selected provider/model; it does not retry these tasks.
+
+The durable paid-call ledger records zero calls, zero tokens, zero cost, and zero unresolved usage; reservations were released before process start. Qwen was **not evaluated**: these results are neither a 0/3 score nor a model failure. This stopped attempt does not qualify any model. A fresh pilot requires new explicit authorization because the approved pilot prohibited task retries. The original admission-staleness refusal remains separately preserved in private evidence.

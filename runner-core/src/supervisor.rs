@@ -295,6 +295,8 @@ pub struct CommittedPaidQuote {
     pub max_cost_micros: u64,
     pub context_tokens: u64,
     pub max_output_tokens_per_call: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_pin: Option<crate::paid_gateway::PaidEndpointPin>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2662,13 +2664,14 @@ impl Supervisor {
                 output: String::new(),
                 failed: None,
             };
+            let reasoning_effort = implementation_reasoning_effort(&settings, profile, &model_id);
             let runtime_request = RuntimeRequest {
                 provider_id: Some(profile.id.clone()),
                 model_id: Some(model_id),
                 cwd: workspace.record.worktree_path.clone(),
                 prompt,
                 timeout_seconds: timeout,
-                reasoning_effort: settings.provider_selection.reasoning_effort.clone(),
+                reasoning_effort,
                 read_only: false,
                 test_command: None,
                 allow_paid: paid_policy.is_some(),
@@ -6030,6 +6033,20 @@ fn validate_paid_model_policy(
         || pricing.source.chars().any(char::is_control)
         || freshness_timestamp_ms > now_ms().max(0) as u64
         || (now_ms().max(0) as u64).saturating_sub(freshness_timestamp_ms) > 24 * 60 * 60 * 1000
+        || policy.endpoint_pin.as_ref().is_some_and(|pin| {
+            pin.requires_tools
+                != task
+                    .route_requirements
+                    .as_ref()
+                    .and_then(|requirements| requirements.require_tools)
+                    .unwrap_or(true)
+                || !crate::economy::reviewed_paid_endpoint_policy_matches(
+                    model_id,
+                    &pin.canonical_model_id,
+                    &pin.endpoint_id,
+                    now_ms().max(0) as u64,
+                )
+        })
     {
         return Err(SupervisorError::Invalid(format!(
             "paid task {} requires matching provider/model/runtime, verified context, explicit token/cost/call caps, zero request fees, and fresh pricing provenance",
@@ -6630,6 +6647,7 @@ fn derive_route_commitments(
                     max_cost_micros: policy.max_cost_micros,
                     context_tokens: policy.model_context_window_tokens,
                     max_output_tokens_per_call: policy.max_output_tokens_per_call,
+                    endpoint_pin: policy.endpoint_pin.clone(),
                 });
             commitments.insert(
                 key,
@@ -6707,6 +6725,17 @@ fn check_fresh_route_commitment(
     }) {
         return Err("required context capacity is no longer confirmed".into());
     }
+    let committed_endpoint_pin = commitment
+        .paid_quote
+        .as_ref()
+        .and_then(|quote| quote.endpoint_pin.as_ref());
+    let current_endpoint_pin = request
+        .paid_policies
+        .get(&key)
+        .and_then(|policy| policy.endpoint_pin.as_ref());
+    if check_paid_endpoint_pin_commitment(committed_endpoint_pin, current_endpoint_pin).is_err() {
+        return Err("paid endpoint pin changed since preview".into());
+    }
     check_fresh_paid_quote(commitment, &fresh.facts)?;
     if !commitment.authorized_candidates.iter().any(|candidate| {
         candidate.provider_id == commitment.provider_id && candidate.model_id == commitment.model_id
@@ -6741,6 +6770,17 @@ fn check_fresh_route_commitment(
         ));
     }
     Ok(())
+}
+
+fn check_paid_endpoint_pin_commitment(
+    committed: Option<&crate::paid_gateway::PaidEndpointPin>,
+    current: Option<&crate::paid_gateway::PaidEndpointPin>,
+) -> Result<(), ()> {
+    if committed == current {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 fn check_fresh_paid_quote(
@@ -7191,6 +7231,24 @@ fn selected_model(
     Ok(id.to_owned())
 }
 
+/// The user's reasoning-effort selection belongs to the selected
+/// provider/model pair. A task routed elsewhere must not inherit it; the
+/// runtime still validates an effort explicitly selected for its own model.
+fn implementation_reasoning_effort(
+    settings: &Settings,
+    profile: &ProviderProfile,
+    model_id: &str,
+) -> Option<String> {
+    let selection = &settings.provider_selection;
+    if selection.provider_id.as_deref() == Some(profile.id.as_str())
+        && selection.model_id.as_deref() == Some(model_id)
+    {
+        selection.reasoning_effort.clone()
+    } else {
+        None
+    }
+}
+
 fn validate_reviewer_reasoning_efforts(
     settings: &Settings,
     request: &BatchRequest,
@@ -7321,6 +7379,92 @@ mod supervisor_tests {
         assert!(!verification_error_requires_input(
             &SupervisorError::Runtime("needs_input: unrelated runtime text".into(),)
         ));
+    }
+
+    #[test]
+    fn implementation_effort_stays_bound_to_selected_provider_and_model() {
+        use crate::providers::{ModelProfile, ProviderKind};
+
+        let mut settings = Settings::default();
+        settings.provider_selection.provider_id = Some("codex-local".into());
+        settings.provider_selection.model_id = Some("gpt-6-luna".into());
+        settings.provider_selection.reasoning_effort = Some("medium".into());
+        let codex = ProviderProfile {
+            id: "codex-local".into(),
+            kind: ProviderKind::Codex,
+            name: "Codex".into(),
+            executable: "codex".into(),
+            endpoint: None,
+            secret_ref: None,
+            models: vec![ModelProfile {
+                id: "gpt-6-luna".into(),
+                name: "GPT-6 Luna".into(),
+                reasoning_efforts: vec!["medium".into()],
+                context_window_tokens: None,
+                supports_tools: None,
+                quality_rating: None,
+            }],
+        };
+        let qwen = ProviderProfile {
+            id: "openRouter-373ec4c1".into(),
+            kind: ProviderKind::OpenRouter,
+            name: "OpenRouter".into(),
+            executable: "aider".into(),
+            endpoint: None,
+            secret_ref: None,
+            models: vec![ModelProfile {
+                id: "qwen/qwen3-coder-next".into(),
+                name: "Qwen 3 Coder Next".into(),
+                reasoning_efforts: Vec::new(),
+                context_window_tokens: None,
+                supports_tools: Some(true),
+                quality_rating: None,
+            }],
+        };
+
+        assert_eq!(
+            implementation_reasoning_effort(&settings, &qwen, "qwen/qwen3-coder-next"),
+            None,
+            "Codex's medium setting must not be sent to the Qwen runtime"
+        );
+        let same_provider_different_model = ProviderProfile {
+            id: "codex-local".into(),
+            ..qwen.clone()
+        };
+        assert_eq!(
+            implementation_reasoning_effort(
+                &settings,
+                &same_provider_different_model,
+                "qwen/qwen3-coder-next"
+            ),
+            None,
+            "matching only the selected provider must not forward its effort"
+        );
+        let same_model_different_provider = ProviderProfile {
+            id: "openRouter-373ec4c1".into(),
+            ..codex.clone()
+        };
+        assert_eq!(
+            implementation_reasoning_effort(
+                &settings,
+                &same_model_different_provider,
+                "gpt-6-luna"
+            ),
+            None,
+            "matching only the selected model must not forward its effort"
+        );
+        assert_eq!(
+            implementation_reasoning_effort(&settings, &codex, "gpt-6-luna"),
+            Some("medium".into()),
+            "the selected Codex Luna effort must remain intact"
+        );
+
+        settings.provider_selection.reasoning_effort = Some("unsupported".into());
+        assert_eq!(
+            implementation_reasoning_effort(&settings, &codex, "gpt-6-luna"),
+            Some("unsupported".into()),
+            "an invalid effort on the selected identity must reach the existing runtime validator"
+        );
     }
 
     #[test]
@@ -7721,6 +7865,7 @@ mod supervisor_tests {
                 source: "verified-fixture-catalog".into(),
                 observed_at_ms: now.saturating_sub(24 * 60 * 60 * 1000 + 1),
             },
+            endpoint_pin: None,
         };
         let original = reviewed.clone();
 
@@ -7779,6 +7924,7 @@ mod supervisor_tests {
             max_output_tokens_per_call: reviewed.max_output_tokens_per_call,
             max_cost_micros: reviewed.max_cost_micros,
             max_calls: reviewed.max_calls,
+            endpoint_pin: None,
         };
         let commitment = RouteSemanticCommitment {
             provider_id: reviewed.provider_id.clone(),
@@ -7799,6 +7945,37 @@ mod supervisor_tests {
         assert!(check_fresh_paid_quote(&commitment, &changed_facts)
             .unwrap_err()
             .contains("quote or source changed"));
+    }
+
+    #[test]
+    fn paid_endpoint_pin_is_serialized_in_route_commitment_and_drift_is_rejected() {
+        let pin = crate::paid_gateway::PaidEndpointPin {
+            endpoint_id: "parasail/bf16".into(),
+            canonical_model_id: "qwen/qwen3-coder-next-2025-02-03".into(),
+            requires_tools: true,
+        };
+        let quote = CommittedPaidQuote {
+            input_price_micros_per_1m: 120_000,
+            output_price_micros_per_1m: 800_000,
+            request_fee_micros: 0,
+            source: "authenticated-openrouter-model-and-endpoint-metadata".into(),
+            max_calls: 3,
+            max_cost_micros: 33_333,
+            context_tokens: 16_384,
+            max_output_tokens_per_call: 8_192,
+            endpoint_pin: Some(pin.clone()),
+        };
+        let encoded = serde_json::to_value(&quote).unwrap();
+        assert_eq!(encoded["endpointPin"]["endpointId"], "parasail/bf16");
+        let restored: CommittedPaidQuote = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.endpoint_pin.as_ref(), Some(&pin));
+        assert!(check_paid_endpoint_pin_commitment(Some(&pin), Some(&pin)).is_ok());
+        let changed = crate::paid_gateway::PaidEndpointPin {
+            endpoint_id: "parasail/other".into(),
+            ..pin.clone()
+        };
+        assert!(check_paid_endpoint_pin_commitment(Some(&pin), Some(&changed)).is_err());
+        assert!(check_paid_endpoint_pin_commitment(Some(&pin), None).is_err());
     }
 
     fn budget_request(id: &str) -> ReservationRequest {

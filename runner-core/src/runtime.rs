@@ -1086,6 +1086,46 @@ fn run_openrouter_paid(
             "The refreshed model context or price exceeds the reviewed paid-run policy.",
         ));
     }
+    if let Some(pin) = policy.endpoint_pin.as_ref() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if !crate::economy::reviewed_paid_endpoint_policy_matches(
+            model_id,
+            &pin.canonical_model_id,
+            &pin.endpoint_id,
+            now,
+        ) {
+            return Err(RuntimeError::new(
+                "PAID_ENDPOINT_POLICY_UNAVAILABLE",
+                "The pinned endpoint has no fresh backend-reviewed privacy policy.",
+            ));
+        }
+        let endpoint_timeout = require_time()?;
+        if crate::providers::openrouter_pinned_paid_endpoint_probe_with_timeout(
+            &api_key,
+            crate::providers::PinnedPaidEndpointRequirements {
+                model_id,
+                canonical_model_id: &pin.canonical_model_id,
+                endpoint_id: &pin.endpoint_id,
+                input_price_ceiling_micros_per_1m: policy.pricing.input_price_micros_per_1m,
+                output_price_ceiling_micros_per_1m: policy.pricing.output_price_micros_per_1m,
+                input_tokens: policy.model_context_window_tokens,
+                output_tokens: policy.max_output_tokens_per_call,
+                requires_tools: pin.requires_tools,
+            },
+            endpoint_timeout,
+        )
+        .is_err()
+        {
+            return Err(RuntimeError::new(
+                "PAID_ENDPOINT_CHANGED",
+                "The authenticated pinned endpoint, price, capability, context, status, or ZDR evidence changed before runtime start.",
+            ));
+        }
+    }
     let parent = paid.budgets.get(paid.parent_reservation_id).map_err(|_| {
         RuntimeError::new(
             "PAID_RESERVATION_INVALID",
@@ -4281,6 +4321,7 @@ mod tests {
                 source: "diagnostic-only".into(),
                 observed_at_ms: 1,
             },
+            endpoint_pin: None,
         };
         let files =
             prepare_paid_aider_files("probe only", &policy, &["C:/synthetic/source.rs".into()])
@@ -4316,6 +4357,7 @@ mod tests {
                 source: "test".into(),
                 observed_at_ms: 1,
             },
+            endpoint_pin: None,
         };
         let files = prepare_paid_aider_files("prompt", &policy, &["C:/worktree/src/lib.rs".into()])
             .unwrap();

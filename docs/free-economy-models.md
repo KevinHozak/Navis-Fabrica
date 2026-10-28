@@ -112,3 +112,24 @@ The batch wall duration was 196.861 seconds. The table reports runner-accounted 
 The corrected run's accounted API cost per verified task was $0.001191. Including the earlier inconclusive $0.000457 call, cumulative accounted API cost per verified task is $0.001648. Subscription review cost was not measured. The earlier call is excluded from model-quality scoring because its prompt omitted issue requirements.
 
 The corrected source change was published as `0e3bdbf` (version 1.0.24); all seven declared checks passed, including 345 unit tests, 7 integration tests, 7 helper tests, and the exact-version source probe. Qwen has one valid verified task out of three and is **not qualified**. The pilot is complete; no further live calls, retries, fallbacks, or output repairs are authorized by this run.
+
+## DeepSeek V4.1 Flash pilot — 2026-10-28
+
+The user selected `deepseek/deepseek-v4.1-flash` next under the same cumulative USD 0.10 cap. The corrected three-task pilot pinned canonical model `deepseek/deepseek-v4.1-flash-20260910` and `parasail/fp8`, with at most two calls per task, 16,384 input and 8,192 output tokens per call, and 120 seconds of provider execution per task. Full issue snapshots and exact acceptance requirements were present. No fallback or whole-task retry ran.
+
+The runner now separates authenticated model-catalog pricing from the selected endpoint quote. Parasail's reviewed rate was USD 0.30/M input and USD 1.20/M output; reservations and request price ceilings use that endpoint rate. The cheaper catalog minimum remains separately bound and cannot authorize another endpoint. A catalog-price change stopped the first metadata-only preparation before any request, batch or inference; its evidence was preserved, and a fresh preview reused the unchanged synthetic fixtures. No omitted request fee is treated as observed zero: `max_price.request=0` remains an enforced ceiling.
+
+| Synthetic task | Calls | Tokens | Accounted API cost | Runner-accounted execution | Outcome |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Small bugfix | 1 | 2,575 | $0.000993 | 15 s | Provider process failed before edits |
+| Implementation | 1 | 3,511 | $0.002070 | 42 s | Provider process failed before edits |
+| Multifile edit | 1 | 5,915 | $0.004458 | 77 s | Provider process failed before edits |
+| **Total** | **3** | **12,001** | **$0.007521** | **134 s** | **Inconclusive for coding quality** |
+
+All three attempts remain `reconciliation_required`, and the batch is `waiting`; the foreground host returned after 160.737 seconds. Retained stderr tails show Aider/Rich crashing with a Windows cp1252 `UnicodeEncodeError` while printing U+25BA (`►`). Earlier response/error output was not fully retained, so another preceding error cannot be ruled out. The four seed source files remained unchanged in each worktree. No candidate behavior checks were executed because no implementation was applied; this is not a valid 0/3 model-quality score.
+
+All three calls and parent reservations settled, with zero unresolved billing or retained budget holds. Including previous Qwen usage, cumulative accounted API usage is seven calls, 21,687 tokens and **USD 0.009169**, leaving USD 0.090831 under the cap. Cost per verified successful DeepSeek task is undefined. API latency and subscription review dollars were not measured. No model is qualified by this run.
+
+Endpoint quote support was delivered in `8076444` (v1.0.25). Verification passed: 349 active unit tests, seven integration tests, seven prompt-helper tests, native check, CLI/worker build, release source contract and whitespace. Independent source audit found no actionable issues. One new test fixture initially used the wrong catalog output price; its failed run is preserved, and the corrected suite passed. No app installer was built. Live desktop settings and all six historical preservation hashes remain unchanged.
+
+FAB-S001 remains open. The next runtime repair is to make the isolated Aider output path Unicode-safe and verify it locally before any separately bounded fresh pilot. These consumed attempts were not recovered, edited or retried.

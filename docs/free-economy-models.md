@@ -133,3 +133,24 @@ All three calls and parent reservations settled, with zero unresolved billing or
 Endpoint quote support was delivered in `8076444` (v1.0.25). Verification passed: 349 active unit tests, seven integration tests, seven prompt-helper tests, native check, CLI/worker build, release source contract and whitespace. Independent source audit found no actionable issues. One new test fixture initially used the wrong catalog output price; its failed run is preserved, and the corrected suite passed. No app installer was built. Live desktop settings and all six historical preservation hashes remain unchanged.
 
 FAB-S001 remains open. The next runtime repair is to make the isolated Aider output path Unicode-safe and verify it locally before any separately bounded fresh pilot. These consumed attempts were not recovered, edited or retried.
+
+## Unicode repair and fresh DeepSeek pilot — 2026-10-28
+
+The isolated guard now configures both stdout and stderr as UTF-8 before importing Aider or Rich. Python `-I` isolation remains enabled; the ignored `PYTHONUTF8`/`PYTHONIOENCODING` environment settings are no longer the only output protection. The guard's metadata probe emits a Unicode sentinel that the runtime validates before dispatch. The repair is delivered in `93a5b51` (v1.0.26).
+
+Local verification passed with no external inference: one test forcibly initialized both Python streams as cp1252 before loading the actual guard; another ran real Aider through the production guard against a local fake gateway, printed `►`, applied a SEARCH/REPLACE Unicode edit, and confirmed that exactly the admitted CSS file changed. The original file/path, secret, model, fallback, call-count and settlement assertions remain. Final checks passed: 349 active unit tests, seven integration tests, seven prompt-helper tests, both Unicode checks, native check, CLI/worker build, release source contract and whitespace. Earlier local fixture/protocol/line-ending assertion failures are retained. An unchanged process-cleanup timing test also failed once; its isolated reproduction and serial full-suite rerun passed without changing its timeout or termination assertions. No app installer was built.
+
+The user explicitly authorized one fresh three-task DeepSeek round under the same cumulative USD 0.10 ceiling. It used unchanged synthetic requirements and behavior tests, exact model `deepseek/deepseek-v4.1-flash`, canonical identity `deepseek/deepseek-v4.1-flash-20260910`, and endpoint `parasail/fp8`. Fresh authenticated catalog and endpoint quotes were bound separately. Limits were two calls per task, 16,384 input and 8,192 output tokens per call, 120 seconds of provider execution per task, and USD 0.090831 remaining for the batch. No fallback, candidate output repair or whole-task retry occurred.
+
+| Synthetic task | Calls | Tokens | Accounted API cost | Runner-accounted execution | Independent behavioral result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Small bugfix | 1 | 2,558 | $0.000973 | 31 s | Passed both checks |
+| Implementation | 1 | 3,544 | $0.001733 | 34 s | Passed both checks |
+| Multifile edit | 1 | 4,654 | $0.002945 | 43 s | Passed both checks |
+| **Total** | **3** | **10,756** | **$0.005651** | **108 s** | **3 of 3 tasks; all six checks passed** |
+
+All three one-attempt jobs completed their native syntax contracts. Separate manual review of the exact captured source found no unsafe side effects or out-of-scope changes, then independent host checks passed against private copies with source hashes unchanged before/after execution. The batch completed in 163.603 seconds. These are runner-accounted execution and wall times; API latency was not separately retained.
+
+All calls and parent reservations settled with zero unresolved billing or retained holds. Cumulative paid-pilot usage including Qwen and the earlier inconclusive DeepSeek round is ten calls, 32,443 tokens and **USD 0.014820**, leaving USD 0.085180 under the cap. The valid fresh round's accounted API cost per verified task was approximately USD 0.001884. Including DeepSeek's earlier runtime-blocked round, its accounted API cost per verified successful task is approximately USD 0.004391. Subscription review dollars remain unmeasured; earlier inconclusive attempts are excluded from quality scoring but included in spend.
+
+DeepSeek passed this bounded coding matrix. Production paid Economy shortlist admission and UI integration remain separate work, so FAB-S001 stays open; no provider profile or running job was automatically changed. All six historical preservation hashes and live desktop settings remain unchanged. The prior failed attempts, diagnostics, prompt proofs and ledgers are preserved.

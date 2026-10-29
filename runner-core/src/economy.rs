@@ -1773,6 +1773,11 @@ pub(crate) fn admit_paid_economy_candidate(
     let evaluation = trusted_paid_evaluation("aider", runtime_version, now_ms)
         .ok_or_else(|| "No current all-case paid Economy qualification matches this Aider runtime and guard.".to_string())?;
     let model = &metadata.model;
+    let scoped_zdr_endpoints = crate::providers::scope_openrouter_zdr_endpoints(
+        &metadata.zdr_endpoints,
+        &[evaluation.model_id.as_str(), evaluation.canonical_model_id.as_str()],
+    )
+    .ok_or_else(|| "The selected model has too many ZDR endpoint records.".to_string())?;
     let catalog_input = current_catalog_input
         .ok_or_else(|| "Current authenticated catalog input pricing is unavailable.".to_string())?;
     let catalog_output = current_catalog_output
@@ -1797,7 +1802,6 @@ pub(crate) fn admit_paid_economy_candidate(
         || metadata.runtime_identity_fingerprint != runtime_identity_fingerprint
         || metadata.observed_at_ms > now_ms as u128
         || (now_ms as u128).saturating_sub(metadata.observed_at_ms) > 24 * 60 * 60 * 1000
-        || metadata.zdr_endpoints.len() > 256
         || !reviewed_paid_endpoint_policy_matches(
             &model.id,
             &evaluation.canonical_model_id,
@@ -1840,7 +1844,7 @@ pub(crate) fn admit_paid_economy_candidate(
             free_model_daily_requests: None,
         },
         &metadata.endpoints,
-        &metadata.zdr_endpoints,
+        &scoped_zdr_endpoints,
         requirements,
     ) {
         return Err("The exact endpoint is unavailable, stale, over its reviewed price/capability envelope, or missing ZDR.".into());
@@ -3154,6 +3158,99 @@ mod tests {
         )
     }
 
+    fn paid_deepseek_admission(
+        metadata: &crate::provider_observations::OpenRouterPaidEndpointMetadata,
+        now_ms: u64,
+    ) -> Result<VerifiedPaidEconomyAdmission, String> {
+        admit_paid_economy_candidate(
+            "openrouter-paid-fixture",
+            &"a".repeat(32),
+            metadata,
+            Some(2_730),
+            Some(278_000),
+            Some("OpenRouter authenticated user model catalog"),
+            Some(now_ms),
+            now_ms,
+        )
+    }
+
+    #[test]
+    fn paid_admission_scopes_global_zdr_inventory_before_per_model_limit() {
+        let now = 1_793_221_100_000;
+        let (_, mut metadata) = paid_deepseek_fixture(now);
+        for index in 0..300 {
+            metadata.zdr_endpoints.insert((
+                format!("aaa-unrelated-model-{index:04}"),
+                format!("unrelated/provider-{index:04}"),
+            ));
+        }
+        let target = (
+            "deepseek/deepseek-v4.1-flash-20260910".to_string(),
+            "parasail/fp8".to_string(),
+        );
+        metadata.zdr_endpoints.insert(target.clone());
+
+        let target_position = metadata
+            .zdr_endpoints
+            .iter()
+            .position(|entry| entry == &target)
+            .unwrap();
+        assert!(target_position > 256, "fixture should place the valid pin beyond the per-model bound");
+        assert!(metadata.zdr_endpoints.len() > 256);
+        assert!(paid_deepseek_admission(&metadata, now).is_ok());
+        assert_eq!(metadata.zdr_endpoints.len(), 301, "global metadata remains intact");
+        metadata.zdr_endpoints.remove(&target);
+        assert!(paid_deepseek_admission(&metadata, now).is_err(),
+            "a large unrelated inventory cannot substitute for the exact pin");
+    }
+
+    #[test]
+    fn paid_admission_requires_exact_model_alias_and_endpoint_zdr_membership() {
+        let now = 1_793_221_100_000;
+        let (_, mut metadata) = paid_deepseek_fixture(now);
+
+        // Either the selected model ID or its authenticated canonical ID is
+        // accepted, but a different model with the same endpoint tag is not.
+        metadata.zdr_endpoints = BTreeSet::from([(
+            "deepseek/deepseek-v4.1-flash".into(),
+            "parasail/fp8".into(),
+        )]);
+        assert!(paid_deepseek_admission(&metadata, now).is_ok());
+
+        metadata.zdr_endpoints = BTreeSet::from([(
+            "unrelated/model".into(),
+            "parasail/fp8".into(),
+        )]);
+        assert!(paid_deepseek_admission(&metadata, now).is_err());
+
+        metadata.zdr_endpoints = BTreeSet::from([(
+            "deepseek/deepseek-v4.1-flash-20260910".into(),
+            "parasail/other".into(),
+        )]);
+        assert!(paid_deepseek_admission(&metadata, now).is_err());
+    }
+
+    #[test]
+    fn paid_admission_rejects_oversized_in_scope_zdr_and_ambiguous_endpoint() {
+        let now = 1_793_221_100_000;
+        let (_, mut metadata) = paid_deepseek_fixture(now);
+        metadata.zdr_endpoints = (0..crate::providers::OPENROUTER_MAX_ZDR_ENDPOINTS_PER_MODEL)
+            .map(|index| (
+                "deepseek/deepseek-v4.1-flash-20260910".to_string(),
+                format!("parasail/tag-{index:04}"),
+            ))
+            .collect();
+        metadata.zdr_endpoints.insert((
+            "deepseek/deepseek-v4.1-flash-20260910".into(),
+            "parasail/fp8".into(),
+        ));
+        assert!(paid_deepseek_admission(&metadata, now).is_err());
+
+        let (_, mut metadata) = paid_deepseek_fixture(now);
+        metadata.endpoints.push(metadata.endpoints[0].clone());
+        assert!(paid_deepseek_admission(&metadata, now).is_err());
+    }
+
     #[test]
     fn embedded_paid_evaluation_bundle_hash_and_case_proofs_validate() {
         assert_eq!(
@@ -3170,7 +3267,13 @@ mod tests {
     #[test]
     fn paid_status_uses_current_exact_endpoint_and_reports_tested_bounds() {
         let now = 1_793_221_100_000;
-        let (model, metadata) = paid_deepseek_fixture(now);
+        let (model, mut metadata) = paid_deepseek_fixture(now);
+        for index in 0..300 {
+            metadata.zdr_endpoints.insert((
+                format!("aaa-unrelated-model-{index:04}"),
+                format!("unrelated/provider-{index:04}"),
+            ));
+        }
         let models = vec![model];
         let paid = BTreeMap::from([(metadata.model.id.clone(), metadata)]);
         let status = statuses_from_catalog(
@@ -3239,6 +3342,12 @@ mod tests {
         let now_u64 = u64::try_from(now).unwrap();
         let (model, mut paid_metadata) = paid_deepseek_fixture(now_u64);
         paid_metadata.runtime_identity_fingerprint = runtime_identity_fingerprint.clone();
+        for index in 0..300 {
+            paid_metadata.zdr_endpoints.insert((
+                format!("aaa-unrelated-model-{index:04}"),
+                format!("unrelated/provider-{index:04}"),
+            ));
+        }
         let observed_at = now;
         let provider = ProviderObservation {
             provider_id: settings.providers[0].id.clone(),

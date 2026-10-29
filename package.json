@@ -1,7 +1,7 @@
 {
   "name": "navis-fabrica",
   "private": true,
-  "version": "1.0.27",
+  "version": "1.0.28",
   "type": "module",
   "packageManager": "npm@11.11.1",
   "engines": {

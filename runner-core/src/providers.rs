@@ -58,6 +58,8 @@ pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub const OPENROUTER_MAX_MODELS: usize = 500;
 const OPENROUTER_MAX_ENDPOINT_ROWS: usize = 2048;
 pub const OPENROUTER_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum exact ZDR records considered for one selected/canonical model pair.
+pub const OPENROUTER_MAX_ZDR_ENDPOINTS_PER_MODEL: usize = 256;
 
 pub const TYPESAFE_API_BASE: &str = "https://api.typesafe.ai/v1";
 pub const TYPESAFE_JEV_MODEL: &str = "jev-1.14.0";
@@ -637,6 +639,31 @@ pub fn parse_openrouter_zdr_endpoints(
     Some(endpoints)
 }
 
+/// Restrict the bounded global ZDR inventory to the exact selected model and
+/// its authenticated canonical alias before applying the per-model limit.
+/// Unrelated model rows never count toward this limit or satisfy membership.
+pub fn scope_openrouter_zdr_endpoints(
+    endpoints: &std::collections::BTreeSet<(String, String)>,
+    allowed_model_ids: &[&str],
+) -> Option<std::collections::BTreeSet<(String, String)>> {
+    let scoped = endpoints
+        .iter()
+        .filter(|(model_id, _)| allowed_model_ids.contains(&model_id.as_str()))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    (scoped.len() <= OPENROUTER_MAX_ZDR_ENDPOINTS_PER_MODEL).then_some(scoped)
+}
+
+fn parse_openrouter_zdr_response_bytes(
+    bytes: &[u8],
+) -> Option<std::collections::BTreeSet<(String, String)>> {
+    if bytes.len() > OPENROUTER_MAX_RESPONSE_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    parse_openrouter_zdr_endpoints(&value)
+}
+
 pub fn openrouter_zdr_endpoints_http_probe_with_timeout(
     api_key: &str,
     timeout: Duration,
@@ -675,9 +702,7 @@ pub fn openrouter_zdr_endpoints_http_probe_with_timeout(
     if bytes.len() > OPENROUTER_MAX_RESPONSE_BYTES {
         return Err("OpenRouter ZDR endpoint inventory exceeded its response limit.".into());
     }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "OpenRouter ZDR endpoint inventory was malformed.".to_string())?;
-    parse_openrouter_zdr_endpoints(&value)
+    parse_openrouter_zdr_response_bytes(&bytes)
         .ok_or_else(|| "OpenRouter ZDR endpoint inventory contained invalid records.".into())
 }
 
@@ -2828,6 +2853,70 @@ pub fn validate_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zdr_inventory_keeps_global_limits_and_scopes_without_truncating() {
+        let rows = (0..10_000)
+            .map(|index| json!({
+                "model_id": format!("model/group-{index:05}"),
+                "tag": format!("provider/endpoint-{index:05}"),
+            }))
+            .collect::<Vec<_>>();
+        let value = json!({ "data": rows });
+        let parsed = parse_openrouter_zdr_endpoints(&value).unwrap();
+        assert_eq!(parsed.len(), 10_000);
+
+        let oversized = json!({
+            "data": (0..10_001)
+                .map(|index| json!({
+                    "model_id": format!("model/group-{index:05}"),
+                    "tag": format!("provider/endpoint-{index:05}"),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        assert!(parse_openrouter_zdr_endpoints(&oversized).is_none());
+
+        let mut global = (0..300)
+            .map(|index| (
+                format!("aaa-unrelated-model-{index:04}"),
+                format!("unrelated/provider-{index:04}"),
+            ))
+            .collect::<std::collections::BTreeSet<_>>();
+        let pin = ("target/model-canonical".to_string(), "parasail/fp8".to_string());
+        global.insert(pin.clone());
+        assert!(global.iter().position(|entry| entry == &pin).unwrap() > 256);
+        let scoped = scope_openrouter_zdr_endpoints(
+            &global,
+            &["target/model", "target/model-canonical"],
+        )
+        .unwrap();
+        assert_eq!(scoped, std::collections::BTreeSet::from([pin]));
+        assert!(scope_openrouter_zdr_endpoints(
+            &global,
+            &["aaa-unrelated-model-0000"],
+        )
+        .is_some_and(|rows| rows.len() == 1));
+        assert!(scope_openrouter_zdr_endpoints(
+            &global,
+            &["target/model"],
+        )
+        .is_some_and(|rows| rows.is_empty()));
+
+        let in_scope_oversized = (0..=OPENROUTER_MAX_ZDR_ENDPOINTS_PER_MODEL)
+            .map(|index| (
+                "target/model-canonical".to_string(),
+                format!("provider/endpoint-{index:04}"),
+            ))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(scope_openrouter_zdr_endpoints(
+            &in_scope_oversized,
+            &["target/model-canonical"],
+        )
+        .is_none());
+
+        let too_many_bytes = vec![b' '; OPENROUTER_MAX_RESPONSE_BYTES + 1];
+        assert!(parse_openrouter_zdr_response_bytes(&too_many_bytes).is_none());
+    }
 
     fn paid_pilot_observations() -> (
         OpenRouterMetadataObservation,

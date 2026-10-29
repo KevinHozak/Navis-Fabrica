@@ -3509,22 +3509,23 @@ fn hydrate_economy_routing_evidence(app: &AppHandle, request: &mut routing::Requ
     let economy_facts = evidence_result.unwrap_or_default();
     for candidate in &mut request.candidates {
         candidate.economy_evidence_ready = false;
-        let configured_openrouter_candidate = configured_settings.as_ref().is_ok_and(|settings| {
-            settings.providers.iter().any(|profile| {
+        candidate.requires_economy_evidence = false;
+        let configured_profile = configured_settings.as_ref().ok().and_then(|settings| {
+            settings.providers.iter().find(|profile| {
                 profile.id == candidate.provider_id
-                    && profile.kind == providers::ProviderKind::OpenRouter
                     && profile.models.iter().any(|model| model.id == candidate.model_id)
             })
         });
-        if !configured_openrouter_candidate {
+        if !configured_profile.is_some_and(|profile| profile.kind == providers::ProviderKind::OpenRouter) {
             continue;
         }
+        candidate.requires_economy_evidence = true;
         let Some(profile_facts) = economy_facts.iter().find(|fact| {
             fact.provider_id == candidate.provider_id && fact.model_id == candidate.model_id
         }) else {
             continue;
         };
-        if profile_facts.economy_admission.is_some() {
+        if profile_facts.economy_admission.is_some() || profile_facts.paid_economy_admission.is_some() {
             candidate.economy_evidence_ready = true;
             candidate.context_tokens = profile_facts.context_tokens;
             candidate.supports_tools = profile_facts.supports_tools;
@@ -3540,12 +3541,14 @@ fn add_economy_refresh_reasons(
     evidence_available: bool,
 ) {
     for row in &mut decision.candidates {
-        let is_economy_candidate = request.candidates.iter().any(|candidate| {
+        let candidate_requires_economy = request.candidates.iter().any(|candidate| {
             candidate.provider_id == row.provider_id
                 && candidate.model_id == row.model_id
-                && runner_core::economy::is_free_variant_id(&candidate.model_id)
+                && (candidate.requires_economy_evidence
+                    || runner_core::economy::is_free_variant_id(&candidate.model_id))
         });
-        if is_economy_candidate
+        if request.pace == routing::Pace::Economy
+            && candidate_requires_economy
             && !request.candidates.iter().any(|candidate| {
                 candidate.provider_id == row.provider_id
                     && candidate.model_id == row.model_id
@@ -3554,6 +3557,12 @@ fn add_economy_refresh_reasons(
         {
             row.reasons.push(if !evidence_available {
                 "No fresh configured provider evidence is available. Refresh provider evidence in the Batch Runner, then evaluate again.".into()
+            } else if request.candidates.iter().any(|candidate| {
+                candidate.provider_id == row.provider_id
+                    && candidate.model_id == row.model_id
+                    && candidate.requires_economy_evidence
+            }) {
+                "No backend-verified OpenRouter Economy evidence is available. Check Economy status and refresh provider evidence in the Batch Runner; paid runs also need their own explicit budget caps.".into()
             } else {
                 "No backend-verified Economy admission is available. Check Economy status; refresh provider evidence in the Batch Runner if the saved evidence is stale.".into()
             });

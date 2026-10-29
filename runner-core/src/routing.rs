@@ -53,6 +53,10 @@ pub struct Candidate {
     /// Never accepted from a request or settings file.
     #[serde(skip)]
     pub economy_evidence_ready: bool,
+    /// Backend classification for OpenRouter API-paid Economy candidates.
+    /// The UI/request cannot decide which provider kind uses this gate.
+    #[serde(skip)]
+    pub requires_economy_evidence: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +133,10 @@ pub struct CandidateFacts {
     /// Opaque core-minted proof; client JSON cannot supply or persist it.
     #[serde(skip)]
     pub economy_admission: Option<crate::economy::VerifiedEconomyAdmission>,
+    /// Opaque paid qualification proof. It is distinct from zero-cost
+    /// admission/settlement and cannot be supplied or persisted by clients.
+    #[serde(skip)]
+    pub paid_economy_admission: Option<crate::economy::VerifiedPaidEconomyAdmission>,
     /// Explicit-refresh, backend-validated endpoint quote. It is an
     /// observation, not caller authority, and cannot be supplied in JSON.
     #[serde(skip)]
@@ -154,6 +162,10 @@ pub struct PaidEndpointQuoteObservation {
     pub input_micros_per_million_tokens: u64,
     pub output_micros_per_million_tokens: u64,
     pub request_fee_micros: u64,
+    pub request_fee_observed: bool,
+    pub additional_pricing_micros_per_1m: std::collections::BTreeMap<String, Option<u64>>,
+    pub pricing_discount: Option<String>,
+    pub pricing_overrides_present: bool,
     pub context_tokens: u64,
     pub max_prompt_tokens: Option<u64>,
     pub max_completion_tokens: u64,
@@ -282,8 +294,17 @@ fn route_assignment(assignment: &AssignmentRequest, facts: &[CandidateFacts]) ->
             None => {},
             Some(fact) => {
                 if reason.is_some() {}
-                else if crate::economy::is_free_variant_id(&candidate.model_id) && fact.economy_admission.is_none() {
+                else if crate::economy::is_free_variant_id(&candidate.model_id)
+                    && fact.economy_admission.is_none()
+                {
                     reason = Some("Rejected: free model variants require backend verified Economy admission.".into());
+                }
+                else if assignment.request.pace == Pace::Economy
+                    && candidate.requires_economy_evidence
+                    && fact.economy_admission.is_none()
+                    && fact.paid_economy_admission.is_none()
+                {
+                    reason = Some("Rejected: this OpenRouter Economy choice requires current backend verified coding and endpoint evidence.".into());
                 }
                 else if !fact.evidence_ready { reason = Some(fact.evidence_reasons.first().cloned().unwrap_or_else(|| "Rejected: provider observations are incomplete or stale.".to_owned())); }
                 else if fact.billing == BillingPolicy::Unknown { reason = Some("Rejected: provider billing type is unknown.".into()); }
@@ -316,6 +337,10 @@ fn route_assignment(assignment: &AssignmentRequest, facts: &[CandidateFacts]) ->
         } else {
             let fact = fact.expect("eligible candidates have facts");
             let mut observed_candidate = candidate.clone();
+            if observed_candidate.requires_economy_evidence {
+                observed_candidate.economy_evidence_ready = fact.economy_admission.is_some()
+                    || fact.paid_economy_admission.is_some();
+            }
             observed_candidate.context_tokens = fact.context_tokens;
             observed_candidate.supports_tools = fact.supports_tools;
             observed_candidate.is_local = fact.local_only;
@@ -966,6 +991,13 @@ pub fn decide(request: Request) -> Decision {
             reasons.push("Rejected: free model variants require backend verified Economy admission and cannot use paid routing.".into());
         }
         if request.pace == Pace::Economy
+            && candidate.requires_economy_evidence
+            && !candidate.economy_evidence_ready
+        {
+            eligible = false;
+            reasons.push("Rejected: OpenRouter Economy choices require current backend-verified coding, privacy, and endpoint evidence.".into());
+        }
+        if request.pace == Pace::Economy
             && !candidate.is_local
             && is_openrouter_free_route(&candidate.model_id)
             && !candidate.economy_evidence_ready
@@ -1171,6 +1203,7 @@ mod tests {
             latency_ms: latency,
             latency_collected_at_ms: latency.map(|_| 10_000),
             economy_evidence_ready: false,
+            requires_economy_evidence: false,
         }
     }
 
@@ -1654,6 +1687,7 @@ mod tests {
             pricing_verified_at_ms: Some(10_100),
             economy_policy: None,
             economy_admission: None,
+            paid_economy_admission: None,
             paid_endpoint_quote: None,
             context_tokens: Some(32_768),
             supports_tools: Some(true),
@@ -1672,6 +1706,10 @@ mod tests {
             input_micros_per_million_tokens: 300_000,
             output_micros_per_million_tokens: 1_200_000,
             request_fee_micros: 0,
+            request_fee_observed: false,
+            additional_pricing_micros_per_1m: Default::default(),
+            pricing_discount: None,
+            pricing_overrides_present: false,
             context_tokens: 1_048_576,
             max_prompt_tokens: None,
             max_completion_tokens: 943_718,
@@ -1787,6 +1825,129 @@ mod tests {
             .reasons
             .join(" ")
             .contains("backend verified Economy admission"));
+    }
+
+    #[test]
+    fn economy_rejects_positive_price_remote_models_without_backend_shortlist_evidence() {
+        let mut route = request(vec![candidate(
+            "openrouter-main",
+            false,
+            Some(32_000),
+            Some(true),
+            Some(5),
+            Some(20),
+        )]);
+        route.pace = Pace::Economy;
+        route.candidates[0].model_id = "deepseek/deepseek-v4.1-flash".into();
+        route.candidates[0].requires_economy_evidence = true;
+        let result = route_job(JobRoutingRequest {
+            implementer: AssignmentRequest {
+                task_id: "implementation".into(),
+                request: route,
+                required_runtime_id: None,
+                max_input_tokens: Some(16_384),
+                max_output_tokens: Some(8_192),
+            },
+            reviewer: None,
+            candidate_facts: vec![facts(
+                "openrouter-main",
+                "deepseek/deepseek-v4.1-flash",
+                false,
+                3_000,
+            )],
+        });
+        assert_eq!(result.implementer.decision.selected_model_id, None);
+        let row = result
+            .implementer
+            .decision
+            .candidates
+            .iter()
+            .find(|row| row.model_id == "deepseek/deepseek-v4.1-flash")
+            .unwrap();
+        assert!(!row.eligible);
+        assert!(row.reasons.iter().any(|reason| {
+            reason.contains("OpenRouter Economy choice") && reason.contains("evidence")
+        }));
+    }
+
+    #[test]
+    fn paid_economy_evidence_gate_does_not_reject_other_paid_paces() {
+        for pace in [Pace::Fast, Pace::Balanced, Pace::Thorough] {
+            let mut route = request(vec![candidate(
+                "openrouter-main",
+                false,
+                Some(32_000),
+                Some(true),
+                Some(5),
+                Some(20),
+            )]);
+            route.pace = pace;
+            route.candidates[0].model_id = "deepseek/deepseek-v4.1-flash".into();
+            route.candidates[0].requires_economy_evidence = true;
+            let result = route_job(JobRoutingRequest {
+                implementer: AssignmentRequest {
+                    task_id: "implementation".into(),
+                    request: route,
+                    required_runtime_id: None,
+                    max_input_tokens: Some(16_384),
+                    max_output_tokens: Some(8_192),
+                },
+                reviewer: None,
+                candidate_facts: vec![facts(
+                    "openrouter-main",
+                    "deepseek/deepseek-v4.1-flash",
+                    false,
+                    3_000,
+                )],
+            });
+            assert_eq!(
+                result.implementer.decision.selected_model_id.as_deref(),
+                Some("deepseek/deepseek-v4.1-flash"),
+                "legacy paid provider routing must remain available for {pace:?}"
+            );
+        }
+
+        let mut economy = request(vec![candidate(
+            "openrouter-main",
+            false,
+            Some(32_000),
+            Some(true),
+            Some(5),
+            Some(20),
+        )]);
+        economy.pace = Pace::Economy;
+        economy.manual_provider_id = Some("openrouter-main".into());
+        economy.manual_model_id = Some("deepseek/deepseek-v4.1-flash".into());
+        economy.candidates[0].model_id = "deepseek/deepseek-v4.1-flash".into();
+        economy.candidates[0].requires_economy_evidence = true;
+        let result = route_job(JobRoutingRequest {
+            implementer: AssignmentRequest {
+                task_id: "implementation".into(),
+                request: economy,
+                required_runtime_id: None,
+                max_input_tokens: Some(16_384),
+                max_output_tokens: Some(8_192),
+            },
+            reviewer: None,
+            candidate_facts: vec![facts(
+                "openrouter-main",
+                "deepseek/deepseek-v4.1-flash",
+                false,
+                3_000,
+            )],
+        });
+        assert_eq!(result.implementer.decision.selected_model_id, None);
+        let row = result
+            .implementer
+            .decision
+            .candidates
+            .iter()
+            .find(|row| row.model_id == "deepseek/deepseek-v4.1-flash")
+            .unwrap();
+        assert!(!row.eligible);
+        assert!(row.reasons.iter().any(|reason| {
+            reason.contains("OpenRouter Economy choice") && reason.contains("evidence")
+        }));
     }
 
     #[test]

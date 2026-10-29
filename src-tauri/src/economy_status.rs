@@ -54,6 +54,8 @@ pub async fn get_economy_model_status(
     if profile.kind != providers::ProviderKind::OpenRouter {
         return Err("Choose an OpenRouter provider profile.".into());
     }
+    let runtime_identity_fingerprint = navis_fabrica_runner_core::providers::runtime_identity_fingerprint(&profile)
+        .unwrap_or_default();
     let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref())
         .ok_or_else(|| "Save a valid OpenRouter credential for this profile first.".to_string())?;
     let provider_id = profile.id;
@@ -86,12 +88,22 @@ pub async fn get_economy_model_status(
     let observed_at = now_ms();
     let passing_ids =
         economy::trusted_economy_candidate_ids("aider", &runtime_version, observed_at);
+    let paid_candidate_canonicals = economy::paid_economy_candidate_models(
+        "aider",
+        &runtime_version,
+        observed_at,
+    )
+    .into_iter()
+    .map(|(model_id, canonical_model_id, _)| (model_id, canonical_model_id))
+    .collect::<BTreeMap<_, _>>();
     let catalog_ids = observation
         .models
         .iter()
         .map(|model| model.id.as_str())
         .collect::<BTreeSet<_>>();
-    let proof_ids = passing_ids
+    let mut endpoint_model_ids = passing_ids.into_iter().collect::<BTreeSet<_>>();
+    endpoint_model_ids.extend(paid_candidate_canonicals.keys().cloned());
+    let proof_ids = endpoint_model_ids
         .into_iter()
         .filter(|model_id| catalog_ids.contains(model_id.as_str()))
         .take(16)
@@ -100,6 +112,7 @@ pub async fn get_economy_model_status(
         (BTreeMap::new(), BTreeSet::new())
     } else {
         let proof_key = endpoint_key;
+        let paid_candidate_canonicals_for_probe = paid_candidate_canonicals.clone();
         let remaining = status_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             (BTreeMap::new(), BTreeSet::new())
@@ -114,9 +127,25 @@ pub async fn get_economy_model_status(
                     if remaining.is_zero() {
                         break;
                     }
-                    if let Ok(rows) = providers::openrouter_endpoints_http_probe_with_timeout(
-                        &proof_key, &model_id, remaining,
-                    ) {
+                    let rows = if let Some(canonical_model_id) =
+                        paid_candidate_canonicals_for_probe.get(&model_id)
+                    {
+                        let allowed_model_ids = [
+                            model_id.as_str(),
+                            canonical_model_id.as_str(),
+                        ];
+                        providers::openrouter_endpoints_http_probe_with_aliases(
+                            &proof_key,
+                            &model_id,
+                            &allowed_model_ids,
+                            remaining,
+                        )
+                    } else {
+                        providers::openrouter_endpoints_http_probe_with_timeout(
+                            &proof_key, &model_id, remaining,
+                        )
+                    };
+                    if let Ok(rows) = rows {
                         endpoints.insert(model_id, rows);
                     }
                 }
@@ -127,13 +156,33 @@ pub async fn get_economy_model_status(
             .unwrap_or_else(|_| (BTreeMap::new(), BTreeSet::new()))
         }
     };
+    let paid_endpoint_metadata_by_model = paid_candidate_canonicals
+        .into_keys()
+        .filter_map(|model_id| {
+            let model = observation.models.iter().find(|model| model.id == model_id)?;
+            let endpoints = endpoints_by_model.get(&model_id)?.clone();
+            Some((
+                model_id,
+                navis_fabrica_runner_core::provider_observations::OpenRouterPaidEndpointMetadata {
+                    model: model.clone(),
+                    endpoints,
+                    zdr_endpoints: zdr_endpoints.clone(),
+                    runtime_version: runtime_version.clone(),
+                    runtime_identity_fingerprint: runtime_identity_fingerprint.clone(),
+                    observed_at_ms: observed_at as u128,
+                },
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
     Ok(EconomyStatusResponse {
         models: economy::statuses_from_catalog(
             &provider_id,
+            &runtime_identity_fingerprint,
             &observation.models,
             &endpoints_by_model,
             &zdr_endpoints,
             observed_at,
+            &paid_endpoint_metadata_by_model,
             "aider",
             &runtime_version,
             observed_at,

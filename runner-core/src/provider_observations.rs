@@ -220,6 +220,8 @@ pub struct OpenRouterPaidEndpointMetadata {
     pub model: providers::OpenRouterModel,
     pub endpoints: Vec<providers::OpenRouterEndpoint>,
     pub zdr_endpoints: std::collections::BTreeSet<(String, String)>,
+    #[serde(default)]
+    pub runtime_version: String,
     pub runtime_identity_fingerprint: String,
     pub observed_at_ms: u128,
 }
@@ -561,13 +563,19 @@ fn refresh_selected_openrouter(
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if !remaining.is_zero() {
                         if let Ok(zdr_endpoints) = providers::openrouter_zdr_endpoints_http_probe_with_timeout(&key, remaining) {
-                            observed_model.paid_endpoint_metadata = Some(OpenRouterPaidEndpointMetadata {
-                                model: model.clone(),
-                                endpoints,
-                                zdr_endpoints,
-                                runtime_identity_fingerprint: runtime_identity_fingerprint.clone(),
-                                observed_at_ms: u128::try_from(unix_time_ms()).unwrap_or(u128::MAX),
-                            });
+                            if let Some(runtime_version) = providers::find_executable(
+                                &profile.executable,
+                                std::env::var_os("PATH").as_deref(),
+                            ).and_then(|executable| providers::probe_aider_runtime_version(&executable)) {
+                                observed_model.paid_endpoint_metadata = Some(OpenRouterPaidEndpointMetadata {
+                                    model: model.clone(),
+                                    endpoints,
+                                    zdr_endpoints,
+                                    runtime_version,
+                                    runtime_identity_fingerprint: runtime_identity_fingerprint.clone(),
+                                    observed_at_ms: u128::try_from(unix_time_ms()).unwrap_or(u128::MAX),
+                                });
+                            }
                         }
                     }
                 }
@@ -866,6 +874,11 @@ fn refresh_openrouter_paid_endpoint_metadata(
     now_ms: u128,
 ) {
     let Ok(now) = u64::try_from(now_ms) else { return; };
+    let Some(executable) = providers::find_executable(
+        &profile.executable,
+        std::env::var_os("PATH").as_deref(),
+    ) else { return; };
+    let Some(runtime_version) = providers::probe_aider_runtime_version(&executable) else { return; };
     let reviewed = crate::economy::reviewed_paid_endpoint_candidates(now);
     for (model_id, canonical_model_id, _) in reviewed {
         if !profile.models.iter().any(|model| model.id == model_id) {
@@ -892,6 +905,7 @@ fn refresh_openrouter_paid_endpoint_metadata(
             model,
             endpoints,
             zdr_endpoints,
+            runtime_version: runtime_version.clone(),
             runtime_identity_fingerprint: runtime_identity_fingerprint.to_owned(),
             observed_at_ms: u128::try_from(unix_time_ms()).unwrap_or(u128::MAX),
         });
@@ -1503,6 +1517,50 @@ impl ProviderObservationSnapshot {
                     )
                     .ok()
                 });
+                let paid_economy_admission = model.paid_endpoint_metadata.as_ref().and_then(|metadata| {
+                    let observed_time = metadata.observed_at_ms;
+                    if profile.kind != ProviderKind::OpenRouter
+                        || !installed
+                        || observed.runtime_installed.value != Some(true)
+                        || !runtime_matches
+                        || !authenticated
+                        || observed.authenticated.value != Some(true)
+                        || !healthy
+                        || observed.healthy.value != Some(true)
+                        || !available
+                        || model.model_available.value != Some(true)
+                        || billing_value != BillingPolicy::Paid
+                        || !privacy
+                        || model.local_only.value != Some(false)
+                        || !context
+                        || !tools
+                        || observed_time > now_ms
+                        || now_ms.saturating_sub(observed_time) > max_age_ms
+                        || metadata.runtime_identity_fingerprint != observed.runtime_identity_fingerprint
+                        || input_price.is_none()
+                        || output_price.is_none()
+                        || pricing_source.as_deref() != Some("OpenRouter authenticated user model catalog")
+                        || pricing_verified_at_ms.is_none()
+                        || metadata.model.id != model.model_id
+                        || metadata.model.context_length != model.context_tokens.value
+                        || metadata.model.supported_parameters.as_ref().is_none_or(|parameters| {
+                            parameters.iter().any(|value| value == "tools")
+                                != (model.supports_tools.value == Some(true))
+                        })
+                    {
+                        return None;
+                    }
+                    crate::economy::admit_paid_economy_candidate(
+                        &observed.provider_id,
+                        &observed.runtime_identity_fingerprint,
+                        metadata,
+                        input_price,
+                        output_price,
+                        pricing_source.as_deref(),
+                        pricing_verified_at_ms.and_then(|value| u64::try_from(value).ok()),
+                        u64::try_from(now_ms).ok()?,
+                    ).ok()
+                });
                 let paid_endpoint_quote = model.paid_endpoint_metadata.as_ref().and_then(|metadata| {
                     let observed_time = metadata.observed_at_ms;
                     if profile.kind != ProviderKind::OpenRouter
@@ -1572,6 +1630,12 @@ impl ProviderObservationSnapshot {
                         input_micros_per_million_tokens: input_price,
                         output_micros_per_million_tokens: output_price,
                         request_fee_micros: 0,
+                        request_fee_observed: endpoint.request_price.is_some(),
+                        additional_pricing_micros_per_1m: endpoint.additional_pricing.iter()
+                            .map(|(key, value)| (key.clone(), value.as_deref().and_then(price_per_token_to_micros_per_million)))
+                            .collect(),
+                        pricing_discount: endpoint.pricing_discount.clone(),
+                        pricing_overrides_present: endpoint.pricing_overrides_present,
                         context_tokens: endpoint.context_length?,
                         max_prompt_tokens: endpoint.max_prompt_tokens,
                         max_completion_tokens: endpoint.max_completion_tokens?,
@@ -1597,6 +1661,7 @@ impl ProviderObservationSnapshot {
                     local_only: privacy && model.local_only.value == Some(true),
                     economy_policy: None,
                     economy_admission,
+                    paid_economy_admission,
                     paid_endpoint_quote,
                     context_tokens: if context {
                         model.context_tokens.value
@@ -2193,6 +2258,9 @@ mod tests {
             prompt_price: Some("0".into()),
             completion_price: Some("0".into()),
             request_price: Some("0".into()),
+            additional_pricing: Default::default(),
+            pricing_discount: None,
+            pricing_overrides_present: false,
             status: Some(0),
             zdr: None,
             supported_parameters: Some(vec!["max_tokens".into(), "tools".into()]),
@@ -2377,6 +2445,7 @@ mod tests {
                 latency_ms: None,
                 latency_collected_at_ms: None,
                 economy_evidence_ready: positive_fact.economy_admission.is_some(),
+                requires_economy_evidence: true,
             }],
             usage_signals: vec![],
             now_ms: 1_793_059_200_000,
@@ -2405,6 +2474,8 @@ mod tests {
             paid_quote: None,
             economy_endpoint_id: Some(admission.endpoint_id().into()),
             economy_evidence_digest: Some(admission.evidence_digest().into()),
+            paid_economy_endpoint_id: None,
+            paid_economy_evidence_digest: None,
         };
         let restored: crate::supervisor::RouteSemanticCommitment =
             serde_json::from_slice(&serde_json::to_vec(&commitment).unwrap()).unwrap();

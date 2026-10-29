@@ -19,6 +19,99 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+thread_local! {
+    static PAID_GATEWAY_TEST_FIXTURE: std::cell::RefCell<Option<PaidGatewayTestFixture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only transport substitution for exercising the normal paid runtime
+/// without contacting OpenRouter. The fixture still passes through the same
+/// authenticated model/endpoint/ZDR validator used by production preflight and
+/// the gateway's per-call revalidation.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct PaidGatewayTestFixture {
+    pub api_key: String,
+    pub catalog: providers::OpenRouterProbe,
+    pub metadata: providers::OpenRouterMetadataObservation,
+    pub endpoints: Vec<providers::OpenRouterEndpoint>,
+    pub zdr_endpoints: std::collections::BTreeSet<(String, String)>,
+    pub upstream: std::net::SocketAddr,
+    pub endpoint_validation_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub outcome_diagnostic: Arc<std::sync::Mutex<Option<PaidRuntimeOutcomeDiagnostic>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct PaidRuntimeOutcomeDiagnostic {
+    pub state: RuntimeState,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+}
+
+#[cfg(test)]
+pub(crate) struct PaidGatewayTestFixtureGuard(Option<PaidGatewayTestFixture>);
+
+#[cfg(test)]
+impl PaidGatewayTestFixtureGuard {
+    pub(crate) fn install(fixture: PaidGatewayTestFixture) -> Self {
+        assert!(fixture.upstream.ip().is_loopback());
+        let previous = PAID_GATEWAY_TEST_FIXTURE.with(|slot| slot.replace(Some(fixture)));
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PaidGatewayTestFixtureGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        PAID_GATEWAY_TEST_FIXTURE.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(test)]
+fn paid_gateway_test_fixture() -> Option<PaidGatewayTestFixture> {
+    PAID_GATEWAY_TEST_FIXTURE.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn paid_gateway_fixture_endpoint_is_verified(
+    fixture: &PaidGatewayTestFixture,
+    policy: &PaidModelPolicy,
+) -> bool {
+    fixture
+        .endpoint_validation_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let Some(pin) = policy.endpoint_pin.as_ref() else {
+        return false;
+    };
+    providers::openrouter_pinned_paid_endpoint_is_verified(
+        &fixture.metadata,
+        &fixture.endpoints,
+        &fixture.zdr_endpoints,
+        providers::PinnedPaidEndpointRequirements {
+            model_id: &policy.model_id,
+            canonical_model_id: &pin.canonical_model_id,
+            endpoint_id: &pin.endpoint_id,
+            input_price_ceiling_micros_per_1m: policy.pricing.input_price_micros_per_1m,
+            output_price_ceiling_micros_per_1m: policy.pricing.output_price_micros_per_1m,
+            input_tokens: crate::paid_gateway::call_input_token_ceiling(policy),
+            output_tokens: policy.max_output_tokens_per_call,
+            requires_tools: pin.requires_tools,
+            model_catalog_input_micros_per_1m: policy
+                .model_catalog_pricing
+                .as_ref()
+                .map(|quote| quote.input_price_micros_per_1m),
+            model_catalog_output_micros_per_1m: policy
+                .model_catalog_pricing
+                .as_ref()
+                .map(|quote| quote.output_price_micros_per_1m),
+        },
+    )
+}
+
 const MAX_PROMPT_BYTES: usize = 60_000;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
@@ -843,6 +936,8 @@ fn run_openrouter_paid(
     build_output: Option<&Path>,
 ) -> Result<RuntimeOutcome, RuntimeError> {
     let runtime_started = Instant::now();
+    #[cfg(test)]
+    let test_fixture = paid_gateway_test_fixture();
     let requested_timeout = Duration::from_secs(request.timeout_seconds);
     let remaining = || requested_timeout.saturating_sub(runtime_started.elapsed());
     let require_time = || {
@@ -1022,6 +1117,27 @@ fn run_openrouter_paid(
                 "A valid OpenRouter credential reference is required for the selected provider.",
             )
         })?;
+    #[cfg(test)]
+    let api_key = if let Some(fixture) = test_fixture.as_ref() {
+        providers::valid_openrouter_key(&fixture.api_key)
+            .then(|| fixture.api_key.clone())
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "AUTHENTICATION_REQUIRED",
+                    "The isolated paid runtime fixture has no valid dummy credential.",
+                )
+            })?
+    } else {
+        crate::credentials::resolve(secret_ref)
+            .filter(|key| providers::valid_openrouter_key(key))
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "AUTHENTICATION_REQUIRED",
+                    "The saved OpenRouter credential is unavailable or invalid.",
+                )
+            })?
+    };
+    #[cfg(not(test))]
     let api_key = crate::credentials::resolve(secret_ref)
         .filter(|key| providers::valid_openrouter_key(key))
         .ok_or_else(|| {
@@ -1034,6 +1150,12 @@ fn run_openrouter_paid(
     // This read-only catalog request refreshes the pinned quote only after an
     // explicit run starts. The paid gateway still uses the reviewed ceiling.
     let catalog_timeout = require_time()?;
+    #[cfg(test)]
+    let catalog = test_fixture.as_ref().map_or_else(
+        || providers::openrouter_http_probe_with_timeout(&api_key, catalog_timeout),
+        |fixture| fixture.catalog.clone(),
+    );
+    #[cfg(not(test))]
     let catalog = providers::openrouter_http_probe_with_timeout(&api_key, catalog_timeout);
     let _ = require_time()?;
     if catalog.state != "ready" {
@@ -1105,7 +1227,36 @@ fn run_openrouter_paid(
             ));
         }
         let endpoint_timeout = require_time()?;
-        if crate::providers::openrouter_pinned_paid_endpoint_probe_with_timeout(
+        #[cfg(test)]
+        let endpoint_is_verified = if let Some(fixture) = test_fixture.as_ref() {
+            paid_gateway_fixture_endpoint_is_verified(fixture, policy)
+        } else {
+            crate::providers::openrouter_pinned_paid_endpoint_probe_with_timeout(
+                &api_key,
+                crate::providers::PinnedPaidEndpointRequirements {
+                    model_id,
+                    canonical_model_id: &pin.canonical_model_id,
+                    endpoint_id: &pin.endpoint_id,
+                    input_price_ceiling_micros_per_1m: policy.pricing.input_price_micros_per_1m,
+                    output_price_ceiling_micros_per_1m: policy.pricing.output_price_micros_per_1m,
+                    input_tokens: crate::paid_gateway::call_input_token_ceiling(policy),
+                    output_tokens: policy.max_output_tokens_per_call,
+                    requires_tools: pin.requires_tools,
+                    model_catalog_input_micros_per_1m: policy
+                        .model_catalog_pricing
+                        .as_ref()
+                        .map(|quote| quote.input_price_micros_per_1m),
+                    model_catalog_output_micros_per_1m: policy
+                        .model_catalog_pricing
+                        .as_ref()
+                        .map(|quote| quote.output_price_micros_per_1m),
+                },
+                endpoint_timeout,
+            )
+            .is_ok()
+        };
+        #[cfg(not(test))]
+        let endpoint_is_verified = crate::providers::openrouter_pinned_paid_endpoint_probe_with_timeout(
             &api_key,
             crate::providers::PinnedPaidEndpointRequirements {
                 model_id,
@@ -1113,7 +1264,7 @@ fn run_openrouter_paid(
                 endpoint_id: &pin.endpoint_id,
                 input_price_ceiling_micros_per_1m: policy.pricing.input_price_micros_per_1m,
                 output_price_ceiling_micros_per_1m: policy.pricing.output_price_micros_per_1m,
-                input_tokens: policy.model_context_window_tokens,
+                input_tokens: crate::paid_gateway::call_input_token_ceiling(policy),
                 output_tokens: policy.max_output_tokens_per_call,
                 requires_tools: pin.requires_tools,
                 model_catalog_input_micros_per_1m: policy
@@ -1127,8 +1278,8 @@ fn run_openrouter_paid(
             },
             endpoint_timeout,
         )
-        .is_err()
-        {
+        .is_ok();
+        if !endpoint_is_verified {
             return Err(RuntimeError::new(
                 "PAID_ENDPOINT_CHANGED",
                 "The authenticated pinned endpoint, price, capability, context, status, or ZDR evidence changed before runtime start.",
@@ -1141,8 +1292,7 @@ fn run_openrouter_paid(
             "The durable parent budget reservation could not be read.",
         )
     })?;
-    let minimum_tokens = policy
-        .model_context_window_tokens
+    let minimum_tokens = crate::paid_gateway::call_input_token_ceiling(policy)
         .checked_add(policy.max_output_tokens_per_call)
         .ok_or_else(|| {
             RuntimeError::new("PAID_POLICY_INVALID", "The paid token ceiling overflowed.")
@@ -1181,8 +1331,7 @@ fn run_openrouter_paid(
         Path::new(&files.allowlist_path),
         &aider_arguments,
     )?;
-    let mut gateway = PaidGateway::bind(
-        PaidGatewayConfig {
+    let gateway_config = PaidGatewayConfig {
             upstream_api_key: api_key.clone(),
             parent_reservation_id: paid.parent_reservation_id.into(),
             policy: policy.clone(),
@@ -1193,9 +1342,31 @@ fn run_openrouter_paid(
             request_timeout: require_time()?.min(Duration::from_secs(300)),
             dispatch_deadline: runtime_started + requested_timeout,
             cancel: paid.cancel.clone(),
-        },
-        paid.budgets.clone(),
-    )
+        };
+    #[cfg(test)]
+    let mut gateway = if let Some(fixture) = test_fixture.as_ref() {
+        let endpoint_fixture = fixture.clone();
+        let endpoint_policy = policy.clone();
+        let endpoint_validator = Arc::new(move || {
+            paid_gateway_fixture_endpoint_is_verified(&endpoint_fixture, &endpoint_policy)
+        });
+        PaidGateway::bind_to_upstream_with_endpoint_validation_fixture(
+            gateway_config,
+            paid.budgets.clone(),
+            format!("http://{}/chat/completions", fixture.upstream),
+            endpoint_validator,
+        )
+    } else {
+        PaidGateway::bind(gateway_config, paid.budgets.clone())
+    }
+    .map_err(|_| {
+        RuntimeError::new(
+            "PAID_GATEWAY_START_FAILED",
+            "The capped local OpenRouter gateway could not be started.",
+        )
+    })?;
+    #[cfg(not(test))]
+    let mut gateway = PaidGateway::bind(gateway_config, paid.budgets.clone())
     .map_err(|_| {
         RuntimeError::new(
             "PAID_GATEWAY_START_FAILED",
@@ -1434,6 +1605,16 @@ fn run_openrouter_paid(
         },
         None => RuntimeUsage::default(),
     };
+    #[cfg(test)]
+    if let Some(fixture) = test_fixture.as_ref() {
+        if let Ok(mut diagnostic) = fixture.outcome_diagnostic.lock() {
+            *diagnostic = Some(PaidRuntimeOutcomeDiagnostic {
+                state: result.state,
+                exit_code: result.exit_code,
+                elapsed_ms: result.elapsed_ms,
+            });
+        }
+    }
     Ok(result)
 }
 
@@ -1614,7 +1795,7 @@ fn prepare_paid_aider_files(
     let model = format!("openai/{}", policy.model_id);
     let metadata = serde_json::json!({(model): {
         "max_tokens": policy.model_context_window_tokens,
-        "max_input_tokens": policy.model_context_window_tokens,
+        "max_input_tokens": crate::paid_gateway::call_input_token_ceiling(policy),
         "max_output_tokens": policy.max_output_tokens_per_call,
         "input_cost_per_token": policy.pricing.input_price_micros_per_1m as f64 / 1_000_000_000_000.0,
         "output_cost_per_token": policy.pricing.output_price_micros_per_1m as f64 / 1_000_000_000_000.0,
@@ -4432,6 +4613,7 @@ mod tests {
             model_id: "vendor/model".into(),
             runtime_id: "aider".into(),
             model_context_window_tokens: 4096,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: 512,
             max_calls: 1,
             max_cost_micros: 500,
@@ -4481,6 +4663,7 @@ mod tests {
             model_id: "vendor/model".into(),
             runtime_id: "aider".into(),
             model_context_window_tokens: 4096,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: 512,
             max_calls: 1,
             max_cost_micros: 500,
@@ -4524,6 +4707,7 @@ mod tests {
             model_id: "vendor/model".into(),
             runtime_id: "aider".into(),
             model_context_window_tokens: 4096,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: 512,
             max_calls: 1,
             max_cost_micros: 500,
@@ -4580,8 +4764,9 @@ mod tests {
             provider_id: "openrouter".into(),
             model_id: "vendor/model".into(),
             runtime_id: "aider".into(),
-            model_context_window_tokens: 4096,
-            max_output_tokens_per_call: 512,
+            model_context_window_tokens: 32_768,
+            max_input_tokens_per_call: Some(16_384),
+            max_output_tokens_per_call: 8_192,
             max_calls: 1,
             max_cost_micros: 500,
             pricing: crate::paid_gateway::PaidPricingCeiling {
@@ -4596,6 +4781,18 @@ mod tests {
         };
         let files = prepare_paid_aider_files("prompt", &policy, &["C:/worktree/src/lib.rs".into()])
             .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&files.metadata_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["openai/vendor/model"]["max_input_tokens"],
+            16_384
+        );
+        assert_eq!(
+            metadata["openai/vendor/model"]["max_output_tokens"],
+            8_192
+        );
         let env =
             isolated_aider_environment(&files, "http://127.0.0.1:4321/v1", "dummy-child-token");
         let values = env

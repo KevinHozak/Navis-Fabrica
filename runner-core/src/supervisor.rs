@@ -259,6 +259,12 @@ pub struct RouteSemanticCommitment {
     pub economy_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economy_evidence_digest: Option<String>,
+    /// Hash-bound paid Economy endpoint/evaluation pin. This remains separate
+    /// from zero-cost Economy admission and its settlement semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_economy_endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_economy_evidence_digest: Option<String>,
 }
 
 impl RouteSemanticCommitment {
@@ -282,6 +288,27 @@ impl RouteSemanticCommitment {
         }
         Ok(())
     }
+
+    pub(crate) fn validate_paid_economy_pin(
+        &self,
+        facts: &crate::routing::CandidateFacts,
+    ) -> Result<(), String> {
+        if let Some(endpoint_id) = self.paid_economy_endpoint_id.as_deref() {
+            let admission = facts.paid_economy_admission.as_ref().ok_or_else(|| {
+                "fresh paid Economy qualification could not be rehydrated before dispatch".to_owned()
+            })?;
+            if admission.endpoint_id() != endpoint_id
+                || self.paid_economy_evidence_digest.as_deref() != Some(admission.evidence_digest())
+                || admission.provider_profile_id() != self.provider_id
+                || admission.model_id() != self.model_id
+            {
+                return Err("paid Economy endpoint or evidence pin changed since preview".into());
+            }
+        } else if self.paid_economy_evidence_digest.is_some() {
+            return Err("paid Economy evidence digest has no committed endpoint pin".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -296,9 +323,17 @@ pub struct CommittedPaidQuote {
     pub max_calls: u32,
     pub max_cost_micros: u64,
     pub context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens_per_call: Option<u64>,
     pub max_output_tokens_per_call: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_pin: Option<crate::paid_gateway::PaidEndpointPin>,
+    #[serde(default)]
+    pub endpoint_additional_pricing_micros_per_1m: BTreeMap<String, Option<u64>>,
+    #[serde(default)]
+    pub endpoint_pricing_discount: Option<String>,
+    #[serde(default)]
+    pub endpoint_pricing_overrides_present: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -6001,7 +6036,8 @@ fn paid_policy_key(issue_id: &str, task_id: &str) -> String {
 
 fn paid_call_token_ceiling(policy: &crate::paid_gateway::PaidModelPolicy) -> Option<u64> {
     policy
-        .model_context_window_tokens
+        .max_input_tokens_per_call
+        .unwrap_or(policy.model_context_window_tokens)
         .checked_add(policy.max_output_tokens_per_call)
         .and_then(|per_call| per_call.checked_mul(u64::from(policy.max_calls)))
 }
@@ -6079,6 +6115,18 @@ fn validate_paid_model_policy(
         || policy.runtime_id != "aider"
         || model.context_window_tokens != Some(policy.model_context_window_tokens)
         || policy.model_context_window_tokens == 0
+        || policy.max_input_tokens_per_call.is_some_and(|cap| {
+            cap == 0
+                || cap > policy.model_context_window_tokens
+                || cap
+                    .checked_add(policy.max_output_tokens_per_call)
+                    .is_none_or(|total| total > policy.model_context_window_tokens)
+                || task
+                    .route_requirements
+                    .as_ref()
+                    .and_then(|requirements| requirements.max_input_tokens)
+                    .is_some_and(|required| required > cap)
+        })
         || policy.max_output_tokens_per_call == 0
         || policy.max_output_tokens_per_call > policy.model_context_window_tokens
         || policy.max_calls == 0
@@ -6125,7 +6173,11 @@ fn validate_paid_model_policy(
             task.task_id
         )));
     }
-    let input_cost = u128::from(policy.model_context_window_tokens)
+    let input_cost = u128::from(
+        policy
+            .max_input_tokens_per_call
+            .unwrap_or(policy.model_context_window_tokens),
+    )
         .checked_mul(u128::from(pricing.input_price_micros_per_1m))
         .and_then(|value| value.checked_add(999_999))
         .map(|value| value / 1_000_000)
@@ -6719,8 +6771,16 @@ fn derive_route_commitments(
                     max_calls: policy.max_calls,
                     max_cost_micros: policy.max_cost_micros,
                     context_tokens: policy.model_context_window_tokens,
+                    max_input_tokens_per_call: policy.max_input_tokens_per_call,
                     max_output_tokens_per_call: policy.max_output_tokens_per_call,
                     endpoint_pin: policy.endpoint_pin.clone(),
+                    endpoint_additional_pricing_micros_per_1m: fact.paid_endpoint_quote.as_ref()
+                        .map(|quote| quote.additional_pricing_micros_per_1m.clone())
+                        .unwrap_or_default(),
+                    endpoint_pricing_discount: fact.paid_endpoint_quote.as_ref()
+                        .and_then(|quote| quote.pricing_discount.clone()),
+                    endpoint_pricing_overrides_present: fact.paid_endpoint_quote.as_ref()
+                        .is_some_and(|quote| quote.pricing_overrides_present),
                 });
             commitments.insert(
                 key,
@@ -6741,6 +6801,10 @@ fn derive_route_commitments(
                     economy_evidence_digest: fact
                         .economy_admission
                         .as_ref()
+                        .map(|admission| admission.evidence_digest().to_owned()),
+                    paid_economy_endpoint_id: fact.paid_economy_admission.as_ref()
+                        .map(|admission| admission.endpoint_id().to_owned()),
+                    paid_economy_evidence_digest: fact.paid_economy_admission.as_ref()
                         .map(|admission| admission.evidence_digest().to_owned()),
                 },
             );
@@ -6783,6 +6847,7 @@ fn check_fresh_route_commitment(
         return Err("provider refresh returned a different route".into());
     }
     commitment.validate_economy_pin(&fresh.facts)?;
+    commitment.validate_paid_economy_pin(&fresh.facts)?;
     if fresh.facts.local_only != commitment.local_only || fresh.facts.billing != commitment.billing
     {
         return Err("provider privacy or billing classification changed since preview".into());
@@ -6808,6 +6873,17 @@ fn check_fresh_route_commitment(
         .and_then(|policy| policy.endpoint_pin.as_ref());
     if check_paid_endpoint_pin_commitment(committed_endpoint_pin, current_endpoint_pin).is_err() {
         return Err("paid endpoint pin changed since preview".into());
+    }
+    if let Some(committed) = commitment.paid_quote.as_ref() {
+        let current = request.paid_policies.get(&key).ok_or_else(|| "paid policy disappeared since preview".to_owned())?;
+        if committed.max_input_tokens_per_call != current.max_input_tokens_per_call
+            || committed.max_output_tokens_per_call != current.max_output_tokens_per_call
+            || committed.max_calls != current.max_calls
+            || committed.max_cost_micros != current.max_cost_micros
+            || committed.context_tokens != current.model_context_window_tokens
+        {
+            return Err("paid call, token, context, or cost limits changed since preview".into());
+        }
     }
     check_fresh_paid_quote(commitment, &fresh.facts)?;
     if !commitment.authorized_candidates.iter().any(|candidate| {
@@ -6878,6 +6954,9 @@ fn check_fresh_paid_quote(
                     || endpoint.input_micros_per_million_tokens != quote.input_price_micros_per_1m
                     || endpoint.output_micros_per_million_tokens != quote.output_price_micros_per_1m
                     || endpoint.request_fee_micros != quote.request_fee_micros
+                    || endpoint.additional_pricing_micros_per_1m != quote.endpoint_additional_pricing_micros_per_1m
+                    || endpoint.pricing_discount != quote.endpoint_pricing_discount
+                    || endpoint.pricing_overrides_present != quote.endpoint_pricing_overrides_present
                     || endpoint.source != quote.source
             })
             });
@@ -6918,12 +6997,15 @@ fn paid_candidate_quote_matches(
         let Some(total_required) = required_input.checked_add(required_output) else {
             return false;
         };
+        let input_policy_matches = policy.max_input_tokens_per_call
+            .is_none_or(|maximum| required_input <= maximum);
         let catalog_matches = if let Some(catalog) = policy.model_catalog_pricing.as_ref() {
             facts.input_micros_per_million_tokens == Some(catalog.input_price_micros_per_1m)
                 && facts.output_micros_per_million_tokens == Some(catalog.output_price_micros_per_1m)
                 && facts.pricing_source.as_deref() == Some(catalog.source.as_str())
         } else { false };
         catalog_matches
+            && input_policy_matches
             && endpoint.endpoint_id == pin.endpoint_id
             && endpoint.canonical_model_id == pin.canonical_model_id
             && endpoint.input_micros_per_million_tokens == policy.pricing.input_price_micros_per_1m
@@ -7106,7 +7188,11 @@ fn route_task(
             economy_evidence_ready: facts.iter().any(|fact| {
                 fact.provider_id == candidate.provider_id
                     && fact.model_id == candidate.model_id
-                    && fact.economy_admission.is_some()
+                    && (fact.economy_admission.is_some()
+                        || fact.paid_economy_admission.is_some())
+            }),
+            requires_economy_evidence: profile.is_some_and(|profile| {
+                profile.kind == ProviderKind::OpenRouter
             }),
         });
 
@@ -7164,6 +7250,28 @@ fn route_task(
                                     )
                                     .is_ok()
                         });
+                let paid_economy_ok = requirements.pace.unwrap_or(crate::routing::Pace::Balanced)
+                    == crate::routing::Pace::Economy
+                    && paid_policy.is_some_and(|policy| {
+                        let Some(admission) = observed.paid_economy_admission.as_ref() else { return false; };
+                        let Some((_, runtime_identity_fingerprint)) = observed.runtime_id.split_once(':') else { return false; };
+                        admission.provider_profile_id() == profile.id
+                            && admission.model_id() == candidate.model_id
+                            && admission.validates_policy(
+                                &profile.id,
+                                policy,
+                                runtime_identity_fingerprint,
+                                now.max(0) as u64,
+                            )
+                            && policy.max_calls <= 3
+                            && task.limits.max_seconds.is_some_and(|seconds| seconds <= 120)
+                            && requirements.max_input_tokens.is_none_or(|value| {
+                                value <= admission.max_input_tokens_per_call()
+                            })
+                            && requirements.max_output_tokens.is_none_or(|value| {
+                                value <= admission.max_output_tokens_per_call()
+                            })
+                    });
                 let policy_ok = economy_ok
                     || paid_policy.is_some_and(|policy| {
                         validate_paid_model_policy(
@@ -7187,6 +7295,9 @@ fn route_task(
                                 .max_output_tokens
                                 .is_none_or(|tokens| tokens <= policy.max_output_tokens_per_call)
                             && paid_candidate_quote_matches(&observed, policy, &requirements)
+                            && (requirements.pace.unwrap_or(crate::routing::Pace::Balanced)
+                                != crate::routing::Pace::Economy
+                                || paid_economy_ok)
                     });
                 endpoint_quote_authorized = policy_ok
                     && paid_policy.is_some_and(|policy| {
@@ -8112,6 +8223,7 @@ mod supervisor_tests {
             model_id: "paid-model".into(),
             runtime_id: "aider".into(),
             model_context_window_tokens: 16_384,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: 512,
             max_calls: 2,
             max_cost_micros: 5_000,
@@ -8168,6 +8280,7 @@ mod supervisor_tests {
             pricing_verified_at_ms: Some(now as u128),
             economy_policy: None,
             economy_admission: None,
+            paid_economy_admission: None,
             paid_endpoint_quote: None,
             context_tokens: Some(16_384),
             supports_tools: Some(true),
@@ -8180,11 +8293,15 @@ mod supervisor_tests {
             request_fee_micros: reviewed.pricing.request_fee_micros,
             source: reviewed.pricing.source.clone(),
             context_tokens: reviewed.model_context_window_tokens,
+            max_input_tokens_per_call: reviewed.max_input_tokens_per_call,
             max_output_tokens_per_call: reviewed.max_output_tokens_per_call,
             max_cost_micros: reviewed.max_cost_micros,
             max_calls: reviewed.max_calls,
             endpoint_pin: None,
             model_catalog_pricing: None,
+            endpoint_additional_pricing_micros_per_1m: Default::default(),
+            endpoint_pricing_discount: None,
+            endpoint_pricing_overrides_present: false,
         };
         let commitment = RouteSemanticCommitment {
             provider_id: reviewed.provider_id.clone(),
@@ -8201,6 +8318,8 @@ mod supervisor_tests {
             paid_quote: Some(quote),
             economy_endpoint_id: None,
             economy_evidence_digest: None,
+            paid_economy_endpoint_id: None,
+            paid_economy_evidence_digest: None,
         };
         assert!(check_fresh_paid_quote(&commitment, &changed_facts)
             .unwrap_err()
@@ -8223,8 +8342,12 @@ mod supervisor_tests {
             max_calls: 3,
             max_cost_micros: 33_333,
             context_tokens: 16_384,
+            max_input_tokens_per_call: Some(16_384),
             max_output_tokens_per_call: 8_192,
             endpoint_pin: Some(pin.clone()),
+            endpoint_additional_pricing_micros_per_1m: Default::default(),
+            endpoint_pricing_discount: None,
+            endpoint_pricing_overrides_present: false,
         };
         let encoded = serde_json::to_value(&quote).unwrap();
         assert_eq!(encoded["endpointPin"]["endpointId"], "parasail/bf16");
@@ -8237,6 +8360,133 @@ mod supervisor_tests {
         };
         assert!(check_paid_endpoint_pin_commitment(Some(&pin), Some(&changed)).is_err());
         assert!(check_paid_endpoint_pin_commitment(Some(&pin), None).is_err());
+    }
+
+    #[test]
+    fn paid_economy_commitment_roundtrip_requires_matching_fresh_opaque_proof() {
+        let now = now_ms().max(0) as u64;
+        let runtime_identity_fingerprint = "a".repeat(32);
+        let model_id = "deepseek/deepseek-v4.1-flash";
+        let canonical_model_id = "deepseek/deepseek-v4.1-flash-20260910";
+        let endpoint_id = "parasail/fp8";
+        let model = crate::providers::OpenRouterModel {
+            id: model_id.into(),
+            canonical_slug: Some(canonical_model_id.into()),
+            name: "DeepSeek V4.1 Flash fixture".into(),
+            context_length: Some(1_048_576),
+            prompt_price: Some("0.00000000273".into()),
+            completion_price: Some("0.000000278".into()),
+            input_modalities: Some(vec!["text".into()]),
+            output_modalities: Some(vec!["text".into()]),
+            supported_parameters: Some(vec![
+                "max_tokens".into(),
+                "tools".into(),
+                "tool_choice".into(),
+            ]),
+        };
+        let endpoint = crate::providers::OpenRouterEndpoint {
+            model_id: canonical_model_id.into(),
+            tag: endpoint_id.into(),
+            context_length: Some(1_048_576),
+            max_prompt_tokens: Some(1_000_000),
+            max_completion_tokens: Some(943_718),
+            prompt_price: Some("0.0000003".into()),
+            completion_price: Some("0.0000012".into()),
+            request_price: None,
+            additional_pricing: Default::default(),
+            pricing_discount: None,
+            pricing_overrides_present: false,
+            status: Some(0),
+            zdr: None,
+            supported_parameters: Some(vec![
+                "max_tokens".into(),
+                "tools".into(),
+                "tool_choice".into(),
+            ]),
+        };
+        let metadata = crate::provider_observations::OpenRouterPaidEndpointMetadata {
+            model: model.clone(),
+            endpoints: vec![endpoint],
+            zdr_endpoints: std::collections::BTreeSet::from([(
+                canonical_model_id.into(),
+                endpoint_id.into(),
+            )]),
+            runtime_version: "0.86.2".into(),
+            runtime_identity_fingerprint: runtime_identity_fingerprint.clone(),
+            observed_at_ms: u128::from(now),
+        };
+        let admission = crate::economy::admit_paid_economy_candidate(
+            "openrouter-deepseek-fixture",
+            &runtime_identity_fingerprint,
+            &metadata,
+            Some(2_730),
+            Some(278_000),
+            Some("OpenRouter authenticated user model catalog"),
+            Some(now),
+            now,
+        )
+        .expect("embedded passing results and reviewed endpoint should mint a proof");
+        let facts = crate::routing::CandidateFacts {
+            provider_id: "openrouter-deepseek-fixture".into(),
+            model_id: model_id.into(),
+            runtime_id: format!("aider:{runtime_identity_fingerprint}"),
+            runtime_installed: true,
+            authenticated: true,
+            healthy: true,
+            health_checked_at_ms: Some(u128::from(now)),
+            model_available: true,
+            local_only: false,
+            billing: crate::routing::BillingPolicy::Paid,
+            input_micros_per_million_tokens: Some(2_730),
+            output_micros_per_million_tokens: Some(278_000),
+            pricing_source: Some("OpenRouter authenticated user model catalog".into()),
+            pricing_verified_at_ms: Some(u128::from(now)),
+            economy_policy: None,
+            economy_admission: None,
+            paid_economy_admission: Some(admission.clone()),
+            paid_endpoint_quote: None,
+            context_tokens: Some(1_048_576),
+            supports_tools: Some(true),
+            evidence_ready: true,
+            evidence_reasons: Vec::new(),
+        };
+        let commitment = RouteSemanticCommitment {
+            provider_id: facts.provider_id.clone(),
+            model_id: facts.model_id.clone(),
+            runtime_identity_fingerprint,
+            local_only: false,
+            billing: crate::routing::BillingPolicy::Paid,
+            requires_tools: true,
+            minimum_context_tokens: Some(24_576),
+            authorized_candidates: vec![crate::routing::CandidateRoute {
+                provider_id: facts.provider_id.clone(),
+                model_id: facts.model_id.clone(),
+            }],
+            paid_quote: None,
+            economy_endpoint_id: None,
+            economy_evidence_digest: None,
+            paid_economy_endpoint_id: Some(endpoint_id.into()),
+            paid_economy_evidence_digest: Some(admission.evidence_digest().into()),
+        };
+        let persisted = serde_json::to_vec(&commitment).unwrap();
+        let restored: RouteSemanticCommitment = serde_json::from_slice(&persisted).unwrap();
+        assert!(restored.validate_paid_economy_pin(&facts).is_ok());
+
+        let mut changed_digest = restored.clone();
+        changed_digest.paid_economy_evidence_digest = Some("0".repeat(64));
+        assert!(changed_digest.validate_paid_economy_pin(&facts).is_err());
+
+        let mut changed_endpoint = restored.clone();
+        changed_endpoint.paid_economy_endpoint_id = Some("parasail/other".into());
+        assert!(changed_endpoint.validate_paid_economy_pin(&facts).is_err());
+
+        let missing_fresh_proof = crate::routing::CandidateFacts {
+            paid_economy_admission: None,
+            ..facts
+        };
+        assert!(restored
+            .validate_paid_economy_pin(&missing_fresh_proof)
+            .is_err());
     }
 
     #[test]
@@ -8253,6 +8503,7 @@ mod supervisor_tests {
             model_id: "deepseek/deepseek-v4.1-flash".into(),
             runtime_id: "aider".into(),
             model_context_window_tokens: 262_144,
+            max_input_tokens_per_call: Some(16_384),
             max_output_tokens_per_call: 8_192,
             max_calls: 2,
             max_cost_micros: 98_352,
@@ -8288,12 +8539,17 @@ mod supervisor_tests {
             pricing_verified_at_ms: Some(now as u128),
             economy_policy: None,
             economy_admission: None,
+            paid_economy_admission: None,
             paid_endpoint_quote: Some(crate::routing::PaidEndpointQuoteObservation {
                 canonical_model_id: pin.canonical_model_id.clone(),
                 endpoint_id: pin.endpoint_id.clone(),
                 input_micros_per_million_tokens: 300_000,
                 output_micros_per_million_tokens: 1_200_000,
                 request_fee_micros: 0,
+                request_fee_observed: false,
+                additional_pricing_micros_per_1m: Default::default(),
+                pricing_discount: None,
+                pricing_overrides_present: false,
                 context_tokens: 1_048_576,
                 max_prompt_tokens: None,
                 max_completion_tokens: 943_718,
@@ -8438,6 +8694,9 @@ mod supervisor_tests {
             prompt_price: Some("0".into()),
             completion_price: Some("0".into()),
             request_price: Some("0".into()),
+            additional_pricing: Default::default(),
+            pricing_discount: None,
+            pricing_overrides_present: false,
             status: Some(0),
             zdr: None,
             supported_parameters: Some(vec!["max_tokens".into(), "tools".into()]),
@@ -8842,6 +9101,739 @@ mod supervisor_tests {
         let snapshot =
             crate::provider_observations::seal_snapshot(&settings, observed_at, providers).unwrap();
         crate::provider_observations::persist_snapshot(data_root, &snapshot).unwrap();
+    }
+
+    fn serve_paid_economy_fake_upstream(
+        listener: std::net::TcpListener,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let started = Instant::now();
+            let mut last_request = None;
+            let mut requests = Vec::new();
+            while !stop.load(Ordering::Acquire)
+                && started.elapsed() < Duration::from_secs(150)
+                && requests.len() < 3
+            {
+                if !requests.is_empty()
+                    && last_request.is_some_and(|last: Instant| {
+                        last.elapsed() >= Duration::from_secs(3)
+                    })
+                {
+                    break;
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("fake paid gateway listener failed: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        panic!("Aider closed its fake upstream request before headers completed");
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if line
+                        .split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    {
+                        content_length = line
+                            .split_once(':')
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok());
+                    }
+                }
+                let length = content_length.expect("Aider request has a bounded Content-Length");
+                assert!(length > 0 && length <= 512 * 1024);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                requests.push(request);
+                last_request = Some(Instant::now());
+
+                let response = serde_json::json!({
+                    "id": "fixture-completion",
+                    "object": "chat.completion",
+                    "created": 1793222000u64,
+                    "model": "deepseek/deepseek-v4.1-flash-20260910",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "web/theme.css\n```css\n<<<<<<< SEARCH\n/* theme baseline */\n=======\n/* theme baseline ► */\n>>>>>>> REPLACE\n```"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1200,
+                        "completion_tokens": 80,
+                        "total_tokens": 1280,
+                        "cost": 0.0005
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        })
+    }
+
+    struct FakePaidUpstreamStopGuard(Arc<AtomicBool>);
+
+    impl Drop for FakePaidUpstreamStopGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FABRICA_AIDER_SMOKE_EXE; runs the real Aider runtime only against a localhost fake OpenRouter endpoint"]
+    fn paid_economy_supervisor_end_to_end_uses_reviewed_pin_and_settles_paid_call() {
+        use crate::providers::{
+            ModelProfile, OpenRouterEndpoint, OpenRouterMetadataObservation, OpenRouterModel,
+            OpenRouterProbe, ProviderKind, ProviderProfile,
+        };
+        use crate::provider_observations::{
+            Observation, OpenRouterPaidEndpointMetadata, ProviderModelObservation,
+            ProviderObservation,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let aider = std::env::var_os("FABRICA_AIDER_SMOKE_EXE")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .expect("FABRICA_AIDER_SMOKE_EXE must name the installed Aider executable");
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("synthetic paid economy project");
+        fs::create_dir_all(repo.join("issues")).unwrap();
+        fs::create_dir_all(repo.join("web")).unwrap();
+        git_fixture(&repo, &["init"]);
+        git_fixture(&repo, &["config", "user.name", "Fabrica Fixture"]);
+        git_fixture(&repo, &["config", "user.email", "fixture@example.invalid"]);
+        fs::write(repo.join("web/theme.css"), "/* theme baseline */\n").unwrap();
+        let issue = "---\nschema_version: 1\nid: \"FAB-S998\"\ntitle: \"Synthetic paid Economy validation\"\ntype: \"task\"\nstatus: \"open\"\nparent: []\ndepends_on: []\n---\n\n## Acceptance criteria\n- [ ] The CSS contains the single theme marker '►' in the baseline comment.\n";
+        let issue_path = repo.join("issues/FAB-S998.md");
+        fs::write(&issue_path, issue).unwrap();
+        let parsed_issue = crate::issues::parse_issue_markdown(issue)
+            .expect("synthetic issue fixture frontmatter must parse");
+        assert_eq!(parsed_issue.id(), "FAB-S998");
+        let validated_issues = crate::issues::IssueStore::open_read_only(repo.join("issues"))
+            .expect("open synthetic issue fixture read-only")
+            .list()
+            .expect("synthetic issue fixture must pass schema and graph validation");
+        assert_eq!(validated_issues.len(), 1);
+        assert_eq!(validated_issues[0].record.id(), "FAB-S998");
+        assert_eq!(validated_issues[0].record.title(), "Synthetic paid Economy validation");
+        assert_eq!(validated_issues[0].record.status(), "open");
+        git_fixture(&repo, &["add", "web/theme.css", "issues/FAB-S998.md"]);
+        git_fixture(&repo, &["commit", "-m", "fixture baseline"]);
+        let base_commit = git_fixture(&repo, &["rev-parse", "HEAD"]);
+
+        let worker_marker = temp.path().join("worker-placeholder.exe");
+        fs::write(&worker_marker, b"preview worker identity").unwrap();
+        let reviewer_runtime = temp.path().join("codex-review-placeholder.exe");
+        fs::write(&reviewer_runtime, b"contract-only reviewer is not launched").unwrap();
+        let provider_id = "openrouter-deepseek-e2e";
+        let model_id = "deepseek/deepseek-v4.1-flash";
+        let canonical_model_id = "deepseek/deepseek-v4.1-flash-20260910";
+        let endpoint_id = "parasail/fp8";
+        let api_key = "isolated-test-only-openrouter-key";
+        let mut settings = Settings::default();
+        settings.project_root = repo.to_string_lossy().into_owned();
+        settings.provider_selection.provider_id = Some(provider_id.into());
+        settings.provider_selection.model_id = Some(model_id.into());
+        settings.providers = vec![
+            ProviderProfile {
+                id: provider_id.into(),
+                kind: ProviderKind::OpenRouter,
+                name: "OpenRouter DeepSeek fixture".into(),
+                executable: aider.to_string_lossy().into_owned(),
+                endpoint: None,
+                secret_ref: Some(crate::providers::openrouter_credential_target(provider_id).map(|v| format!("credential-store:{v}")).unwrap()),
+                models: vec![ModelProfile {
+                    id: model_id.into(),
+                    name: "DeepSeek V4.1 Flash".into(),
+                    reasoning_efforts: Vec::new(),
+                    context_window_tokens: Some(1_048_576),
+                    supports_tools: Some(true),
+                    quality_rating: None,
+                }],
+            },
+            ProviderProfile {
+                id: "codex-fixture".into(),
+                kind: ProviderKind::Codex,
+                name: "Contract-only reviewer".into(),
+                executable: reviewer_runtime.to_string_lossy().into_owned(),
+                endpoint: None,
+                secret_ref: None,
+                models: vec![ModelProfile {
+                    id: "codex-fixture-model".into(),
+                    name: "Contract-only model".into(),
+                    reasoning_efforts: Vec::new(),
+                    context_window_tokens: Some(32_768),
+                    supports_tools: Some(true),
+                    quality_rating: None,
+                }],
+            },
+        ];
+        let settings_path = temp.path().join("settings.json");
+        fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let profile = &settings.providers[0];
+        let runtime_fingerprint = crate::providers::runtime_identity_fingerprint(profile).unwrap();
+        let now = now_ms().max(0) as u64;
+        let model = OpenRouterModel {
+            id: model_id.into(),
+            canonical_slug: Some(canonical_model_id.into()),
+            name: "DeepSeek V4.1 Flash".into(),
+            context_length: Some(1_048_576),
+            prompt_price: Some("0.00000000273".into()),
+            completion_price: Some("0.000000278".into()),
+            input_modalities: Some(vec!["text".into()]),
+            output_modalities: Some(vec!["text".into()]),
+            supported_parameters: Some(vec![
+                "max_tokens".into(),
+                "tools".into(),
+                "tool_choice".into(),
+            ]),
+        };
+        let endpoint = OpenRouterEndpoint {
+            model_id: canonical_model_id.into(),
+            tag: endpoint_id.into(),
+            context_length: Some(1_048_576),
+            max_prompt_tokens: Some(1_000_000),
+            max_completion_tokens: Some(943_718),
+            prompt_price: Some("0.0000003".into()),
+            completion_price: Some("0.0000012".into()),
+            request_price: None,
+            additional_pricing: Default::default(),
+            pricing_discount: None,
+            pricing_overrides_present: false,
+            status: Some(0),
+            zdr: None,
+            supported_parameters: Some(vec![
+                "max_tokens".into(),
+                "tools".into(),
+                "tool_choice".into(),
+            ]),
+        };
+        let endpoint_metadata = OpenRouterPaidEndpointMetadata {
+            model: model.clone(),
+            endpoints: vec![endpoint.clone()],
+            zdr_endpoints: std::collections::BTreeSet::from([(
+                canonical_model_id.to_owned(),
+                endpoint_id.to_owned(),
+            )]),
+            runtime_version: "0.86.2".into(),
+            runtime_identity_fingerprint: runtime_fingerprint.clone(),
+            observed_at_ms: u128::from(now),
+        };
+        crate::economy::admit_paid_economy_candidate(
+            provider_id,
+            &runtime_fingerprint,
+            &endpoint_metadata,
+            Some(2_730),
+            Some(278_000),
+            Some("OpenRouter authenticated user model catalog"),
+            Some(now),
+            now,
+        )
+        .expect("synthetic observations should pass the real paid admission validator");
+        let codex_profile = &settings.providers[1];
+        let codex_fingerprint = crate::providers::runtime_identity_fingerprint(codex_profile).unwrap();
+        let observed_at = u128::from(now);
+        let observations = vec![
+            ProviderObservation {
+                provider_id: provider_id.into(),
+                kind: ProviderKind::OpenRouter,
+                runtime_identity_fingerprint: runtime_fingerprint.clone(),
+                runtime_installed: Observation::known(true, "fixture-executable-inspection", observed_at),
+                authenticated: Observation::known(true, "fixture-authenticated-model-metadata", observed_at),
+                healthy: Observation::known(true, "fixture-authenticated-model-metadata", observed_at),
+                health_checked_at_ms: Some(observed_at),
+                models: vec![ProviderModelObservation {
+                    model_id: model_id.into(),
+                    model_available: Observation::known(true, "fixture-authenticated-model-metadata", observed_at),
+                    context_tokens: Observation::known(1_048_576, "fixture-authenticated-model-metadata", observed_at),
+                    supports_tools: Observation::known(true, "fixture-authenticated-model-metadata", observed_at),
+                    local_only: Observation::known(false, "fixture-provider-classification", observed_at),
+                    billing: Observation::known(crate::routing::BillingPolicy::Paid, "fixture-authenticated-model-metadata", observed_at),
+                    input_micros_per_million_tokens: Observation::known(2_730, "OpenRouter authenticated user model catalog", observed_at),
+                    output_micros_per_million_tokens: Observation::known(278_000, "OpenRouter authenticated user model catalog", observed_at),
+                    pricing_source: Observation::known("OpenRouter authenticated user model catalog".into(), "fixture-authenticated-model-metadata", observed_at),
+                    pricing_verified_at_ms: Some(observed_at),
+                    economy_metadata: None,
+                    paid_endpoint_metadata: Some(endpoint_metadata.clone()),
+                }],
+            },
+            ProviderObservation {
+                provider_id: "codex-fixture".into(),
+                kind: ProviderKind::Codex,
+                runtime_identity_fingerprint: codex_fingerprint,
+                runtime_installed: Observation::known(true, "fixture-executable-inspection", observed_at),
+                authenticated: Observation::known(true, "fixture-reviewer-account", observed_at),
+                healthy: Observation::known(true, "fixture-reviewer-model-list", observed_at),
+                health_checked_at_ms: Some(observed_at),
+                models: vec![ProviderModelObservation {
+                    model_id: "codex-fixture-model".into(),
+                    model_available: Observation::known(true, "fixture-reviewer-model-list", observed_at),
+                    context_tokens: Observation::known(32_768, "fixture-reviewer-model-list", observed_at),
+                    supports_tools: Observation::known(true, "fixture-reviewer-model-list", observed_at),
+                    local_only: Observation::known(false, "codex-subscription-classification", observed_at),
+                    billing: Observation::known(crate::routing::BillingPolicy::Subscription, "fixture-reviewer-account", observed_at),
+                    input_micros_per_million_tokens: Observation::unknown("Codex subscription has no per-token quote."),
+                    output_micros_per_million_tokens: Observation::unknown("Codex subscription has no per-token quote."),
+                    pricing_source: Observation::unknown("Codex subscription has no per-token quote."),
+                    pricing_verified_at_ms: None,
+                    economy_metadata: None,
+                    paid_endpoint_metadata: None,
+                }],
+            },
+        ];
+        let worker_data = temp.path().join("supervisor-state");
+        fs::create_dir_all(&worker_data).unwrap();
+        let snapshot = crate::provider_observations::seal_snapshot(&settings, observed_at, observations).unwrap();
+        crate::provider_observations::persist_snapshot(&worker_data, &snapshot).unwrap();
+        let persisted_snapshot: crate::provider_observations::ProviderObservationSnapshot =
+            serde_json::from_slice(
+                &fs::read(worker_data.join("provider-observations.json")).unwrap(),
+            )
+            .unwrap();
+        let persisted_endpoint_metadata = persisted_snapshot.providers[0].models[0]
+            .paid_endpoint_metadata
+            .as_ref()
+            .expect("authenticated paid endpoint metadata must survive snapshot persistence");
+        assert_eq!(persisted_endpoint_metadata.runtime_version, "0.86.2");
+        crate::economy::admit_paid_economy_candidate(
+            provider_id,
+            &runtime_fingerprint,
+            persisted_endpoint_metadata,
+            Some(2_730),
+            Some(278_000),
+            Some("OpenRouter authenticated user model catalog"),
+            Some(now),
+            now,
+        )
+        .expect("persisted snapshot metadata should still pass the same validator");
+
+        let criterion = "The CSS contains the single theme marker '►' in the baseline comment.".to_owned();
+        let task_limits = ResourceLimits {
+            max_attempts: 1,
+            max_tokens: Some(73_728),
+            max_cost_micros: Some(44_241),
+            max_seconds: Some(120),
+            max_concurrency: 1,
+        };
+        let implementation = PlannedTask {
+            task_id: "implementation".into(),
+            parent_task_id: None,
+            kind: TaskKind::Implementation,
+            files: vec!["web/theme.css".into()],
+            acceptance: vec![criterion.clone()],
+            limits: task_limits.clone(),
+            provider_id: Some(provider_id.into()),
+            model_id: Some(model_id.into()),
+            route_requirements: Some(crate::routing::TaskRoutingRequirements {
+                pace: Some(crate::routing::Pace::Economy),
+                require_tools: Some(true),
+                max_input_tokens: Some(16_384),
+                max_output_tokens: Some(8_192),
+                allowed_candidates: vec![crate::routing::CandidateRoute {
+                    provider_id: provider_id.into(),
+                    model_id: model_id.into(),
+                }],
+                ..Default::default()
+            }),
+        };
+        let reviewer_limits = ResourceLimits {
+            max_attempts: 1,
+            max_tokens: Some(1_000),
+            max_cost_micros: Some(0),
+            max_seconds: Some(20),
+            max_concurrency: 1,
+        };
+        let reviewer_task = PlannedTask {
+            task_id: "review".into(),
+            parent_task_id: Some("implementation".into()),
+            kind: TaskKind::Reviewer,
+            files: vec!["web/theme.css".into()],
+            acceptance: vec![criterion.clone()],
+            limits: reviewer_limits.clone(),
+            provider_id: Some("codex-fixture".into()),
+            model_id: Some("codex-fixture-model".into()),
+            route_requirements: None,
+        };
+        let issue_path = issue_path.canonicalize().unwrap();
+        let mut request = BatchRequest {
+            batch_id: "paid-economy-supervisor-e2e".into(),
+            project_path: repo.canonicalize().unwrap(),
+            managed_worktree_root: temp.path().join("worktrees"),
+            build_root: temp.path().join("builds"),
+            settings_path: settings_path.clone(),
+            settings_fingerprint: None,
+            verified_base_commit: base_commit,
+            jobs: vec![SubmitJob {
+                idempotency_key: "paid-economy-supervisor-e2e-FAB-S998".into(),
+                issue_id: "FAB-S998".into(),
+                issue_type: "task".into(),
+                parent_issue_ids: Vec::new(),
+                source_fingerprint: crate::issues::revision(issue),
+                issue_snapshot: issue.into(),
+                dependencies: Vec::new(),
+                plan: JobPlan {
+                    tasks: vec![implementation, reviewer_task],
+                    limits: ResourceLimits {
+                        max_attempts: 1,
+                        max_tokens: Some(74_728),
+                        max_cost_micros: Some(44_241),
+                        max_seconds: Some(140),
+                        max_concurrency: 1,
+                    },
+                },
+            }],
+            verification: vec![VerificationPolicy {
+                issue_id: "FAB-S998".into(),
+                checks: vec![CheckSpec {
+                    id: "theme-marker-contract".into(),
+                    program: crate::providers::find_executable(
+                        "powershell.exe",
+                        std::env::var_os("PATH").as_deref(),
+                    )
+                    .expect("Windows PowerShell is installed for the host check"),
+                    args: vec![
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-Command".into(),
+                        "$ErrorActionPreference='Stop'; $text=[IO.File]::ReadAllText((Join-Path (Get-Location) 'web/theme.css')); $count=([regex]::Matches($text,[regex]::Escape('►'))).Count; @{schema_version=1;observations=@(@{specimen_id='single-marker';input=@{file='web/theme.css'};assertion='deep_equal';expected=@{count=1};actual=@{count=$count};executed=$true})} | ConvertTo-Json -Compress -Depth 8".into(),
+                    ],
+                    cwd: PathBuf::from("."),
+                    timeout_ms: 10_000,
+                    output_limit_bytes: 4096,
+                    adapter: None,
+                    contract: Some(crate::contracts::ContractSpec {
+                        criteria: vec![criterion.clone()],
+                        specimens: vec![crate::contracts::ContractSpecimen {
+                            id: "single-marker".into(),
+                            input: json!({"file":"web/theme.css"}),
+                            expected: json!({"count":1}),
+                        }],
+                    }),
+                }],
+                reviewer: ReviewerIdentity {
+                    task_id: "review".into(),
+                    provider_id: "codex-fixture".into(),
+                    model_id: "codex-fixture-model".into(),
+                    reasoning_effort: None,
+                },
+                acceptance_criteria: vec![criterion],
+            }],
+            issue_sources: BTreeMap::from([("FAB-S998".into(), issue_path)]),
+            paid_policies: BTreeMap::new(),
+            resolved_routes: BTreeMap::new(),
+            provider_observation_fingerprint: None,
+            dispatch_refresh_consent: crate::provider_observations::ModelFreeRefreshConsent::Disabled,
+            route_commitments: BTreeMap::new(),
+            policy: BatchPolicy {
+                window_seconds: 240,
+                max_concurrency: 1,
+                max_auth_retries: 0,
+                max_network_retries: 0,
+                budget: BudgetPolicy {
+                max_tokens: 74_728,
+                    max_cost_micros: 44_241,
+                    max_seconds: 140,
+                    max_concurrency: 1,
+                },
+                permitted_effects: vec![
+                    PermittedEffect::ProviderExecution,
+                    PermittedEffect::WorkspaceWrites,
+                    PermittedEffect::LocalChecks,
+                ],
+            },
+        };
+        // The explicit policy is bound to the same authenticated endpoint and
+        // catalog observation instants used to mint its opaque admission.
+        let policy_observed_at = now;
+        request.paid_policies.insert(
+            paid_policy_key("FAB-S998", "implementation"),
+            crate::paid_gateway::PaidModelPolicy {
+                mode: crate::paid_gateway::GatewayMode::Paid,
+                provider_id: provider_id.into(),
+                model_id: model_id.into(),
+                runtime_id: "aider".into(),
+                model_context_window_tokens: 1_048_576,
+                max_input_tokens_per_call: Some(16_384),
+                max_output_tokens_per_call: 8_192,
+                max_calls: 3,
+                max_cost_micros: 44_241,
+                pricing: crate::paid_gateway::PaidPricingCeiling {
+                    input_price_micros_per_1m: 300_000,
+                    output_price_micros_per_1m: 1_200_000,
+                    request_fee_micros: 0,
+                    source: "OpenRouter authenticated model endpoint".into(),
+                    observed_at_ms: policy_observed_at,
+                },
+                model_catalog_pricing: Some(crate::paid_gateway::PaidModelCatalogPricing {
+                    input_price_micros_per_1m: 2_730,
+                    output_price_micros_per_1m: 278_000,
+                    source: "OpenRouter authenticated user model catalog".into(),
+                    observed_at_ms: policy_observed_at,
+                }),
+                endpoint_pin: Some(crate::paid_gateway::PaidEndpointPin {
+                    endpoint_id: endpoint_id.into(),
+                    canonical_model_id: canonical_model_id.into(),
+                    requires_tools: true,
+                }),
+            },
+        );
+        let loaded_settings = settings::load_settings(&settings_path).unwrap();
+        let (observed_facts, _, observation_problem) = load_provider_observations(
+            &loaded_settings,
+            &worker_data,
+            now_ms().max(0) as u128,
+        )
+        .unwrap();
+        let observed_fact = observed_facts
+            .iter()
+            .find(|fact| fact.provider_id == provider_id && fact.model_id == model_id)
+            .expect("the authenticated fixture observation should rehydrate");
+        let paid_admission = observed_fact
+            .paid_economy_admission
+            .as_ref()
+            .unwrap_or_else(|| panic!("paid admission did not rehydrate: {observation_problem:?}; {observed_fact:#?}"));
+        assert!(paid_admission.validates_policy(
+            provider_id,
+            &request.paid_policies[&paid_policy_key("FAB-S998", "implementation")],
+            &runtime_fingerprint,
+            now_ms().max(0) as u64,
+        ), "rehydrated proof does not match the paid policy");
+
+        let upstream_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_stop = Arc::new(AtomicBool::new(false));
+        let _stop_upstream_on_drop = FakePaidUpstreamStopGuard(Arc::clone(&upstream_stop));
+        let requests = serve_paid_economy_fake_upstream(
+            upstream_listener,
+            Arc::clone(&upstream_stop),
+        );
+        let runtime_fixture = runtime::PaidGatewayTestFixture {
+            api_key: api_key.into(),
+            catalog: OpenRouterProbe {
+                state: "ready".into(),
+                models: vec![model.clone()],
+                note: "isolated test fixture".into(),
+            },
+            metadata: OpenRouterMetadataObservation {
+                authenticated_for_execution: Some(true),
+                models: vec![model],
+                free_model_daily_requests: None,
+            },
+            endpoints: vec![endpoint],
+            zdr_endpoints: endpoint_metadata.zdr_endpoints.clone(),
+            upstream: upstream_address,
+            endpoint_validation_count: Arc::new(AtomicUsize::new(0)),
+            outcome_diagnostic: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let endpoint_validation_count = Arc::clone(&runtime_fixture.endpoint_validation_count);
+        let runtime_outcome_diagnostic = Arc::clone(&runtime_fixture.outcome_diagnostic);
+        let _runtime_fixture_guard = runtime::PaidGatewayTestFixtureGuard::install(runtime_fixture);
+
+        let supervisor = Supervisor::open(&worker_data).unwrap();
+        let preview = preview_batch_request(&supervisor.paths().root, &request, &worker_marker).unwrap();
+        let route_key = paid_policy_key("FAB-S998", "implementation");
+        assert_eq!(
+            preview.request.resolved_routes.get(&route_key).map(|route| route.provider_id.as_str()),
+            Some(provider_id),
+            "normal preview did not select the reviewed OpenRouter route: {:#?}",
+            preview.plan.issues
+        );
+        assert_eq!(
+            preview.request.resolved_routes.get(&route_key).map(|route| route.model_id.as_str()),
+            Some(model_id),
+            "normal preview did not select the reviewed model: {:#?}",
+            preview.plan.issues
+        );
+        assert_eq!(
+            preview.request.route_commitments[&route_key]
+                .paid_quote
+                .as_ref()
+                .and_then(|quote| quote.endpoint_pin.as_ref())
+                .map(|pin| pin.endpoint_id.as_str()),
+            Some(endpoint_id),
+            "ordinary preview must commit the exact reviewed endpoint pin"
+        );
+        let admitted = supervisor.start(&preview.request, now_ms()).unwrap();
+        drop(supervisor);
+        let supervisor = Supervisor::open(&worker_data).unwrap();
+        let worker_id = "paid-economy-inprocess-worker";
+        let batches = BatchStore::open(&supervisor.paths().batches).unwrap();
+        let durable_request_json: String = batches
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT request_json FROM batches WHERE batch_id=?1",
+                [&request.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let durable_request: BatchRequest = serde_json::from_str(&durable_request_json).unwrap();
+        let durable_commitment = &durable_request.route_commitments[&route_key];
+        assert_eq!(durable_commitment.paid_economy_endpoint_id.as_deref(), Some(endpoint_id));
+        assert!(durable_commitment
+            .paid_economy_evidence_digest
+            .as_deref()
+            .is_some_and(|digest| digest.len() == 64));
+        assert!(matches!(
+            &durable_request.paid_policies[&route_key].mode,
+            crate::paid_gateway::GatewayMode::Paid
+        ));
+        assert!(batches
+            .reserve_worker(&request.batch_id, worker_id, 0, now_ms())
+            .unwrap());
+        let identity = crate::process::current_process_identity().unwrap();
+        batches
+            .worker_started(
+                worker_id,
+                identity.pid,
+                identity.creation_time_100ns,
+                now_ms(),
+            )
+            .unwrap();
+        let worker_result = supervisor.run_worker(&request.batch_id, worker_id, identity);
+        upstream_stop.store(true, Ordering::Release);
+        let observed_requests = requests.join().expect("fake upstream task did not panic");
+        let exit = worker_result.unwrap();
+        if exit != WorkerExit::Completed {
+            let retained_root = temp.keep();
+            let jobs = JobsStore::open(supervisor.paths().jobs.clone()).unwrap();
+            let job = jobs.get(admitted.job_ids[0]).unwrap();
+            let checkpoint_summary = jobs
+                .events(job.id, 0, 1000)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == "checkpoint_saved")
+                .filter_map(|event| event.payload.get("name").and_then(Value::as_str).map(str::to_owned))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+            .filter_map(|key| {
+                    let value = jobs.get_checkpoint(job.id, &key).ok().flatten()?;
+                    let mut summary = serde_json::Map::new();
+                    for field in ["state", "statusKey", "code", "errorCode", "phase", "exitCode"] {
+                        if let Some(value) = value.get(field).filter(|value| value.is_string() || value.is_number() || value.is_boolean()) {
+                            summary.insert(field.to_owned(), value.clone());
+                        }
+                    }
+                    for field in ["tail", "output", "stderr", "stdout", "details", "summary"] {
+                        if let Some(text) = value.get(field).and_then(Value::as_str) {
+                            summary.insert(format!("{field}Bytes"), json!(text.len()));
+                        }
+                    }
+                    Some(json!({"key": key, "summary": summary}))
+                })
+                .collect::<Vec<_>>();
+            let batch = supervisor.status(&request.batch_id).unwrap();
+            panic!(
+                "synthetic paid Economy worker did not complete: exit={exit:?}; jobState={:?}; batchState={:?}; fakeRequests={}; checkpoints={}; retainedFixture={}; runtimeOutcome={}",
+                job.state,
+                batch.state,
+                observed_requests.len(),
+                serde_json::to_string(&checkpoint_summary).unwrap_or_else(|_| "[]".into()),
+                retained_root.display(),
+                runtime_outcome_diagnostic
+                    .lock()
+                    .ok()
+                    .and_then(|value| value.clone())
+                    .map(|value| format!("state={:?},exitCode={:?},elapsedMs={}", value.state, value.exit_code, value.elapsed_ms))
+                    .unwrap_or_else(|| "unavailable".into())
+            );
+        }
+        assert_eq!(exit, WorkerExit::Completed);
+        assert!(!observed_requests.is_empty() && observed_requests.len() <= 3);
+        assert!(endpoint_validation_count.load(Ordering::SeqCst) >= 2,
+            "runtime preflight and gateway call must each validate fresh endpoint metadata");
+        for sent in &observed_requests {
+            assert_eq!(sent["model"], model_id);
+            assert_eq!(sent["provider"]["only"][0], endpoint_id);
+            assert_eq!(sent["provider"]["allow_fallbacks"], false);
+            assert_eq!(sent["provider"]["require_parameters"], true);
+            assert_eq!(sent["provider"]["max_price"]["prompt"], 0.3);
+            assert_eq!(sent["provider"]["max_price"]["completion"], 1.2);
+            assert_eq!(sent["provider"]["max_price"]["request"], 0);
+            assert_eq!(sent["provider"]["max_price"]["image"], 0);
+            assert_eq!(sent["data_collection"], "deny");
+            assert_eq!(sent["zdr"], true);
+            assert_eq!(sent["max_tokens"], 8192);
+            assert_eq!(sent["stream"], false);
+        }
+        let reservation_id = reservation_id(
+            &request.batch_id,
+            admitted.job_ids[0],
+            "implementation",
+            1,
+        );
+        let budgets = BudgetStore::open(supervisor.paths().budgets.clone()).unwrap();
+        let reservation = budgets.get(&reservation_id).unwrap();
+        assert_eq!(reservation.state, crate::budgets::ReservationState::Settled);
+        assert_eq!(reservation.runtime_id, "aider");
+        assert!(reservation
+            .settlement_source
+            .as_deref()
+            .is_some_and(|source| source.contains("paid")));
+        let calls = budgets.paid_calls_for_parent(&reservation_id).unwrap();
+        assert!(!calls.is_empty() && calls.len() <= 3);
+        assert!(calls.iter().all(|call| {
+            call.state == crate::budgets::PaidCallState::Settled
+                && call.actual_cost_micros.unwrap_or(0) > 0
+                && call.actual_tokens.unwrap_or(0) > 0
+        }));
+        assert!(budgets
+            .free_calls_for_parent(&reservation_id)
+            .unwrap()
+            .is_empty());
+        let workspace = RepoIsolation::new(
+            &request.project_path,
+            &preview.request.managed_worktree_root,
+            &supervisor.paths().root,
+        )
+        .unwrap()
+            .recover_workspace("FAB-S998")
+        .unwrap();
+        let changed_css = fs::read_to_string(workspace.worktree_path.join("web/theme.css")).unwrap();
+        assert_eq!(changed_css.matches('►').count(), 1);
+        assert_eq!(
+            git_fixture(&workspace.worktree_path, &["status", "--short"]),
+            "M web/theme.css"
+        );
+        let final_job = JobsStore::open(supervisor.paths().jobs.clone())
+            .unwrap()
+            .get(admitted.job_ids[0])
+            .unwrap();
+        assert_eq!(final_job.state, JobState::Verified);
+        let check = JobsStore::open(supervisor.paths().jobs.clone())
+            .unwrap()
+            .get_checkpoint(final_job.id, "verification_check_0")
+            .unwrap()
+            .expect("the normal host check must persist a receipt");
+        assert_eq!(check["receipt"]["passed"], true);
+        assert_eq!(check["receipt"]["contract"]["status"], "passed");
     }
 
     #[test]

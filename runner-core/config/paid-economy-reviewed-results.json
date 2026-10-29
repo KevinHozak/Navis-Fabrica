@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "paidEconomyCodingEvaluation",
+  "evaluatedAtMs": 1793221091870,
+  "caseHashSerialization": "SHA-256 of UTF-8 compact JSON for each case object with lexically ordered keys; exclude caseEvidenceSha256; nested objects and filename maps are lexically ordered",
+  "model": {
+    "modelId": "deepseek/deepseek-v4.1-flash",
+    "canonicalModelId": "deepseek/deepseek-v4.1-flash-20260910",
+    "endpointTag": "parasail/fp8",
+    "providerSlug": "parasail",
+    "catalogInputPriceMicrosPer1m": 2730,
+    "catalogOutputPriceMicrosPer1m": 278000,
+    "catalogObservedAtMs": 1793220767988,
+    "endpointInputPriceMicrosPer1m": 300000,
+    "endpointOutputPriceMicrosPer1m": 1200000,
+    "endpointObservedAtMs": 1793220772534,
+    "requestFeeObservation": "unknown",
+    "requestFeeCeilingMicros": 0
+  },
+  "runtime": {
+    "id": "aider",
+    "version": "0.86.2",
+    "runnerCoreVersion": "0.26.0",
+    "appVersion": "1.0.26",
+    "guardSourceSha256": "4dfe74d210244b370a7ea3b486ab4212691e3c4ee31f96b454184457fc7c9252"
+  },
+  "fixtureSet": {
+    "id": "fab-s001-synthetic-v1",
+    "sha256": "241b035435bf127ee7d5d2cdc164b04bfff23c5322c92d89e89d5b6e5bac119c"
+  },
+  "privacy": {
+    "policyRegistrySha256": "589907505d3d2b4eae2a45dd20b0f6e3bafaa27707e2d7aca15e9863bb91b90a",
+    "observedAtMs": 1793215114055
+  },
+  "batchReceiptSha256": "21b5feeb73907c79c63bd716665a3ef2d38a8902c0d46778deca6f3d99207fd7",
+  "cases": [
+    {
+      "actualCostMicros": 973,
+      "apiLatencyMs": null,
+      "callSequence": 1,
+      "hostCheck": {
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true,
+        "checkFilesSha256": {
+          "test_name_utils.py": "fb1895d6e382f37d2c0664d4f5801bad94c8d3f95036c86280cde6c108e7d00f"
+        },
+        "passedCheckCount": 2,
+        "status": "passed"
+      },
+      "independentReview": {
+        "correctnessPassed": true,
+        "reviewedInventoryMatchesSource": true,
+        "status": "passed"
+      },
+      "inventoryMatchesReview": true,
+      "requestCount": 1,
+      "runnerSeconds": 31,
+      "sourceInventory": {
+        "name_utils.py": "368f5bea587a8c5334d071e453946e087cd09f89171928fc8c5df1e1f08d4197"
+      },
+      "sourceInventorySha256": "b4291ea0aa11cc4f67b88366f45ed4e0e8d244d53f3005fad9242dda0a17d6c0",
+      "status": "passed",
+      "taskType": "small_bugfix",
+      "tokens": 2558,
+      "caseEvidenceSha256": "b5d469e5b0e4fadac57b7e0fcdd6848d280d453565f76035aef0f28435c634ac"
+    },
+    {
+      "actualCostMicros": 1733,
+      "apiLatencyMs": null,
+      "callSequence": 2,
+      "hostCheck": {
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true,
+        "checkFilesSha256": {
+          "test_limits.py": "4322c8bf92ba7e1fbdb4666f5e210fedb6c2b78b416113be8211be804bd42a57"
+        },
+        "passedCheckCount": 2,
+        "status": "passed"
+      },
+      "independentReview": {
+        "correctnessPassed": true,
+        "reviewedInventoryMatchesSource": true,
+        "status": "passed"
+      },
+      "inventoryMatchesReview": true,
+      "requestCount": 1,
+      "runnerSeconds": 34,
+      "sourceInventory": {
+        "limits.py": "d5204c50fcc368a64800a6f6f1012468fcb30f4e2c5de8e0ba09421f9161db7a"
+      },
+      "sourceInventorySha256": "a758f6a81acd47cfcd8606188b9179cf3d1f863619b02b0e93f734bdd13034e7",
+      "status": "passed",
+      "taskType": "implementation",
+      "tokens": 3544,
+      "caseEvidenceSha256": "22979fead919ba2d0088aeeb125c6cd6bb9dc6d14126dd1311360a3517e9c5d8"
+    },
+    {
+      "actualCostMicros": 2945,
+      "apiLatencyMs": null,
+      "callSequence": 3,
+      "hostCheck": {
+        "candidateInventoryMatchesSource": true,
+        "checkFilesMatchRecordedHashes": true,
+        "checkFilesSha256": {
+          "test_catalog.py": "3dbba32bc785931c832e3ebc57229d72760454fe1cc334ca506f3933d558f308"
+        },
+        "passedCheckCount": 2,
+        "status": "passed"
+      },
+      "independentReview": {
+        "correctnessPassed": true,
+        "reviewedInventoryMatchesSource": true,
+        "status": "passed"
+      },
+      "inventoryMatchesReview": true,
+      "requestCount": 1,
+      "runnerSeconds": 43,
+      "sourceInventory": {
+        "catalog.py": "26c123f19603ba8d9d43f9d698a569b4fb5b30b12f2eb3cbffea04b4927bcc56",
+        "text_utils.py": "2fbac6e363f4196cb9a0ecacf49bfa13fb6dae468d7f78417ab4da066c5f7823"
+      },
+      "sourceInventorySha256": "6abb559dcd9e32d8d304e45cde9c873e3827390739c12a239b288a4352b884d6",
+      "status": "passed",
+      "taskType": "multifile_edit",
+      "tokens": 4654,
+      "caseEvidenceSha256": "33dee5af1c271902e94c9b41e89868aa2159f717da8bdf81fbecef472395afd5"
+    }
+  ],
+  "batchCompletedAtMs": 1793221016188,
+  "maxInputTokensPerCall": 16384,
+  "maxOutputTokensPerCall": 8192
+}

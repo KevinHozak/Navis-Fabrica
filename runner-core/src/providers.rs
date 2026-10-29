@@ -253,6 +253,14 @@ pub struct OpenRouterEndpoint {
     pub prompt_price: Option<String>,
     pub completion_price: Option<String>,
     pub request_price: Option<String>,
+    /// Additional authenticated price components are retained so a text-only
+    /// route cannot silently ignore a newly applicable fee. Null stays unknown.
+    #[serde(default)]
+    pub additional_pricing: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub pricing_discount: Option<String>,
+    #[serde(default)]
+    pub pricing_overrides_present: bool,
     pub status: Option<i64>,
     pub zdr: Option<bool>,
     pub supported_parameters: Option<Vec<String>>,
@@ -308,6 +316,36 @@ fn parse_openrouter_endpoints_for_models(
                 None => return Vec::new(),
             },
         };
+        let mut additional_pricing = std::collections::BTreeMap::new();
+        let mut pricing_discount = None;
+        let mut pricing_overrides_present = false;
+        if let Some(pricing_object) = pricing.and_then(Value::as_object) {
+            for (key, value) in pricing_object {
+                if matches!(key.as_str(), "prompt" | "completion" | "request") {
+                    continue;
+                }
+                if key == "discount" {
+                    pricing_discount = match value {
+                        Value::Null => None,
+                        Value::Number(number) => Some(number.to_string()),
+                        _ => return Vec::new(),
+                    };
+                    continue;
+                }
+                if key == "overrides" {
+                    let Some(overrides) = value.as_array() else { return Vec::new(); };
+                    if overrides.len() > 32 { return Vec::new(); }
+                    pricing_overrides_present = !overrides.is_empty();
+                    continue;
+                }
+                let price = match value {
+                    Value::Null => None,
+                    Value::String(value) => Some(value.clone()),
+                    _ => return Vec::new(),
+                };
+                additional_pricing.insert(key.clone(), price);
+            }
+        }
         parsed.push(OpenRouterEndpoint {
             model_id: endpoint_model.to_owned(),
             tag: tag.to_owned(),
@@ -325,6 +363,9 @@ fn parse_openrouter_endpoints_for_models(
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             request_price,
+            additional_pricing,
+            pricing_discount,
+            pricing_overrides_present,
             status: endpoint.get("status").and_then(Value::as_i64),
             zdr: endpoint.get("zdr").and_then(Value::as_bool),
             supported_parameters: endpoint
@@ -476,6 +517,12 @@ pub fn openrouter_pinned_paid_endpoint_is_verified(
             .request_price
             .as_deref()
             .is_none_or(|price| openrouter_price_micros_per_million(price) == Some(0))
+        && endpoint_pricing_components_fit(
+            endpoint,
+            requirements.input_price_ceiling_micros_per_1m,
+            requirements.output_price_ceiling_micros_per_1m,
+            requirements.model_id == "deepseek/deepseek-v4.1-flash",
+        )
         && supports_parameters(
             endpoint.supported_parameters.as_deref(),
             requirements.requires_tools,
@@ -487,6 +534,41 @@ pub fn openrouter_pinned_paid_endpoint_is_verified(
             requirements.canonical_model_id.to_owned(),
             requirements.endpoint_id.to_owned(),
         )))
+}
+
+fn endpoint_pricing_components_fit(
+    endpoint: &OpenRouterEndpoint,
+    input_ceiling: u64,
+    output_ceiling: u64,
+    reviewed_deepseek_cache_semantics: bool,
+) -> bool {
+    if endpoint.pricing_overrides_present {
+        return false;
+    }
+    if endpoint.pricing_discount.as_deref().is_some_and(|value| {
+        value.parse::<f64>().map_or(true, |discount| !discount.is_finite() || !(0.0..=1.0).contains(&discount))
+    }) {
+        return false;
+    }
+    endpoint.additional_pricing.iter().all(|(component, raw)| {
+        let Some(raw) = raw.as_deref() else {
+            // Only DeepSeek's reviewed cache terms let the ordinary prompt
+            // ceiling conservatively bound a missing cache quote.
+            return reviewed_deepseek_cache_semantics
+                && matches!(component.as_str(), "input_cache_read" | "input_cache_write" | "input_cache_write_1h");
+        };
+        let Some(price) = openrouter_price_micros_per_million(raw) else { return false; };
+        match component.as_str() {
+            "input_cache_read" | "input_cache_write" | "input_cache_write_1h" => price <= input_ceiling,
+            "internal_reasoning" => price == 0 && price <= output_ceiling,
+            // The exact Aider request is text-only and sends no web-search,
+            // image, audio, or audio-cache content. These components are
+            // retained in the observation; they cannot be charged for this
+            // request shape. All unrecognized components fail closed.
+            "web_search" | "image" | "image_output" | "image_token" | "audio" | "audio_output" | "input_audio_cache" => true,
+            _ => false,
+        }
+    })
 }
 
 fn supports_parameters(parameters: Option<&[String]>, require_tools: bool) -> bool {
@@ -618,7 +700,10 @@ pub fn openrouter_endpoints_http_probe_with_timeout(
     openrouter_endpoints_http_probe_with_aliases(api_key, model_id, &[model_id], timeout)
 }
 
-pub(crate) fn openrouter_endpoints_http_probe_with_aliases(
+/// Authenticated endpoint probe restricted by the caller to an explicit
+/// selected/canonical identity pair. Core admission still independently
+/// verifies that pair against its reviewed evaluation bundle.
+pub fn openrouter_endpoints_http_probe_with_aliases(
     api_key: &str,
     request_model_id: &str,
     allowed_model_ids: &[&str],
@@ -2782,6 +2867,9 @@ mod tests {
                 prompt_price: Some("0.00000012".into()),
                 completion_price: Some("0.00000080".into()),
                 request_price: Some("0".into()),
+                additional_pricing: Default::default(),
+                pricing_discount: None,
+                pricing_overrides_present: false,
                 status: Some(0),
                 zdr: None,
                 supported_parameters: Some(vec![
@@ -2909,6 +2997,24 @@ mod tests {
     }
 
     #[test]
+    fn pinned_paid_endpoint_bounds_cache_charges_and_rejects_unknown_overrides() {
+        let (metadata, mut endpoints, zdr, requirements) = paid_pilot_observations();
+        let endpoint = &mut endpoints[0];
+        endpoint.additional_pricing.insert("input_cache_read".into(), Some("0.000000012".into()));
+        endpoint.additional_pricing.insert("input_cache_write".into(), Some("0.00000012".into()));
+        assert!(openrouter_pinned_paid_endpoint_is_verified(&metadata, &endpoints, &zdr, requirements));
+
+        endpoints[0].additional_pricing.insert("input_cache_write".into(), Some("0.00000013".into()));
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(&metadata, &endpoints, &zdr, requirements));
+        endpoints[0].additional_pricing.insert("input_cache_write".into(), Some("0.00000012".into()));
+        endpoints[0].pricing_overrides_present = true;
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(&metadata, &endpoints, &zdr, requirements));
+        endpoints[0].pricing_overrides_present = false;
+        endpoints[0].additional_pricing.insert("unreviewed_fee".into(), Some("0".into()));
+        assert!(!openrouter_pinned_paid_endpoint_is_verified(&metadata, &endpoints, &zdr, requirements));
+    }
+
+    #[test]
     fn pinned_paid_endpoint_accepts_an_exact_endpoint_quote_above_catalog_quote() {
         let (mut metadata, mut endpoints, _zdr, mut requirements) = paid_pilot_observations();
         let model = &mut metadata.models[0];
@@ -3016,6 +3122,35 @@ mod tests {
                 .as_deref(),
             Some("0")
         );
+    }
+
+    #[test]
+    fn endpoint_parser_retains_cache_pricing_and_marks_conditional_overrides() {
+        let response = serde_json::json!({
+            "data": {"endpoints": [{
+                "model_id": "deepseek/deepseek-v4.1-flash-20260910",
+                "tag": "parasail/fp8",
+                "pricing": {
+                    "prompt": "0.0003",
+                    "completion": "0.0012",
+                    "request": null,
+                    "input_cache_read": "0.00003",
+                    "input_cache_write": "0.0003",
+                    "input_cache_write_1h": null,
+                    "discount": 0.1,
+                    "overrides": []
+                }
+            }]}
+        });
+        let parsed = parse_openrouter_endpoints(&response, "deepseek/deepseek-v4.1-flash-20260910");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].additional_pricing.get("input_cache_read").and_then(Option::as_deref), Some("0.00003"));
+        assert_eq!(parsed[0].additional_pricing.get("input_cache_write_1h"), Some(&None));
+        assert_eq!(parsed[0].pricing_discount.as_deref(), Some("0.1"));
+        assert!(!parsed[0].pricing_overrides_present);
+        let mut conditional = response;
+        conditional["data"]["endpoints"][0]["pricing"]["overrides"] = serde_json::json!([{"condition": "tier"}]);
+        assert!(parse_openrouter_endpoints(&conditional, "deepseek/deepseek-v4.1-flash-20260910")[0].pricing_overrides_present);
     }
 
     #[test]

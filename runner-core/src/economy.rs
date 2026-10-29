@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 thread_local! {
     static TEST_EVALUATION_EVIDENCE: std::cell::RefCell<Option<CodingEvaluationEvidence>> = const { std::cell::RefCell::new(None) };
+    static TEST_PAID_EVALUATION_EVIDENCE: std::cell::RefCell<Option<PaidCodingEvaluationEvidence>> = const { std::cell::RefCell::new(None) };
     static TEST_ENDPOINT_POLICIES: std::cell::RefCell<Vec<ReviewedEndpointPolicy>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 use std::fs::{self, Metadata};
@@ -41,6 +42,9 @@ const REVIEWED_PAID_ENDPOINT_POLICIES_JSON: &[u8] =
     include_bytes!("../config/paid-endpoint-policies.json");
 const REVIEWED_PAID_ENDPOINT_POLICIES_SHA256: &str =
     "589907505d3d2b4eae2a45dd20b0f6e3bafaa27707e2d7aca15e9863bb91b90a";
+const PAID_ECONOMY_RESULTS_JSON: &[u8] =
+    include_bytes!("../config/paid-economy-reviewed-results.json");
+const PAID_ECONOMY_RESULTS_SHA256: &str = "3bfed4149e63653261622da8ccefd56dd92d1273eca8e1005855df23487ee370";
 const PAID_ENDPOINT_POLICY_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 fn paid_endpoint_policy_digest(bytes: &[u8]) -> String {
@@ -59,6 +63,26 @@ fn paid_endpoint_policy_digest(bytes: &[u8]) -> String {
         }
     }
     sha256_hex(&normalized)
+}
+
+fn paid_economy_results_digest(bytes: &[u8]) -> String {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    sha256_hex(&normalized)
+}
+
+fn paid_aider_guard_source_sha256() -> String {
+    let source = include_str!("paid_aider_guard.py");
+    sha256_hex(source.replace("\r\n", "\n").as_bytes())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,6 +517,7 @@ pub fn execute_trial(arguments: TrialRunArguments<'_>) -> TrialReceipt {
             model_id: arguments.model_id.to_owned(),
             runtime_id: "aider".into(),
             model_context_window_tokens: context_tokens,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: output_tokens,
             max_calls,
             max_cost_micros: 0,
@@ -981,14 +1006,45 @@ pub enum PrivacyStatus {
     Incompatible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EconomyChoiceKind {
+    Free,
+    PaidEndpoint,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EconomyModelStatus {
+    pub choice_kind: EconomyChoiceKind,
     pub provider_id: String,
     pub model_id: String,
     pub context_tokens: Option<u64>,
     pub input_price_micros_per_1m: Option<u64>,
     pub output_price_micros_per_1m: Option<u64>,
+    pub catalog_pricing_source: Option<String>,
+    pub catalog_pricing_observed_at_ms: Option<u64>,
+    pub endpoint_id: Option<String>,
+    pub endpoint_canonical_model_id: Option<String>,
+    pub endpoint_input_price_micros_per_1m: Option<u64>,
+    pub endpoint_output_price_micros_per_1m: Option<u64>,
+    /// None means the endpoint did not report a request fee. Dispatch can
+    /// accept that only because the gateway enforces max_price.request=0.
+    pub endpoint_request_fee_micros: Option<u64>,
+    pub endpoint_pricing_source: Option<String>,
+    pub endpoint_observed_at_ms: Option<u64>,
+    pub endpoint_fresh: bool,
+    pub endpoint_cache_read_price_micros_per_1m: Option<u64>,
+    pub endpoint_cache_write_price_micros_per_1m: Option<u64>,
+    pub endpoint_cache_write_1h_price_micros_per_1m: Option<u64>,
+    pub endpoint_pricing_overrides_present: bool,
+    pub endpoint_context_tokens: Option<u64>,
+    pub endpoint_max_prompt_tokens: Option<u64>,
+    pub endpoint_max_completion_tokens: Option<u64>,
+    pub estimated_max_cost_micros_per_call: Option<u64>,
+    pub evaluated_max_input_tokens_per_call: Option<u64>,
+    pub evaluated_max_output_tokens_per_call: Option<u64>,
+    pub evaluated_max_seconds_per_task: Option<u64>,
     pub catalog_observed_at_ms: u64,
     pub evaluation_status: EvidenceStatus,
     pub evaluation_runtime_version: Option<String>,
@@ -1089,6 +1145,124 @@ struct ReviewedModel {
     reason_codes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedResults {
+    schema_version: u32,
+    evidence_kind: String,
+    evaluated_at_ms: u64,
+    batch_completed_at_ms: u64,
+    max_input_tokens_per_call: u64,
+    max_output_tokens_per_call: u64,
+    case_hash_serialization: String,
+    model: PaidEconomyReviewedModel,
+    runtime: PaidEconomyReviewedRuntime,
+    fixture_set: PaidEconomyReviewedFixtureSet,
+    privacy: PaidEconomyReviewedPrivacy,
+    batch_receipt_sha256: String,
+    cases: Vec<PaidEconomyReviewedCase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedModel {
+    model_id: String,
+    canonical_model_id: String,
+    endpoint_tag: String,
+    provider_slug: String,
+    catalog_input_price_micros_per_1m: u64,
+    catalog_output_price_micros_per_1m: u64,
+    catalog_observed_at_ms: u64,
+    endpoint_input_price_micros_per_1m: u64,
+    endpoint_output_price_micros_per_1m: u64,
+    endpoint_observed_at_ms: u64,
+    request_fee_observation: String,
+    request_fee_ceiling_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedRuntime {
+    id: String,
+    version: String,
+    runner_core_version: String,
+    app_version: String,
+    guard_source_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedFixtureSet {
+    id: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedPrivacy {
+    policy_registry_sha256: String,
+    observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedCase {
+    actual_cost_micros: u64,
+    api_latency_ms: Option<u64>,
+    call_sequence: u32,
+    host_check: PaidEconomyReviewedHostCheck,
+    independent_review: PaidEconomyReviewedReview,
+    inventory_matches_review: bool,
+    request_count: u32,
+    runner_seconds: u64,
+    source_inventory: BTreeMap<String, String>,
+    source_inventory_sha256: String,
+    status: String,
+    task_type: String,
+    tokens: u64,
+    case_evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedHostCheck {
+    candidate_inventory_matches_source: bool,
+    check_files_match_recorded_hashes: bool,
+    check_files_sha256: BTreeMap<String, String>,
+    passed_check_count: u32,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PaidEconomyReviewedReview {
+    correctness_passed: bool,
+    reviewed_inventory_matches_source: bool,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaidCodingEvaluationEvidence {
+    model_id: String,
+    canonical_model_id: String,
+    endpoint_tag: String,
+    runtime_id: String,
+    runtime_version: String,
+    evaluated_at_ms: u64,
+    fixture_set_id: String,
+    fixture_set_sha256: String,
+    result_sha256: String,
+    guard_source_sha256: String,
+    catalog_input_price_micros_per_1m: u64,
+    catalog_output_price_micros_per_1m: u64,
+    endpoint_input_price_micros_per_1m: u64,
+    endpoint_output_price_micros_per_1m: u64,
+    max_input_tokens_per_call: u64,
+    max_output_tokens_per_call: u64,
+    cases: u32,
+    passed: u32,
+}
+
 fn trusted_reviewed_results() -> Option<ReviewedResults> {
     if sha256_hex(REVIEWED_RESULTS_JSON) != REVIEWED_RESULTS_SHA256 {
         return None;
@@ -1106,6 +1280,219 @@ fn trusted_reviewed_results() -> Option<ReviewedResults> {
         return None;
     }
     Some(registry)
+}
+
+fn trusted_paid_evaluation(
+    runtime_id: &str,
+    runtime_version: &str,
+    now_ms: u64,
+) -> Option<PaidCodingEvaluationEvidence> {
+    #[cfg(test)]
+    if let Some(evidence) = TEST_PAID_EVALUATION_EVIDENCE.with(|slot| slot.borrow().clone()) {
+        if evidence.model_id == "deepseek/deepseek-v4.1-flash"
+            && evidence.canonical_model_id == "deepseek/deepseek-v4.1-flash-20260910"
+            && evidence.endpoint_tag == "parasail/fp8"
+            && evidence.runtime_id == runtime_id
+            && evidence.runtime_version == runtime_version
+            && evidence.passed == 3
+            && evidence.cases == 3
+            && evidence.evaluated_at_ms <= now_ms
+            && now_ms.saturating_sub(evidence.evaluated_at_ms) <= MAX_EVIDENCE_AGE_MS
+            && evidence.guard_source_sha256 == paid_aider_guard_source_sha256()
+            && is_sha256(&evidence.fixture_set_sha256)
+            && is_sha256(&evidence.result_sha256)
+        {
+            return Some(evidence);
+        }
+    }
+    if paid_economy_results_digest(PAID_ECONOMY_RESULTS_JSON)
+        != PAID_ECONOMY_RESULTS_SHA256
+    {
+        return None;
+    }
+    let registry: PaidEconomyReviewedResults =
+        serde_json::from_slice(PAID_ECONOMY_RESULTS_JSON).ok()?;
+    let model = &registry.model;
+    let runtime = &registry.runtime;
+    let fixture = &registry.fixture_set;
+    if registry.schema_version != 1
+        || registry.evidence_kind != "paidEconomyCodingEvaluation"
+        || registry.max_input_tokens_per_call != 16_384
+        || registry.max_output_tokens_per_call != 8_192
+        || registry.case_hash_serialization
+            != "SHA-256 of UTF-8 compact JSON for each case object with lexically ordered keys; exclude caseEvidenceSha256; nested objects and filename maps are lexically ordered"
+        || registry.evaluated_at_ms > now_ms
+        || registry.batch_completed_at_ms > registry.evaluated_at_ms
+        || now_ms.saturating_sub(registry.evaluated_at_ms) > MAX_EVIDENCE_AGE_MS
+        || model.model_id != "deepseek/deepseek-v4.1-flash"
+        || model.canonical_model_id != "deepseek/deepseek-v4.1-flash-20260910"
+        || model.endpoint_tag != "parasail/fp8"
+        || model.provider_slug != "parasail"
+        || model.catalog_input_price_micros_per_1m == 0
+        || model.catalog_output_price_micros_per_1m == 0
+        || model.endpoint_input_price_micros_per_1m == 0
+        || model.endpoint_output_price_micros_per_1m == 0
+        || model.request_fee_observation != "unknown"
+        || model.request_fee_ceiling_micros != 0
+        || model.catalog_observed_at_ms > registry.evaluated_at_ms
+        || model.endpoint_observed_at_ms > registry.evaluated_at_ms
+        || runtime.id != "aider"
+        || runtime.id != runtime_id
+        || runtime.version != "0.86.2"
+        || runtime.version != runtime_version
+        || runtime.runner_core_version != env!("CARGO_PKG_VERSION")
+        || runtime.app_version.is_empty()
+        || runtime.app_version.len() > 32
+        || runtime.app_version.chars().any(char::is_control)
+        || runtime.guard_source_sha256 != paid_aider_guard_source_sha256()
+        || !is_sha256(&runtime.guard_source_sha256)
+        || fixture.id != "fab-s001-synthetic-v1"
+        || fixture.sha256 != sha256_hex(TRIAL_REGISTRY_JSON.as_bytes())
+        || !is_sha256(&fixture.sha256)
+        || registry.privacy.policy_registry_sha256
+            != paid_endpoint_policy_digest(REVIEWED_PAID_ENDPOINT_POLICIES_JSON)
+        || !reviewed_paid_endpoint_policy_matches(
+            &model.model_id,
+            &model.canonical_model_id,
+            &model.endpoint_tag,
+            now_ms,
+        )
+        || registry.privacy.observed_at_ms > now_ms
+        || now_ms.saturating_sub(registry.privacy.observed_at_ms) > PAID_ENDPOINT_POLICY_MAX_AGE_MS
+        || !is_sha256(&registry.batch_receipt_sha256)
+        || registry.cases.len() != 3
+    {
+        return None;
+    }
+
+    let expected_checks = BTreeMap::from([
+        ("small_bugfix", "test_name_utils.py"),
+        ("implementation", "test_limits.py"),
+        ("multifile_edit", "test_catalog.py"),
+    ]);
+    let expected_sources = BTreeMap::from([
+        ("small_bugfix", vec!["name_utils.py"]),
+        ("implementation", vec!["limits.py"]),
+        ("multifile_edit", vec!["catalog.py", "text_utils.py"]),
+    ]);
+    let mut sequences = BTreeSet::new();
+    let mut seen_tasks = BTreeSet::new();
+    let mut total_cost = 0u64;
+    let mut total_tokens = 0u64;
+    for case in &registry.cases {
+        if !seen_tasks.insert(case.task_type.as_str())
+            || !sequences.insert(case.call_sequence)
+            || expected_checks.get(case.task_type.as_str()).is_none()
+        {
+            return None;
+        }
+        let expected_check = expected_checks.get(case.task_type.as_str())?;
+        let expected_source_files = expected_sources.get(case.task_type.as_str())?;
+        let source_names = case.source_inventory.keys().map(String::as_str).collect::<Vec<_>>();
+        let check_names = case.host_check.check_files_sha256.keys().map(String::as_str).collect::<Vec<_>>();
+        let source_inventory_bytes = serde_json::to_vec(&case.source_inventory).ok()?;
+        let mut canonical_case = serde_json::to_value(case).ok()?;
+        canonical_case.as_object_mut()?.remove("caseEvidenceSha256")?;
+        let canonical_case_bytes = serde_json::to_vec(&canonical_case).ok()?;
+        if case.status != "passed"
+            || case.call_sequence == 0
+            || case.request_count != 1
+            || case.tokens == 0
+            || case.tokens > 122_880
+            || case.actual_cost_micros == 0
+            || case.runner_seconds == 0
+            || case.runner_seconds > 120
+            || case.api_latency_ms.is_some()
+            || source_names != expected_source_files.as_slice()
+            || case.source_inventory.values().any(|hash| !is_sha256(hash))
+            || paid_economy_results_digest(&source_inventory_bytes) != case.source_inventory_sha256
+            || !case.inventory_matches_review
+            || case.host_check.status != "passed"
+            || case.host_check.passed_check_count != 2
+            || check_names != [*expected_check]
+            || case.host_check.check_files_sha256.values().any(|hash| !is_sha256(hash))
+            || !case.host_check.candidate_inventory_matches_source
+            || !case.host_check.check_files_match_recorded_hashes
+            || case.independent_review.status != "passed"
+            || !case.independent_review.correctness_passed
+            || !case.independent_review.reviewed_inventory_matches_source
+            || !is_sha256(&case.case_evidence_sha256)
+            || paid_economy_results_digest(&canonical_case_bytes) != case.case_evidence_sha256
+        {
+            return None;
+        }
+        total_cost = total_cost.checked_add(case.actual_cost_micros)?;
+        total_tokens = total_tokens.checked_add(case.tokens)?;
+    }
+    if seen_tasks != expected_checks.keys().copied().collect::<BTreeSet<_>>()
+        || sequences != BTreeSet::from([1, 2, 3])
+        || total_cost != 5_651
+        || total_tokens != 10_756
+        || total_cost > 100_000
+    {
+        return None;
+    }
+    Some(PaidCodingEvaluationEvidence {
+        model_id: model.model_id.clone(),
+        canonical_model_id: model.canonical_model_id.clone(),
+        endpoint_tag: model.endpoint_tag.clone(),
+        runtime_id: runtime.id.clone(),
+        runtime_version: runtime.version.clone(),
+        evaluated_at_ms: registry.evaluated_at_ms,
+        fixture_set_id: fixture.id.clone(),
+        fixture_set_sha256: fixture.sha256.clone(),
+        result_sha256: paid_economy_results_digest(PAID_ECONOMY_RESULTS_JSON),
+        guard_source_sha256: runtime.guard_source_sha256.clone(),
+        catalog_input_price_micros_per_1m: model.catalog_input_price_micros_per_1m,
+        catalog_output_price_micros_per_1m: model.catalog_output_price_micros_per_1m,
+        endpoint_input_price_micros_per_1m: model.endpoint_input_price_micros_per_1m,
+        endpoint_output_price_micros_per_1m: model.endpoint_output_price_micros_per_1m,
+        max_input_tokens_per_call: registry.max_input_tokens_per_call,
+        max_output_tokens_per_call: registry.max_output_tokens_per_call,
+        cases: 3,
+        passed: 3,
+    })
+}
+
+/// Exact identities the authenticated provider refresh may probe for the
+/// optional paid Economy shortlist. This is a bounded, read-only projection.
+pub fn paid_economy_candidate_models(
+    runtime_id: &str,
+    runtime_version: &str,
+    now_ms: u64,
+) -> Vec<(String, String, String)> {
+    let Some(evaluation) = trusted_paid_evaluation(runtime_id, runtime_version, now_ms) else {
+        return Vec::new();
+    };
+    reviewed_paid_endpoint_candidates(now_ms)
+        .into_iter()
+        .filter(|(model_id, canonical_model_id, endpoint_id)| {
+            model_id == &evaluation.model_id
+                && canonical_model_id == &evaluation.canonical_model_id
+                && endpoint_id == &evaluation.endpoint_tag
+        })
+        .collect()
+}
+
+/// Hash-bound model identities in the paid evaluation bundle, retained for
+/// status display even when the currently probed runtime is stale or differs.
+/// This is not admission; production routing still requires an opaque proof.
+pub fn paid_economy_reviewed_model_ids() -> Vec<String> {
+    if paid_economy_results_digest(PAID_ECONOMY_RESULTS_JSON) != PAID_ECONOMY_RESULTS_SHA256 {
+        return Vec::new();
+    }
+    let Ok(registry) = serde_json::from_slice::<PaidEconomyReviewedResults>(PAID_ECONOMY_RESULTS_JSON) else {
+        return Vec::new();
+    };
+    if registry.schema_version != 1
+        || registry.evidence_kind != "paidEconomyCodingEvaluation"
+        || registry.model.model_id != "deepseek/deepseek-v4.1-flash"
+        || registry.model.canonical_model_id != "deepseek/deepseek-v4.1-flash-20260910"
+        || registry.model.endpoint_tag != "parasail/fp8"
+    {
+        return Vec::new();
+    }
+    vec![registry.model.model_id]
 }
 
 fn valid_reviewed_endpoint_policies() -> bool {
@@ -1367,6 +1754,165 @@ pub fn trusted_economy_candidate_ids(
 /// Turn fresh authenticated OpenRouter metadata into an opaque dispatch proof.
 /// Caller-supplied evidence and serialized route flags cannot instantiate this.
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_paid_economy_candidate(
+    provider_profile_id: &str,
+    runtime_identity_fingerprint: &str,
+    metadata: &crate::provider_observations::OpenRouterPaidEndpointMetadata,
+    current_catalog_input: Option<u64>,
+    current_catalog_output: Option<u64>,
+    current_catalog_source: Option<&str>,
+    current_catalog_observed_at_ms: Option<u64>,
+    now_ms: u64,
+) -> Result<VerifiedPaidEconomyAdmission, String> {
+    let runtime_version = metadata
+        .runtime_version
+        .as_str();
+    if runtime_version.trim().is_empty() {
+        return Err("The selected Aider version was not verified during refresh.".to_string());
+    }
+    let evaluation = trusted_paid_evaluation("aider", runtime_version, now_ms)
+        .ok_or_else(|| "No current all-case paid Economy qualification matches this Aider runtime and guard.".to_string())?;
+    let model = &metadata.model;
+    let catalog_input = current_catalog_input
+        .ok_or_else(|| "Current authenticated catalog input pricing is unavailable.".to_string())?;
+    let catalog_output = current_catalog_output
+        .ok_or_else(|| "Current authenticated catalog output pricing is unavailable.".to_string())?;
+    let catalog_observed_at_ms = current_catalog_observed_at_ms
+        .ok_or_else(|| "Current authenticated catalog quote timestamp is unavailable.".to_string())?;
+    if provider_profile_id.trim().is_empty()
+        || provider_profile_id.len() > 96
+        || provider_profile_id.chars().any(char::is_control)
+        || !is_runtime_identity_fingerprint(runtime_identity_fingerprint)
+        || model.id != evaluation.model_id
+        || model.canonical_slug.as_deref() != Some(evaluation.canonical_model_id.as_str())
+        || current_catalog_source != Some("OpenRouter authenticated user model catalog")
+        || model.prompt_price.as_deref().and_then(crate::providers::openrouter_price_micros_per_million)
+            != Some(catalog_input)
+        || model.completion_price.as_deref().and_then(crate::providers::openrouter_price_micros_per_million)
+            != Some(catalog_output)
+        || catalog_input == 0
+        || catalog_output == 0
+        || catalog_observed_at_ms > now_ms
+        || now_ms.saturating_sub(catalog_observed_at_ms) > 24 * 60 * 60 * 1000
+        || metadata.runtime_identity_fingerprint != runtime_identity_fingerprint
+        || metadata.observed_at_ms > now_ms as u128
+        || (now_ms as u128).saturating_sub(metadata.observed_at_ms) > 24 * 60 * 60 * 1000
+        || metadata.zdr_endpoints.len() > 256
+        || !reviewed_paid_endpoint_policy_matches(
+            &model.id,
+            &evaluation.canonical_model_id,
+            &evaluation.endpoint_tag,
+            now_ms,
+        )
+    {
+        return Err("Authenticated model, runtime, policy, or catalog evidence changed.".into());
+    }
+    let endpoints = metadata.endpoints.iter().filter(|endpoint| {
+        (endpoint.model_id == evaluation.model_id || endpoint.model_id == evaluation.canonical_model_id)
+            && endpoint.tag == evaluation.endpoint_tag
+    }).collect::<Vec<_>>();
+    if endpoints.len() != 1 {
+        return Err("The authenticated endpoint response is ambiguous for the reviewed pin.".into());
+    }
+    let endpoint = endpoints[0];
+    let input_price = endpoint.prompt_price.as_deref()
+        .and_then(crate::providers::openrouter_price_micros_per_million)
+        .ok_or_else(|| "Current endpoint input quote is invalid.".to_string())?;
+    let output_price = endpoint.completion_price.as_deref()
+        .and_then(crate::providers::openrouter_price_micros_per_million)
+        .ok_or_else(|| "Current endpoint output quote is invalid.".to_string())?;
+    let requirements = crate::providers::PinnedPaidEndpointRequirements {
+        model_id: &evaluation.model_id,
+        canonical_model_id: &evaluation.canonical_model_id,
+        endpoint_id: &evaluation.endpoint_tag,
+        input_price_ceiling_micros_per_1m: evaluation.endpoint_input_price_micros_per_1m,
+        output_price_ceiling_micros_per_1m: evaluation.endpoint_output_price_micros_per_1m,
+        input_tokens: evaluation.max_input_tokens_per_call,
+        output_tokens: evaluation.max_output_tokens_per_call,
+        requires_tools: true,
+        model_catalog_input_micros_per_1m: Some(catalog_input),
+        model_catalog_output_micros_per_1m: Some(catalog_output),
+    };
+    if !crate::providers::openrouter_pinned_paid_endpoint_is_verified(
+        &crate::providers::OpenRouterMetadataObservation {
+            authenticated_for_execution: Some(true),
+            models: vec![model.clone()],
+            free_model_daily_requests: None,
+        },
+        &metadata.endpoints,
+        &metadata.zdr_endpoints,
+        requirements,
+    ) {
+        return Err("The exact endpoint is unavailable, stale, over its reviewed price/capability envelope, or missing ZDR.".into());
+    }
+    if input_price == 0 || output_price == 0
+        || endpoint.request_price.as_deref().is_some_and(|price| {
+            crate::providers::openrouter_price_micros_per_million(price) != Some(0)
+        })
+    {
+        return Err("Current endpoint pricing is incompatible with the explicit zero request-fee ceiling.".into());
+    }
+    let context_tokens = endpoint.context_length
+        .ok_or_else(|| "The current endpoint context limit is unknown.".to_string())?;
+    let max_completion_tokens = endpoint.max_completion_tokens
+        .ok_or_else(|| "The current endpoint output limit is unknown.".to_string())?;
+    let max_prompt_tokens = endpoint.max_prompt_tokens;
+    if context_tokens < evaluation.max_input_tokens_per_call + evaluation.max_output_tokens_per_call
+        || max_completion_tokens < evaluation.max_output_tokens_per_call
+        || max_prompt_tokens.is_some_and(|cap| cap < evaluation.max_input_tokens_per_call)
+    {
+        return Err("The current endpoint context/capacity is below the evaluated input and output limits.".into());
+    }
+    let request_fee_micros = endpoint.request_price.as_deref()
+        .and_then(crate::providers::openrouter_price_micros_per_million);
+    let semantic = serde_json::to_vec(&serde_json::json!({
+        "kind": "paid-economy-admission-v1",
+        "providerProfileId": provider_profile_id,
+        "runtimeIdentityFingerprint": runtime_identity_fingerprint,
+        "modelId": evaluation.model_id,
+        "canonicalModelId": evaluation.canonical_model_id,
+        "endpointId": evaluation.endpoint_tag,
+        "evaluationDigest": evaluation.result_sha256,
+        "guardSourceSha256": evaluation.guard_source_sha256,
+        "policyRegistrySha256": REVIEWED_PAID_ENDPOINT_POLICIES_SHA256,
+        "catalogInputMicrosPer1m": catalog_input,
+        "catalogOutputMicrosPer1m": catalog_output,
+        "endpointInputMicrosPer1m": input_price,
+        "endpointOutputMicrosPer1m": output_price,
+        "requestFeeMicros": request_fee_micros,
+        "modelContextTokens": model.context_length,
+        "endpointContextTokens": context_tokens,
+        "maxPromptTokens": max_prompt_tokens,
+        "maxCompletionTokens": max_completion_tokens,
+        "maxInputTokensPerCall": evaluation.max_input_tokens_per_call,
+        "maxOutputTokensPerCall": evaluation.max_output_tokens_per_call,
+        "pricingComponents": endpoint.additional_pricing,
+        "pricingDiscount": endpoint.pricing_discount,
+        "pricingOverridesPresent": endpoint.pricing_overrides_present,
+    })).map_err(|_| "Paid Economy evidence could not be bound.".to_string())?;
+    Ok(VerifiedPaidEconomyAdmission {
+        provider_profile_id: provider_profile_id.to_owned(),
+        model_id: evaluation.model_id.clone(),
+        canonical_model_id: evaluation.canonical_model_id.clone(),
+        endpoint_id: evaluation.endpoint_tag.clone(),
+        runtime_identity_fingerprint: runtime_identity_fingerprint.to_owned(),
+        runtime_version: runtime_version.to_owned(),
+        context_tokens: model.context_length.ok_or_else(|| "The authenticated model context is unknown.".to_string())?,
+        max_input_tokens_per_call: evaluation.max_input_tokens_per_call,
+        max_prompt_tokens,
+        max_completion_tokens,
+        catalog_input_micros_per_1m: catalog_input,
+        catalog_output_micros_per_1m: catalog_output,
+        endpoint_input_micros_per_1m: input_price,
+        endpoint_output_micros_per_1m: output_price,
+        request_fee_micros,
+        catalog_observed_at_ms,
+        endpoint_observed_at_ms: u64::try_from(metadata.observed_at_ms).map_err(|_| "Endpoint observation time is invalid.".to_string())?,
+        evaluation,
+        evidence_digest: sha256_hex(&semantic),
+    })
+}
+
 pub(crate) fn admit_authenticated_candidate(
     provider_profile_id: &str,
     model_id: &str,
@@ -1847,10 +2393,12 @@ fn valid_authenticated_model_slug(value: &str) -> bool {
 /// dispatch; absent a trusted serving-endpoint proof, rows remain unselectable.
 pub fn statuses_from_catalog(
     provider_id: &str,
+    runtime_identity_fingerprint: &str,
     models: &[crate::providers::OpenRouterModel],
     endpoints_by_model: &BTreeMap<String, Vec<crate::providers::OpenRouterEndpoint>>,
     zdr_endpoints: &BTreeSet<(String, String)>,
     catalog_observed_at_ms: u64,
+    paid_endpoint_metadata_by_model: &BTreeMap<String, crate::provider_observations::OpenRouterPaidEndpointMetadata>,
     runtime_id: &str,
     runtime_version: &str,
     now_ms: u64,
@@ -1888,73 +2436,167 @@ pub fn statuses_from_catalog(
             })
             .map(|model| model.id.clone()),
     );
+    ids.extend(paid_economy_reviewed_model_ids());
     ids.into_iter().map(|model_id| {
         let model = model_map.get(model_id.as_str()).copied();
         let catalog_fresh = catalog_observed_at_ms <= now_ms && now_ms.saturating_sub(catalog_observed_at_ms) <= 24 * 60 * 60 * 1000;
         let input = model.and_then(|model| model.prompt_price.as_deref()).and_then(crate::providers::openrouter_price_micros_per_million);
         let output = model.and_then(|model| model.completion_price.as_deref()).and_then(crate::providers::openrouter_price_micros_per_million);
         let current_zero_priced = input == Some(0) && output == Some(0);
+        let paid_choice = paid_economy_reviewed_model_ids().iter().any(|id| id == &model_id);
+        let paid_registry = if paid_choice && paid_economy_results_digest(PAID_ECONOMY_RESULTS_JSON) == PAID_ECONOMY_RESULTS_SHA256 {
+            serde_json::from_slice::<PaidEconomyReviewedResults>(PAID_ECONOMY_RESULTS_JSON).ok()
+        } else { None };
+        let paid_metadata = paid_endpoint_metadata_by_model.get(&model_id);
+        let paid_endpoint = paid_metadata.and_then(|metadata| {
+            let selected = metadata.model.id.as_str();
+            let canonical = metadata.model.canonical_slug.as_deref()?;
+            let row = paid_registry.as_ref()?;
+            if selected != row.model.model_id || canonical != row.model.canonical_model_id
+                || metadata.runtime_identity_fingerprint != runtime_identity_fingerprint
+                || metadata.model.id != model_id
+            { return None; }
+            let matching = metadata.endpoints.iter().filter(|endpoint| {
+                (endpoint.model_id == row.model.model_id || endpoint.model_id == row.model.canonical_model_id)
+                    && endpoint.tag == row.model.endpoint_tag
+            }).collect::<Vec<_>>();
+            if matching.len() == 1 { Some(matching[0]) } else { None }
+        });
+        let paid_endpoint_at = paid_metadata.and_then(|metadata| u64::try_from(metadata.observed_at_ms).ok());
+        let endpoint_fresh = if paid_choice {
+            paid_endpoint.is_some() && paid_endpoint_at.is_some_and(|time| time <= now_ms && now_ms.saturating_sub(time) <= 5 * 60 * 1000)
+        } else {
+            model.is_some() && catalog_fresh && endpoints_by_model.get(&model_id).is_some_and(|rows| !rows.is_empty())
+        };
         let entry = registry.models.iter().find(|entry| entry.model_id == model_id);
         let codes = entry.map_or_else(Vec::new, |entry| entry.reason_codes.clone());
         let eval = trusted_passing_evaluation(&model_id, runtime_id, runtime_version, now_ms);
-        let evaluation_status = if entry.is_none() { EvidenceStatus::NotEvaluated }
+        let paid_eval = if paid_choice { trusted_paid_evaluation(runtime_id, runtime_version, now_ms) } else { None };
+        let evaluation_status = if paid_choice {
+            match paid_registry.as_ref() {
+                None => EvidenceStatus::Failed,
+                Some(record) if runtime_id != record.runtime.id || runtime_version != record.runtime.version
+                    || record.evaluated_at_ms > now_ms || now_ms.saturating_sub(record.evaluated_at_ms) > MAX_EVIDENCE_AGE_MS => EvidenceStatus::Stale,
+                Some(_) if paid_eval.is_some() => EvidenceStatus::Passed,
+                Some(_) => EvidenceStatus::Failed,
+            }
+        } else if entry.is_none() { EvidenceStatus::NotEvaluated }
             else if runtime_id != registry.runtime.id || runtime_version != registry.runtime.version
                 || registry.evaluated_at_ms > now_ms || now_ms.saturating_sub(registry.evaluated_at_ms) > MAX_EVIDENCE_AGE_MS { EvidenceStatus::Stale }
             else if eval.is_some() { EvidenceStatus::Passed } else { EvidenceStatus::Failed };
-        let policy = reviewed_policy_any_endpoint(&model_id);
-        let privacy_status = match &policy {
+        let free_policy = (!paid_choice).then(|| reviewed_policy_any_endpoint(&model_id)).flatten();
+        let paid_policy = paid_registry.as_ref().and_then(|record| {
+            serde_json::from_slice::<ReviewedPaidEndpointPolicies>(REVIEWED_PAID_ENDPOINT_POLICIES_JSON).ok()?.policies.into_iter()
+                .find(|policy| policy.model_id == model_id && policy.canonical_model_id == record.model.canonical_model_id && policy.endpoint_tag == record.model.endpoint_tag)
+        });
+        let policy_fresh = paid_policy.as_ref().is_some_and(|policy| policy.observed_at_ms <= now_ms && now_ms.saturating_sub(policy.observed_at_ms) <= PAID_ENDPOINT_POLICY_MAX_AGE_MS);
+        let privacy_status = if paid_choice {
+            if paid_policy.as_ref().is_some_and(|policy| policy.no_training && !policy.persistent_input_storage && !policy.input_content_logging) && policy_fresh { PrivacyStatus::Eligible }
+            else { PrivacyStatus::Unknown }
+        } else { match &free_policy {
             None => PrivacyStatus::Unknown,
             Some(policy) if policy.no_training == Some(false) || policy.no_retention == Some(false) || policy.no_content_logging == Some(false) => PrivacyStatus::Incompatible,
             Some(policy) if policy.no_training == Some(true) && policy.no_retention == Some(true) && policy.no_content_logging == Some(true)
                 && policy.observed_at_ms <= now_ms && now_ms.saturating_sub(policy.observed_at_ms) <= MAX_EVIDENCE_AGE_MS => PrivacyStatus::Eligible,
             _ => PrivacyStatus::Unknown,
-        };
+        }};
         let mut capability_reason = None;
-        let selected_admission = if let (Some(model), Some(eval)) = (model, eval) {
+        let selected_admission = if !paid_choice {
+          if let (Some(model), Some(_eval)) = (model, eval) {
             let endpoints = endpoints_by_model.get(&model_id).map(Vec::as_slice).unwrap_or(&[]);
             let observation = crate::providers::OpenRouterMetadataObservation { authenticated_for_execution: Some(true), models: vec![model.clone()], free_model_daily_requests: None };
             match admit_authenticated_candidate(provider_id, &model_id, runtime_id, runtime_version, &observation, endpoints, zdr_endpoints,
                 Some(8_192), Some(8_192), true, 49_152, 120, now_ms) {
                 Ok(admission) => Some(admission),
-                Err(reason) => { capability_reason = Some(reason); let _ = eval; None }
+                Err(reason) => { capability_reason = Some(reason); None }
+            }
+          } else { None }
+        } else { None };
+        let paid_admission = if paid_choice {
+            match (model, paid_metadata) {
+                (Some(_model), Some(metadata)) => match admit_paid_economy_candidate(
+                    provider_id, runtime_identity_fingerprint, metadata, input, output,
+                    Some("OpenRouter authenticated user model catalog"), Some(catalog_observed_at_ms), now_ms,
+                ) {
+                    Ok(admission) => Some(admission),
+                    Err(reason) => { capability_reason = Some(reason); None }
+                },
+                _ => None,
             }
         } else { None };
         let mut reasons = Vec::new();
         if model.is_none() { reasons.push("Model is no longer present in the authenticated catalog.".into()); }
         if !catalog_fresh { reasons.push("Authenticated model catalog is stale.".into()); }
-        if model.is_some() && !current_zero_priced { reasons.push("Current authenticated prompt and completion prices are not both zero.".into()); }
-        match evaluation_status {
+        if model.is_some() && !paid_choice && !current_zero_priced { reasons.push("Current authenticated prompt and completion prices are not both zero.".into()); }
+        if paid_choice && !endpoint_fresh { reasons.push("The pinned endpoint observation is missing or stale.".into()); }
+        if paid_choice && !policy_fresh { reasons.push("Reviewed endpoint privacy policy is stale or unavailable.".into()); }
+        if !paid_choice { match evaluation_status {
             EvidenceStatus::Failed if codes.iter().any(|code| code == "independent_review_failed_or_inventory_mismatch") => reasons.push("Synthetic coding evaluation failed: the multi-file task did not pass independent host review or its source inventory did not match.".into()),
             EvidenceStatus::Failed if codes.iter().any(|code| code == "RUNTIME_FAILED") => reasons.push("Synthetic coding evaluation failed: all three tasks ended with runtime failures.".into()),
             EvidenceStatus::Failed => reasons.push("Synthetic coding evaluation did not pass all required tasks.".into()),
             EvidenceStatus::Stale => reasons.push("Coding evaluation is stale or does not match the current Aider runtime.".into()),
             EvidenceStatus::NotEvaluated => reasons.push("No trusted coding evaluation is recorded for this model.".into()),
             EvidenceStatus::Passed => {},
-        }
+        }} else if evaluation_status == EvidenceStatus::Stale { reasons.push("Paid coding evaluation is stale or does not match the current Aider runtime.".into()); }
+        else if evaluation_status == EvidenceStatus::Failed { reasons.push("Paid coding evaluation bundle did not pass trusted validation.".into()); }
         match privacy_status {
+            PrivacyStatus::Unknown if paid_choice => reasons.push("Reviewed Parasail endpoint policy is unavailable or stale.".into()),
             PrivacyStatus::Unknown => reasons.push("Serving endpoint training, retention, or logging policy is unknown.".into()),
             PrivacyStatus::Incompatible => reasons.push("Reviewed provider policy does not guarantee no training, retention, and content logging for this endpoint.".into()),
             PrivacyStatus::Eligible => {},
         }
         if let Some(reason) = capability_reason.clone() { reasons.push(reason); }
-        let selectable = selected_admission.is_some() && catalog_fresh && current_zero_priced;
+        let selectable = if paid_choice { paid_admission.is_some() && catalog_fresh && endpoint_fresh }
+            else { selected_admission.is_some() && catalog_fresh && current_zero_priced };
+        let endpoint_input = paid_endpoint.and_then(|endpoint| endpoint.prompt_price.as_deref()).and_then(crate::providers::openrouter_price_micros_per_million);
+        let endpoint_output = paid_endpoint.and_then(|endpoint| endpoint.completion_price.as_deref()).and_then(crate::providers::openrouter_price_micros_per_million);
+        let estimated_max_cost = paid_registry.as_ref().zip(endpoint_input).zip(endpoint_output).and_then(|((record, in_price), out_price)| {
+            let total = u128::from(in_price).checked_mul(u128::from(record.max_input_tokens_per_call))?
+                .checked_add(u128::from(out_price).checked_mul(u128::from(record.max_output_tokens_per_call))?)?;
+            u64::try_from(total.div_ceil(1_000_000)).ok()
+        });
+        let cache_price = |key: &str| paid_endpoint.and_then(|endpoint| endpoint.additional_pricing.get(key).and_then(|raw| raw.as_deref()).and_then(crate::providers::openrouter_price_micros_per_million));
+        let evaluation_at = if paid_choice { paid_registry.as_ref().map(|record| record.evaluated_at_ms) } else { entry.map(|_| registry.evaluated_at_ms) };
+        let evaluation_runtime = if paid_choice { paid_registry.as_ref().map(|record| record.runtime.version.clone()) } else { entry.map(|_| registry.runtime.version.clone()) };
         EconomyModelStatus {
+            choice_kind: if paid_choice { EconomyChoiceKind::PaidEndpoint } else { EconomyChoiceKind::Free },
             provider_id: provider_id.into(), model_id: model_id.clone(),
             context_tokens: model.and_then(|model| model.context_length),
             input_price_micros_per_1m: input, output_price_micros_per_1m: output,
+            catalog_pricing_source: model.map(|_| "OpenRouter authenticated user model catalog".into()),
+            catalog_pricing_observed_at_ms: model.map(|_| catalog_observed_at_ms),
+            endpoint_id: paid_registry.as_ref().map(|record| record.model.endpoint_tag.clone()),
+            endpoint_canonical_model_id: paid_registry.as_ref().map(|record| record.model.canonical_model_id.clone()),
+            endpoint_input_price_micros_per_1m: endpoint_input,
+            endpoint_output_price_micros_per_1m: endpoint_output,
+            endpoint_request_fee_micros: paid_endpoint.and_then(|endpoint| endpoint.request_price.as_deref()).and_then(crate::providers::openrouter_price_micros_per_million),
+            endpoint_pricing_source: paid_endpoint.map(|_| "OpenRouter authenticated model endpoint".into()),
+            endpoint_observed_at_ms: if paid_choice { paid_endpoint_at } else { endpoints_by_model.get(&model_id).filter(|rows| !rows.is_empty()).map(|_| catalog_observed_at_ms) },
+            endpoint_fresh,
+            endpoint_cache_read_price_micros_per_1m: cache_price("input_cache_read"),
+            endpoint_cache_write_price_micros_per_1m: cache_price("input_cache_write"),
+            endpoint_cache_write_1h_price_micros_per_1m: cache_price("input_cache_write_1h"),
+            endpoint_pricing_overrides_present: paid_endpoint.is_some_and(|endpoint| endpoint.pricing_overrides_present),
+            endpoint_context_tokens: paid_endpoint.and_then(|endpoint| endpoint.context_length),
+            endpoint_max_prompt_tokens: paid_endpoint.and_then(|endpoint| endpoint.max_prompt_tokens),
+            endpoint_max_completion_tokens: paid_endpoint.and_then(|endpoint| endpoint.max_completion_tokens),
+            estimated_max_cost_micros_per_call: estimated_max_cost,
+            evaluated_max_input_tokens_per_call: paid_registry.as_ref().map(|record| record.max_input_tokens_per_call),
+            evaluated_max_output_tokens_per_call: paid_registry.as_ref().map(|record| record.max_output_tokens_per_call),
+            evaluated_max_seconds_per_task: paid_choice.then_some(120),
             catalog_observed_at_ms, evaluation_status,
-            evaluation_runtime_version: entry.map(|_| registry.runtime.version.clone()),
+            evaluation_runtime_version: evaluation_runtime,
             current_runtime_version: Some(runtime_version.to_owned()),
-            evaluation_at_ms: entry.map(|_| registry.evaluated_at_ms),
-            evaluation_passed: entry.map_or(0, |entry| entry.passed_cases),
-            evaluation_cases: entry.map_or(0, |entry| entry.total_cases),
+            evaluation_at_ms: evaluation_at,
+            evaluation_passed: if paid_choice { 3 } else { entry.map_or(0, |entry| entry.passed_cases) },
+            evaluation_cases: if paid_choice { 3 } else { entry.map_or(0, |entry| entry.total_cases) },
             evaluation_reason_codes: codes,
             catalog_present: model.is_some(), catalog_fresh,
             current_zero_priced, current_context_tokens: model.and_then(|model| model.context_length),
             capability_reason,
             privacy_status,
-            privacy_source: policy.as_ref().map(|policy| policy.source_url.clone()),
-            privacy_observed_at_ms: policy.map(|policy| policy.observed_at_ms),
+            privacy_source: if paid_choice { paid_policy.as_ref().and_then(|policy| policy.source_urls.first().cloned()) } else { free_policy.as_ref().map(|policy| policy.source_url.clone()) },
+            privacy_observed_at_ms: if paid_choice { paid_policy.as_ref().map(|policy| policy.observed_at_ms) } else { free_policy.as_ref().map(|policy| policy.observed_at_ms) },
             selectable, reasons,
         }
     }).collect()
@@ -2028,6 +2670,130 @@ struct ReviewedEndpointPolicy {
 
 /// A proof minted only by the backend from a passing, hash-bound evaluation,
 /// current authenticated model/endpoint metadata and reviewed endpoint policy.
+/// Backend-only proof that a passing paid candidate is admitted for an
+/// explicit Economy route. It is never persisted or accepted from client JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPaidEconomyAdmission {
+    provider_profile_id: String,
+    model_id: String,
+    canonical_model_id: String,
+    endpoint_id: String,
+    runtime_identity_fingerprint: String,
+    runtime_version: String,
+    context_tokens: u64,
+    max_input_tokens_per_call: u64,
+    max_prompt_tokens: Option<u64>,
+    max_completion_tokens: u64,
+    catalog_input_micros_per_1m: u64,
+    catalog_output_micros_per_1m: u64,
+    endpoint_input_micros_per_1m: u64,
+    endpoint_output_micros_per_1m: u64,
+    request_fee_micros: Option<u64>,
+    catalog_observed_at_ms: u64,
+    endpoint_observed_at_ms: u64,
+    evaluation: PaidCodingEvaluationEvidence,
+    evidence_digest: String,
+}
+
+impl VerifiedPaidEconomyAdmission {
+    pub(crate) fn provider_profile_id(&self) -> &str {
+        &self.provider_profile_id
+    }
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    pub(crate) fn canonical_model_id(&self) -> &str {
+        &self.canonical_model_id
+    }
+    pub(crate) fn endpoint_id(&self) -> &str {
+        &self.endpoint_id
+    }
+    pub(crate) fn max_input_tokens_per_call(&self) -> u64 {
+        self.max_input_tokens_per_call
+    }
+    pub(crate) fn max_output_tokens_per_call(&self) -> u64 {
+        self.evaluation.max_output_tokens_per_call
+    }
+    pub(crate) fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    /// Match the opaque evaluation/privacy proof to the caller's explicit paid
+    /// policy. The policy still supplies every cost/call/token/time ceiling.
+    pub(crate) fn validates_policy(
+        &self,
+        provider_profile_id: &str,
+        policy: &crate::paid_gateway::PaidModelPolicy,
+        runtime_identity_fingerprint: &str,
+        now_ms: u64,
+    ) -> bool {
+        if provider_profile_id != self.provider_profile_id
+            || policy.provider_id != self.provider_profile_id
+            || policy.model_id != self.model_id
+            || policy.runtime_id != "aider"
+            || !matches!(policy.mode, crate::paid_gateway::GatewayMode::Paid)
+            || policy.max_calls == 0
+            || policy.max_cost_micros == 0
+            || policy.model_context_window_tokens != self.context_tokens
+            || policy.max_input_tokens_per_call.is_none_or(|cap| {
+                cap == 0
+                    || cap > self.max_input_tokens_per_call
+                    || cap.checked_add(policy.max_output_tokens_per_call)
+                        .is_none_or(|sum| sum > self.context_tokens)
+                    || self.max_prompt_tokens.is_some_and(|prompt| cap > prompt)
+            })
+            || policy.max_output_tokens_per_call == 0
+        || policy.max_output_tokens_per_call > self.max_completion_tokens
+            || policy.max_output_tokens_per_call > self.evaluation.max_output_tokens_per_call
+            || policy.max_output_tokens_per_call > self.context_tokens
+            || runtime_identity_fingerprint != self.runtime_identity_fingerprint
+            || policy.endpoint_pin.as_ref().is_none_or(|pin| {
+                pin.endpoint_id != self.endpoint_id
+                    || pin.canonical_model_id != self.canonical_model_id
+            })
+            || policy.pricing.input_price_micros_per_1m != self.endpoint_input_micros_per_1m
+            || policy.pricing.output_price_micros_per_1m != self.endpoint_output_micros_per_1m
+            || policy.pricing.request_fee_micros != 0
+            || policy.pricing.source != "OpenRouter authenticated model endpoint"
+            || policy.model_catalog_pricing.as_ref().is_none_or(|catalog| {
+                catalog.input_price_micros_per_1m != self.catalog_input_micros_per_1m
+                    || catalog.output_price_micros_per_1m != self.catalog_output_micros_per_1m
+                    || catalog.source != "OpenRouter authenticated user model catalog"
+            })
+            || !reviewed_paid_endpoint_policy_matches(
+                &self.model_id,
+                &self.canonical_model_id,
+                &self.endpoint_id,
+                now_ms,
+            )
+            || self.evaluation.evaluated_at_ms > now_ms
+            || now_ms.saturating_sub(self.evaluation.evaluated_at_ms) > MAX_EVIDENCE_AGE_MS
+            || self.endpoint_observed_at_ms > now_ms
+            || now_ms.saturating_sub(self.endpoint_observed_at_ms) > 24 * 60 * 60 * 1000
+            || self.catalog_observed_at_ms > now_ms
+            || now_ms.saturating_sub(self.catalog_observed_at_ms) > 24 * 60 * 60 * 1000
+        {
+            return false;
+        }
+        self.evaluation.model_id == self.model_id
+            && self.evaluation.canonical_model_id == self.canonical_model_id
+            && self.evaluation.endpoint_tag == self.endpoint_id
+            && self.evaluation.runtime_id == "aider"
+            && self.evaluation.runtime_version == self.runtime_version
+            && self.evaluation.passed == 3
+            && self.evaluation.cases == 3
+            && self.request_fee_micros.is_none_or(|fee| fee == 0)
+            && policy.pricing.observed_at_ms == self.endpoint_observed_at_ms
+            && policy.model_catalog_pricing.as_ref().is_some_and(|catalog| {
+                catalog.observed_at_ms == self.catalog_observed_at_ms
+            })
+            && policy.endpoint_pin.as_ref().is_some_and(|pin| pin.requires_tools)
+            && self.max_prompt_tokens.is_none_or(|cap| cap >= 16_384)
+            && self.evaluation.guard_source_sha256 == paid_aider_guard_source_sha256()
+            && is_sha256(&self.evidence_digest)
+    }
+}
+
 /// This type intentionally has private fields and no serde implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedEconomyAdmission {
@@ -2061,6 +2827,7 @@ impl VerifiedEconomyAdmission {
             model_id: self.model_id.clone(),
             runtime_id: self.runtime_id.clone(),
             model_context_window_tokens: self.context_tokens,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: self.max_output_tokens_per_call,
             max_calls: self.max_calls,
             max_cost_micros: 0,
@@ -2326,9 +3093,204 @@ fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn is_runtime_identity_fingerprint(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paid_deepseek_fixture(now_ms: u64) -> (
+        crate::providers::OpenRouterModel,
+        crate::provider_observations::OpenRouterPaidEndpointMetadata,
+    ) {
+        let model = crate::providers::OpenRouterModel {
+            id: "deepseek/deepseek-v4.1-flash".into(),
+            canonical_slug: Some("deepseek/deepseek-v4.1-flash-20260910".into()),
+            name: "DeepSeek V4.1 Flash".into(),
+            context_length: Some(1_048_576),
+            prompt_price: Some("0.00000000273".into()),
+            completion_price: Some("0.000000278".into()),
+            input_modalities: Some(vec!["text".into()]),
+            output_modalities: Some(vec!["text".into()]),
+            supported_parameters: Some(vec!["max_tokens".into(), "tools".into(), "tool_choice".into()]),
+        };
+        let endpoint = crate::providers::OpenRouterEndpoint {
+            model_id: "deepseek/deepseek-v4.1-flash-20260910".into(),
+            tag: "parasail/fp8".into(),
+            context_length: Some(1_048_576),
+            max_prompt_tokens: None,
+            max_completion_tokens: Some(943_718),
+            prompt_price: Some("0.0000003".into()),
+            completion_price: Some("0.0000012".into()),
+            request_price: None,
+            additional_pricing: BTreeMap::from([
+                ("input_cache_read".into(), Some("0.00000003".into())),
+                ("input_cache_write".into(), Some("0.0000003".into())),
+            ]),
+            pricing_discount: Some("0".into()),
+            pricing_overrides_present: false,
+            status: Some(0),
+            zdr: None,
+            supported_parameters: Some(vec!["max_tokens".into(), "tools".into(), "tool_choice".into()]),
+        };
+        (
+            model.clone(),
+            crate::provider_observations::OpenRouterPaidEndpointMetadata {
+                model,
+                endpoints: vec![endpoint],
+                zdr_endpoints: BTreeSet::from([(
+                    "deepseek/deepseek-v4.1-flash-20260910".into(),
+                    "parasail/fp8".into(),
+                )]),
+                runtime_version: "0.86.2".into(),
+                runtime_identity_fingerprint: "a".repeat(32),
+                observed_at_ms: now_ms as u128,
+            },
+        )
+    }
+
+    #[test]
+    fn embedded_paid_evaluation_bundle_hash_and_case_proofs_validate() {
+        assert_eq!(
+            paid_economy_results_digest(PAID_ECONOMY_RESULTS_JSON),
+            PAID_ECONOMY_RESULTS_SHA256
+        );
+        let evidence = trusted_paid_evaluation("aider", "0.86.2", 1_793_221_100_000).unwrap();
+        assert_eq!((evidence.cases, evidence.passed), (3, 3));
+        assert_eq!(evidence.max_input_tokens_per_call, 16_384);
+        assert_eq!(evidence.max_output_tokens_per_call, 8_192);
+        assert_eq!(evidence.guard_source_sha256, paid_aider_guard_source_sha256());
+    }
+
+    #[test]
+    fn paid_status_uses_current_exact_endpoint_and_reports_tested_bounds() {
+        let now = 1_793_221_100_000;
+        let (model, metadata) = paid_deepseek_fixture(now);
+        let models = vec![model];
+        let paid = BTreeMap::from([(metadata.model.id.clone(), metadata)]);
+        let status = statuses_from_catalog(
+            "openrouter-main",
+            &"a".repeat(32),
+            &models,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            1_793_220_767_988,
+            &paid,
+            "aider",
+            "0.86.2",
+            now,
+        ).into_iter().find(|row| row.model_id == "deepseek/deepseek-v4.1-flash").unwrap();
+        assert_eq!(status.choice_kind, EconomyChoiceKind::PaidEndpoint);
+        assert_eq!(status.evaluation_status, EvidenceStatus::Passed);
+        assert_eq!((status.evaluation_passed, status.evaluation_cases), (3, 3));
+        assert_eq!(status.endpoint_id.as_deref(), Some("parasail/fp8"));
+        assert_eq!(status.endpoint_cache_write_price_micros_per_1m, Some(300_000));
+        assert_eq!(status.endpoint_cache_read_price_micros_per_1m, Some(30_000));
+        assert_eq!(status.evaluated_max_input_tokens_per_call, Some(16_384));
+        assert_eq!(status.evaluated_max_output_tokens_per_call, Some(8_192));
+        assert_eq!(status.evaluated_max_seconds_per_task, Some(120));
+        assert!(status.endpoint_fresh);
+        assert!(status.selectable, "only the shared validator may set selectable");
+        assert!(!status.current_zero_priced);
+    }
+
+    #[test]
+    fn paid_admission_rehydrates_from_snapshot_with_real_runtime_fingerprint() {
+        use crate::provider_observations::{
+            Observation, ProviderModelObservation, ProviderObservation, ProviderObservationStore,
+        };
+        use crate::providers::{ModelProfile, ProviderKind, ProviderProfile};
+        use crate::routing::BillingPolicy;
+        use crate::settings::Settings;
+
+        let folder = tempfile::tempdir().unwrap();
+        let executable = folder.path().join("aider.exe");
+        std::fs::write(&executable, b"synthetic executable identity").unwrap();
+        let model_id = "deepseek/deepseek-v4.1-flash";
+        let mut settings = Settings::default();
+        settings.project_root = folder.path().to_string_lossy().into_owned();
+        settings.providers = vec![ProviderProfile {
+            id: "openrouter-rehydration-fixture".into(),
+            kind: ProviderKind::OpenRouter,
+            name: "OpenRouter fixture".into(),
+            executable: executable.to_string_lossy().into_owned(),
+            endpoint: None,
+            secret_ref: None,
+            models: vec![ModelProfile {
+                id: model_id.into(),
+                name: "DeepSeek V4.1 Flash".into(),
+                reasoning_efforts: Vec::new(),
+                context_window_tokens: Some(1_048_576),
+                supports_tools: Some(true),
+                quality_rating: None,
+            }],
+        }];
+        let runtime_identity_fingerprint = crate::providers::runtime_identity_fingerprint(
+            &settings.providers[0],
+        )
+        .unwrap();
+        assert_eq!(runtime_identity_fingerprint.len(), 32);
+        let now = crate::usage::now_ms();
+        let now_u64 = u64::try_from(now).unwrap();
+        let (model, mut paid_metadata) = paid_deepseek_fixture(now_u64);
+        paid_metadata.runtime_identity_fingerprint = runtime_identity_fingerprint.clone();
+        let observed_at = now;
+        let provider = ProviderObservation {
+            provider_id: settings.providers[0].id.clone(),
+            kind: ProviderKind::OpenRouter,
+            runtime_identity_fingerprint: runtime_identity_fingerprint.clone(),
+            runtime_installed: Observation::known(true, "configured-executable-inspection", observed_at),
+            authenticated: Observation::known(true, "authenticated-model-observation", observed_at),
+            healthy: Observation::known(true, "authenticated-model-observation", observed_at),
+            health_checked_at_ms: Some(observed_at),
+            models: vec![ProviderModelObservation {
+                model_id: model_id.into(),
+                model_available: Observation::known(true, "authenticated-model-observation", observed_at),
+                context_tokens: Observation::known(1_048_576, "authenticated-model-observation", observed_at),
+                supports_tools: Observation::known(true, "authenticated-model-observation", observed_at),
+                local_only: Observation::known(false, "provider-classification", observed_at),
+                billing: Observation::known(BillingPolicy::Paid, "authenticated-model-observation", observed_at),
+                input_micros_per_million_tokens: Observation::known(2_730, "authenticated-model-observation", observed_at),
+                output_micros_per_million_tokens: Observation::known(278_000, "authenticated-model-observation", observed_at),
+                pricing_source: Observation::known(
+                    "OpenRouter authenticated user model catalog".into(),
+                    "authenticated-model-observation",
+                    observed_at,
+                ),
+                pricing_verified_at_ms: Some(observed_at),
+                economy_metadata: None,
+                paid_endpoint_metadata: Some(paid_metadata),
+            }],
+        };
+        let data_root = folder.path().join("runner-data");
+        let snapshot = crate::provider_observations::seal_snapshot(
+            &settings,
+            observed_at,
+            vec![provider],
+        )
+        .unwrap();
+        crate::provider_observations::persist_snapshot(&data_root, &snapshot).unwrap();
+
+        let persisted = ProviderObservationStore::open_read_only(&data_root)
+            .unwrap()
+            .snapshot(&settings, now)
+            .unwrap();
+        let facts = persisted
+            .candidate_facts(&settings, now, 5 * 60 * 1000)
+            .unwrap();
+        let fact = facts
+            .iter()
+            .find(|fact| fact.provider_id == settings.providers[0].id && fact.model_id == model_id)
+            .unwrap();
+        assert!(fact.evidence_ready, "provider observations should be fresh and complete: {fact:#?}");
+        assert!(fact.paid_economy_admission.is_some(),
+            "the exact executable fingerprint and embedded 3/3 result bundle should rehydrate the backend proof: {fact:#?}");
+    }
 
     #[test]
     fn paid_endpoint_policy_is_exact_fresh_and_records_processing_scope() {
@@ -2472,19 +3434,32 @@ mod tests {
             .collect::<Vec<_>>();
         let statuses = statuses_from_catalog(
             "openrouter",
+            &"0".repeat(64),
             &models,
             &BTreeMap::new(),
             &BTreeSet::new(),
             1_793_059_200_000,
+            &BTreeMap::new(),
             "aider",
             "0.86.2",
             1_793_059_200_000,
         );
-        assert_eq!(statuses.len(), 3);
-        assert!(statuses
+        assert_eq!(statuses.len(), 4);
+        let free_statuses = statuses
+            .iter()
+            .filter(|status| status.choice_kind == EconomyChoiceKind::Free)
+            .collect::<Vec<_>>();
+        assert_eq!(free_statuses.len(), 3);
+        assert!(free_statuses
             .iter()
             .all(|status| status.evaluation_status == EvidenceStatus::Failed));
-        assert!(statuses.iter().all(|status| !status.selectable));
+        assert!(free_statuses.iter().all(|status| !status.selectable));
+        let paid_status = statuses
+            .iter()
+            .find(|status| status.model_id == "deepseek/deepseek-v4.1-flash")
+            .expect("the separate reviewed paid endpoint row remains visible");
+        assert_eq!(paid_status.choice_kind, EconomyChoiceKind::PaidEndpoint);
+        assert!(!paid_status.selectable, "missing live metadata cannot select the paid row");
         let laguna = statuses
             .iter()
             .find(|status| status.model_id == "poolside/laguna-s-2.1:free")
@@ -2495,7 +3470,7 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("multi-file")));
-        for status in statuses
+        for status in free_statuses
             .iter()
             .filter(|status| status.model_id.starts_with("nvidia/"))
         {
@@ -2508,10 +3483,12 @@ mod tests {
         }
         let stale = statuses_from_catalog(
             "openrouter",
+            &"0".repeat(64),
             &models,
             &BTreeMap::new(),
             &BTreeSet::new(),
             1_793_059_200_000,
+            &BTreeMap::new(),
             "aider",
             "0.86.3",
             1_793_059_200_000,

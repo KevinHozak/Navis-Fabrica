@@ -38,7 +38,7 @@ import {
   RoutingComplexity,
   RoutingPace,
 } from "./settings";
-import { EconomyModelStatus, EconomyStatusResponse, formatEconomyEvidenceDate, getEconomyModelStatuses } from "./economyModels";
+import { EconomyModelStatus, EconomyStatusResponse, defaultModelId, formatEconomyEvidenceDate, getEconomyModelStatuses, isSelectableEconomyChoice, paidEconomyChoiceLabel } from "./economyModels";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -61,30 +61,73 @@ function evaluationSummary(model: EconomyModelStatus): string {
   return `${evaluationLabel(model.evaluationStatus)}${count} · ${evaluatedOn} · Aider ${version}${current}`;
 }
 
-function isKnownFreeChoice(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined, probe: OpenRouterProbe | undefined): boolean {
+function requiresEconomyEligibility(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined, probe: OpenRouterProbe | undefined): boolean {
   if (provider.kind !== "openRouter") return false;
   const normalizedId = modelId.trim().toLowerCase();
   if (normalizedId === "openrouter/free" || normalizedId === "openrouter/auto" || normalizedId.endsWith("/free") || normalizedId.endsWith("/auto")) return true;
   if (modelId.endsWith(":free")) return true;
   const status = statuses?.models.find((item) => item.modelId === modelId);
-  if (status) return true;
+  if (status?.choiceKind === "free") return true;
   const catalogModel = probe?.models.find((item) => item.id === modelId);
   const hasZeroPrice = [catalogModel?.promptPrice, catalogModel?.completionPrice].some((price) => price !== null && price !== undefined && Number.isFinite(Number(price)) && Number(price) === 0);
   return hasZeroPrice;
 }
 
 function canSelectModel(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined, probe: OpenRouterProbe | undefined): boolean {
-  if (!isKnownFreeChoice(provider, modelId, statuses, probe)) return true;
+  if (!requiresEconomyEligibility(provider, modelId, statuses, probe)) return true;
   const status = statuses?.models.find((item) => item.modelId === modelId);
-  return status?.selectable === true && status.catalogPresent && status.catalogFresh && status.currentZeroPriced;
+  return status?.providerId === provider.id && isSelectableEconomyChoice(status);
 }
 
-function blockedModelReason(provider: ProviderProfile, modelId: string): string {
+function canSelectRoutingOverride(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined, probe: OpenRouterProbe | undefined, pace: RoutingPace): boolean {
+  if (!canSelectModel(provider, modelId, statuses, probe)) return false;
+  if (pace !== "economy" || provider.kind !== "openRouter") return true;
+  const status = statuses?.models.find((item) => item.providerId === provider.id && item.modelId === modelId);
+  return isSelectableEconomyChoice(status);
+}
+
+function blockedModelReason(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined): string {
   const normalizedId = modelId.trim().toLowerCase();
   if (provider.kind === "openRouter" && (normalizedId === "openrouter/free" || normalizedId === "openrouter/auto" || normalizedId.endsWith("/free") || normalizedId.endsWith("/auto"))) {
     return "OpenRouter router IDs are not fixed models and cannot be selected.";
   }
+  const status = statuses?.models.find((item) => item.modelId === modelId);
+  if (status?.choiceKind === "paidEndpoint") return "Paid endpoint eligibility is not current. Check Economy status; an actual run also needs its own explicit paid budget.";
   return "Saved choice is blocked by current Economy eligibility. Check Economy status for its evaluation and catalog reason; the saved selection is preserved.";
+}
+
+function modelOptionSuffix(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined, probe: OpenRouterProbe | undefined): string {
+  const normalizedId = modelId.trim().toLowerCase();
+  if (provider.kind === "openRouter" && (normalizedId === "openrouter/free" || normalizedId === "openrouter/auto" || normalizedId.endsWith("/free") || normalizedId.endsWith("/auto"))) return " · router";
+  const status = statuses?.models.find((item) => item.modelId === modelId && item.providerId === provider.id);
+  if (status?.choiceKind === "paidEndpoint") return paidEconomyChoiceLabel(status);
+  if (requiresEconomyEligibility(provider, modelId, statuses, probe)) return canSelectModel(provider, modelId, statuses, probe) ? " · Economy" : " · not eligible";
+  return "";
+}
+
+function routingOverrideSuffix(provider: ProviderProfile, modelId: string, statuses: EconomyStatusResponse | undefined, probe: OpenRouterProbe | undefined, pace: RoutingPace): string {
+  if (pace === "economy" && provider.kind === "openRouter" && !canSelectRoutingOverride(provider, modelId, statuses, probe, pace)) return " · Economy evidence required";
+  return modelOptionSuffix(provider, modelId, statuses, probe);
+}
+
+function microsAsUsd(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? "unknown" : `$${(value / 1_000_000).toFixed(6)} USD`;
+}
+
+function economyChoiceDetails(model: EconomyModelStatus): string {
+  const evaluation = evaluationSummary(model);
+  const privacy = `${model.privacyStatus} · ${model.privacySource ?? "source not recorded"} · ${formatEconomyEvidenceDate(model.privacyObservedAtMs)}`;
+  if (model.choiceKind === "paidEndpoint") {
+    const requestFee = model.endpointRequestFeeMicros === null
+      ? "request fee unknown · gateway ceiling $0"
+      : `request fee ${microsAsUsd(model.endpointRequestFeeMicros)}`;
+    const cachePricing = `cache read ${model.endpointCacheReadPriceMicrosPer1m ?? "unknown"} · cache write ${model.endpointCacheWritePriceMicrosPer1m ?? "unknown"} · cache write 1h ${model.endpointCacheWrite1hPriceMicrosPer1m ?? "unknown"} μUSD/1M`;
+    const testedBounds = `tested cap ${model.evaluatedMaxInputTokensPerCall ?? "unknown"} input/${model.evaluatedMaxOutputTokensPerCall ?? "unknown"} output tokens per call · ${model.evaluatedMaxSecondsPerTask ?? "unknown"}s per task`;
+    const pricingOverrides = model.endpointPricingOverridesPresent ? "endpoint pricing overrides present" : "no endpoint pricing overrides observed";
+    const paidChoiceEligible = isSelectableEconomyChoice(model);
+    return `${model.modelId} · Paid endpoint ${model.endpointId ?? "unknown"} · catalog ${model.catalogPresent ? model.catalogFresh ? "fresh" : "stale" : "removed"} ${model.inputPriceMicrosPer1m ?? "unknown"}/${model.outputPriceMicrosPer1m ?? "unknown"} μUSD/1M (${model.catalogPricingSource ?? "source unknown"} · ${formatEconomyEvidenceDate(model.catalogPricingObservedAtMs)}) · endpoint ${model.endpointFresh ? "fresh" : model.endpointObservedAtMs === null ? "unknown" : "stale"} ${model.endpointInputPriceMicrosPer1m ?? "unknown"}/${model.endpointOutputPriceMicrosPer1m ?? "unknown"} μUSD/1M (${model.endpointPricingSource ?? "source unknown"} · ${formatEconomyEvidenceDate(model.endpointObservedAtMs)}) · ${cachePricing} · ${pricingOverrides} · context ${model.endpointContextTokens ?? "unknown"} · prompt cap ${model.endpointMaxPromptTokens ?? "unknown"} · completion cap ${model.endpointMaxCompletionTokens ?? "unknown"} · ${testedBounds} · estimated max ${microsAsUsd(model.estimatedMaxCostMicrosPerCall)}/call · ${requestFee} · evaluation ${evaluation} · privacy ${privacy} · ${paidChoiceEligible ? "eligible · paid budget required for a run" : "not selectable"}`;
+  }
+  return `${model.modelId} · Free · catalog ${model.catalogPresent ? model.catalogFresh ? "present and fresh" : "present, stale" : "removed"} · context ${model.currentContextTokens ?? model.contextTokens ?? "unknown"} · input ${model.inputPriceMicrosPer1m ?? "unknown"} μUSD/1M · output ${model.outputPriceMicrosPer1m ?? "unknown"} μUSD/1M · evaluation ${evaluation} · privacy ${privacy} · ${model.selectable ? "eligible choice" : "not selectable"}`;
 }
 
 const executableDefaults: Record<ProviderKind, string> = {
@@ -512,17 +555,22 @@ export function ProvidersPanel() {
           <label className="settings-field" htmlFor="selected-provider"><span>Provider</span>
             <select id="selected-provider" value={settings.providerSelection.providerId ?? ""} onChange={(event) => {
               const profile = settings.providers.find((item) => item.id === event.target.value);
-              const firstUsable = profile?.models.find((model) => canSelectModel(profile, model.id, economyStatuses[profile.id], openRouterProbes[profile.id]));
-              updateSelection({ providerId: profile?.id ?? null, modelId: firstUsable?.id ?? null, reasoningEffort: null, runtimeId: settings.providerSelection.runtimeId });
+              const firstUsableId = profile ? defaultModelId(
+                profile.models.map((model) => model.id),
+                economyStatuses[profile.id]?.models.filter((status) => status.providerId === profile.id),
+                (id) => canSelectModel(profile, id, economyStatuses[profile.id], openRouterProbes[profile.id]),
+              ) : null;
+              updateSelection({ providerId: profile?.id ?? null, modelId: firstUsableId, reasoningEffort: null, runtimeId: settings.providerSelection.runtimeId });
             }}>
               <option value="">Choose a configured provider</option>{settings.providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
             </select>
           </label>
           <label className="settings-field" htmlFor="selected-model"><span>Model</span>
             <select id="selected-model" disabled={!selectedProvider} value={settings.providerSelection.modelId ?? ""} onChange={(event) => updateSelection({ ...settings.providerSelection, modelId: event.target.value || null, reasoningEffort: null })}>
-              <option value="">{selectedProvider?.kind === "ollama" ? "Discover and choose an eligible model" : "Choose a manual model profile"}</option>{selectedProvider?.models.map((model) => <option key={model.id} value={model.id} disabled={!canSelectModel(selectedProvider, model.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id])}>{model.name}{canSelectModel(selectedProvider, model.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id]) ? "" : " · not eligible"}</option>)}
+              <option value="">{selectedProvider?.kind === "ollama" ? "Discover and choose an eligible model" : "Choose a manual model profile"}</option>{selectedProvider?.models.map((model) => <option key={model.id} value={model.id} disabled={!canSelectModel(selectedProvider, model.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id])}>{model.name}{modelOptionSuffix(selectedProvider, model.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id])}</option>)}
             </select>
-            {selectedProvider && selectedModel && !canSelectModel(selectedProvider, selectedModel.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id]) && <small role="status">{blockedModelReason(selectedProvider, selectedModel.id)}</small>}
+            {selectedProvider && selectedModel && !canSelectModel(selectedProvider, selectedModel.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id]) && <small role="status">{blockedModelReason(selectedProvider, selectedModel.id, economyStatuses[selectedProvider.id])}</small>}
+            {selectedProvider && selectedModel && economyStatuses[selectedProvider.id]?.models.find((item) => item.modelId === selectedModel.id)?.choiceKind === "paidEndpoint" && canSelectModel(selectedProvider, selectedModel.id, economyStatuses[selectedProvider.id], openRouterProbes[selectedProvider.id]) && <small role="status">Paid endpoint choice. A run still needs a separate explicit paid budget and call, token, and time caps.</small>}
           </label>
           <label className="settings-field" htmlFor="reasoning-effort"><span>Reasoning effort</span>
             <select id="reasoning-effort" disabled={!selectedModel} value={settings.providerSelection.reasoningEffort ?? ""} onChange={(event) => updateSelection({ ...settings.providerSelection, reasoningEffort: event.target.value || null })}>
@@ -551,7 +599,7 @@ export function ProvidersPanel() {
         <div className="provider-inline-fields">
           <label className="settings-field"><span>Task complexity</span><select value={routingComplexity} onChange={(event) => { setRoutingComplexity(event.target.value as RoutingComplexity); invalidateRoutingDecision(); }}><option value="simple">Simple · 8k context floor</option><option value="standard">Standard · 16k context floor</option><option value="complex">Complex · 32k context floor</option></select></label>
           <label className="settings-field"><span>Pace preference</span><select value={routingPace} onChange={(event) => { setRoutingPace(event.target.value as RoutingPace); invalidateRoutingDecision(); }}><option value="fast">Fast · recent latency first</option><option value="balanced">Balanced · quality, quota, latency</option><option value="thorough">Thorough · quality and reasoning</option><option value="economy">Economy · fresh spend and quota</option></select></label>
-          <label className="settings-field"><span>Manual override</span><select value={manualRoute} onChange={(event) => { setManualRoute(event.target.value); invalidateRoutingDecision(); }}><option value="">Automatic recommendation</option>{settings.providers.flatMap((provider) => provider.models.map((model) => <option key={`${provider.id}/${model.id}`} value={JSON.stringify([provider.id, model.id])} disabled={!canSelectModel(provider, model.id, economyStatuses[provider.id], openRouterProbes[provider.id])}>{provider.name} · {model.name}{canSelectModel(provider, model.id, economyStatuses[provider.id], openRouterProbes[provider.id]) ? "" : ` · ${provider.kind === "openRouter" && (model.id.toLowerCase().endsWith("/free") || model.id.toLowerCase().endsWith("/auto")) ? "router" : "not eligible"}`}</option>))}</select></label>
+          <label className="settings-field"><span>Manual override</span><select value={manualRoute} onChange={(event) => { setManualRoute(event.target.value); invalidateRoutingDecision(); }}><option value="">Automatic recommendation</option>{settings.providers.flatMap((provider) => provider.models.map((model) => <option key={`${provider.id}/${model.id}`} value={JSON.stringify([provider.id, model.id])} disabled={!canSelectRoutingOverride(provider, model.id, economyStatuses[provider.id], openRouterProbes[provider.id], routingPace)}>{provider.name} · {model.name}{routingOverrideSuffix(provider, model.id, economyStatuses[provider.id], openRouterProbes[provider.id], routingPace)}</option>))}</select></label>
           <label className="settings-field"><span>Desired completion time (minutes)</span><input type="number" min="1" max="1440" value={desiredMinutes} onChange={(event) => { setDesiredMinutes(event.target.value); invalidateRoutingDecision(); }} placeholder="Optional" /><small>A preference only; task completion is not guaranteed.</small></label>
           <label className="routing-checkbox"><input type="checkbox" checked={routingRequireTools} onChange={(event) => { setRoutingRequireTools(event.target.checked); invalidateRoutingDecision(); }} /> Require known tool support</label>
           <label className="routing-checkbox"><input type="checkbox" checked={routingLocalOnly} onChange={(event) => { setRoutingLocalOnly(event.target.checked); invalidateRoutingDecision(); }} /> Local-only privacy</label>
@@ -639,13 +687,13 @@ export function ProvidersPanel() {
               <div className="settings-actions"><button className="button button-secondary" type="button" disabled={!desktop || !openRouterKeys[provider.id]?.trim() || probingId === provider.id} onClick={() => { void saveOpenRouterKey(provider.id); }}>Save key securely</button><button className="button button-secondary" type="button" disabled={!desktop || !provider.secretRef || probingId === provider.id} onClick={() => { void discoverOpenRouterModels(provider.id); }}>{probingId === provider.id ? "Checking OpenRouter…" : "Discover models"}</button><button className="button button-secondary" type="button" disabled={!desktop || !provider.secretRef || probingId === provider.id} onClick={() => { void checkEconomyStatus(provider.id); }}>{probingId === provider.id ? "Checking…" : "Check Economy status"}</button></div>
               {openRouterProbes[provider.id] && <div className="provider-feedback" role="status"><strong>{openRouterProbes[provider.id].state}</strong> · {openRouterProbes[provider.id].note}<ul>{openRouterProbes[provider.id].models.slice(0, 100).map((model) => <li key={model.id}>{model.name} ({model.id}) · context {model.contextLength ?? "unknown"} · prompt price {model.promptPrice ?? "unknown"} · completion price {model.completionPrice ?? "unknown"} · input {model.inputModalities?.join(", ") ?? "unknown"} · output {model.outputModalities?.join(", ") ?? "unknown"} · parameters {model.supportedParameters?.join(", ") ?? "unknown"}</li>)}</ul></div>}
               {(economyStatuses[provider.id] || economyStatusErrors[provider.id]) && <div className="provider-feedback" role="status">
-                <strong>Economy coding choices</strong>
+                <strong>Economy and paid endpoint choices</strong>
                 <p>Authenticated catalog · {economyStatuses[provider.id] ? `observed ${formatEconomyEvidenceDate(economyStatuses[provider.id].catalogObservedAtMs)}` : "catalog unavailable"} · {economyStatuses[provider.id]?.freeModelDailyRequests ? `daily requests ${economyStatuses[provider.id].freeModelDailyRequests!.used} used · ${economyStatuses[provider.id].freeModelDailyRequests!.remaining} remaining of ${economyStatuses[provider.id].freeModelDailyRequests!.limit} (observed ${formatEconomyEvidenceDate(economyStatuses[provider.id].freeModelDailyRequests!.observedAtMs)})` : "account daily quota unknown"}</p>
                 {economyStatusErrors[provider.id] && <p>{economyStatusErrors[provider.id]}</p>}
                 {economyStatuses[provider.id]?.models.length ? <ul>{economyStatuses[provider.id].models.map((model) => <li key={model.modelId}>
-                  {model.modelId} · catalog {model.catalogPresent ? model.catalogFresh ? "present and fresh" : "present, stale" : "removed"} · context {model.currentContextTokens ?? model.contextTokens ?? "unknown"} · input {model.inputPriceMicrosPer1m ?? "unknown"} μUSD/1M · output {model.outputPriceMicrosPer1m ?? "unknown"} μUSD/1M · evaluation {evaluationSummary(model)} · privacy {model.privacyStatus} · source {model.privacySource ?? "not recorded"} · observed {formatEconomyEvidenceDate(model.privacyObservedAtMs)} · {model.selectable ? "eligible choice" : "not selectable"}
+                  {economyChoiceDetails(model)}
                   {model.reasons.length > 0 && <small> · {model.reasons.join(" ")}</small>}
-                </li>)}</ul> : economyStatuses[provider.id] ? <p>No tested or current free/zero-priced models were returned.</p> : null}
+                </li>)}</ul> : economyStatuses[provider.id] ? <p>No reviewed Economy choices were returned.</p> : null}
                 <details><summary>Published free-tier limits</summary><p>20 requests/minute; 50/day below 10 lifetime credits or 1,000/day from 9 credits (rounding allowance). Account limits can differ; the authenticated daily counter is shown when available.</p><a href="https://openrouter.ai/docs/api_reference/limits" target="_blank" rel="noreferrer">OpenRouter limits · checked 2026-10-27</a></details>
               </div>}
             </div>}

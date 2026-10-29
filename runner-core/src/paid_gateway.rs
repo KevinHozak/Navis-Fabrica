@@ -63,6 +63,10 @@ pub struct PaidModelPolicy {
     /// Verified model input context. Each call reserves this entire input
     /// envelope plus the configured output maximum.
     pub model_context_window_tokens: u64,
+    /// Optional tighter per-call input ceiling. When absent, preserve legacy
+    /// paid behavior; Economy qualification requires an explicit cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens_per_call: Option<u64>,
     pub max_output_tokens_per_call: u64,
     pub max_calls: u32,
     /// Parent run's maximum spend; child calls must collectively remain under it.
@@ -243,6 +247,21 @@ impl PaidGateway {
         upstream_url: String,
     ) -> Result<Self, PaidGatewayError> {
         Self::bind_to_upstream_inner(config, budgets, upstream_url, Some(Arc::new(|| true)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_to_upstream_with_endpoint_validation_fixture(
+        config: PaidGatewayConfig,
+        budgets: BudgetStore,
+        upstream_url: String,
+        validate: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Self, PaidGatewayError> {
+        if !upstream_url.starts_with("http://127.0.0.1:") {
+            return Err(PaidGatewayError::Invalid(
+                "test upstream must be an explicit loopback HTTP listener",
+            ));
+        }
+        Self::bind_to_upstream_inner(config, budgets, upstream_url, Some(validate))
     }
 
     fn bind_to_upstream_inner(
@@ -641,8 +660,18 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
             "synthetic trial exceeds its 120-second task limit",
         ));
     }
-    let call_tokens = p
-        .model_context_window_tokens
+    let input_tokens = call_input_token_ceiling(p);
+    if p.max_input_tokens_per_call.is_some_and(|cap| {
+        cap == 0
+            || cap > p.model_context_window_tokens
+            || cap.checked_add(p.max_output_tokens_per_call)
+                .is_none_or(|total| total > p.model_context_window_tokens)
+    }) {
+        return Err(PaidGatewayError::Invalid(
+            "input and output ceilings exceed the verified context window",
+        ));
+    }
+    let call_tokens = input_tokens
         .checked_add(p.max_output_tokens_per_call)
         .ok_or(PaidGatewayError::Invalid("token ceiling overflowed"))?;
     if call_tokens > i64::MAX as u64 {
@@ -655,7 +684,7 @@ fn validate_config(config: &PaidGatewayConfig) -> Result<(), PaidGatewayError> {
             "output ceiling exceeds the verified context window",
         ));
     }
-    let call_cost = worst_case_cost_micros(p, call_tokens)?;
+    let call_cost = worst_case_cost_micros(p)?;
     if call_cost > p.max_cost_micros {
         return Err(PaidGatewayError::Invalid(
             "one worst-case call exceeds the parent task cost ceiling",
@@ -699,8 +728,7 @@ fn validate_parent_matches(
         || parent.pricing_source.as_deref() != Some(p.pricing.source.as_str())
         || parent.pricing_verified_at_ms != Some(p.pricing.observed_at_ms)
         || parent.max_tokens
-            < p.model_context_window_tokens
-                .saturating_add(p.max_output_tokens_per_call)
+            < call_input_token_ceiling(p).saturating_add(p.max_output_tokens_per_call)
     {
         return Err(PaidGatewayError::Invalid(
             "parent reservation does not match the immutable paid model policy",
@@ -709,12 +737,9 @@ fn validate_parent_matches(
     Ok(())
 }
 
-fn worst_case_cost_micros(
-    policy: &PaidModelPolicy,
-    total_tokens: u64,
-) -> Result<u64, PaidGatewayError> {
+fn worst_case_cost_micros(policy: &PaidModelPolicy) -> Result<u64, PaidGatewayError> {
     let input_cost = ceil_div(
-        policy.model_context_window_tokens as u128
+        call_input_token_ceiling(policy) as u128
             * policy.pricing.input_price_micros_per_1m as u128,
         TOKENS_PER_MILLION,
     );
@@ -723,9 +748,14 @@ fn worst_case_cost_micros(
             * policy.pricing.output_price_micros_per_1m as u128,
         TOKENS_PER_MILLION,
     );
-    let _ = total_tokens;
     u64::try_from(input_cost + output_cost)
         .map_err(|_| PaidGatewayError::Invalid("computed call cost exceeds supported range"))
+}
+
+pub(crate) fn call_input_token_ceiling(policy: &PaidModelPolicy) -> u64 {
+    policy
+        .max_input_tokens_per_call
+        .unwrap_or(policy.model_context_window_tokens)
 }
 
 fn ceil_div(value: u128, divisor: u128) -> u128 {
@@ -916,17 +946,17 @@ fn forward_request(
             "free endpoint identity, price, status, context, or privacy eligibility changed",
         ));
     }
-    let call_tokens = policy
-        .model_context_window_tokens
+    let input_tokens = call_input_token_ceiling(policy);
+    let call_tokens = input_tokens
         .checked_add(policy.max_output_tokens_per_call)
         .ok_or((StatusCode::PAYLOAD_TOO_LARGE, "token ceiling is invalid"))?;
-    if u64::try_from(input_bytes).unwrap_or(u64::MAX) > policy.model_context_window_tokens {
+    if u64::try_from(input_bytes).unwrap_or(u64::MAX) > input_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            "request exceeds the verified model context",
+            "request exceeds the configured input ceiling",
         ));
     }
-    let call_cost = worst_case_cost_micros(policy, call_tokens).map_err(|_| {
+    let call_cost = worst_case_cost_micros(policy).map_err(|_| {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
             "call cost ceiling is invalid",
@@ -1198,7 +1228,7 @@ fn refresh_free_endpoint(shared: &Shared) -> bool {
                         output_price_ceiling_micros_per_1m: policy
                             .pricing
                             .output_price_micros_per_1m,
-                        input_tokens: policy.model_context_window_tokens,
+                        input_tokens: call_input_token_ceiling(policy),
                         output_tokens: policy.max_output_tokens_per_call,
                         requires_tools: pin.requires_tools,
                         model_catalog_input_micros_per_1m: policy
@@ -1449,7 +1479,16 @@ fn validate_and_cap_request(request: &mut Value, policy: &PaidModelPolicy) -> Re
     let bounded_input = prompt_bytes
         .checked_add(messages.len().saturating_mul(16))
         .ok_or(())?;
-    if bounded_input as u64 > policy.model_context_window_tokens {
+    let input_ceiling = policy
+        .max_input_tokens_per_call
+        .unwrap_or(policy.model_context_window_tokens);
+    if bounded_input as u64 > input_ceiling
+        || input_ceiling > policy.model_context_window_tokens
+        || policy.max_input_tokens_per_call.is_some_and(|cap| {
+            cap.checked_add(policy.max_output_tokens_per_call)
+                .is_none_or(|total| total > policy.model_context_window_tokens)
+        })
+    {
         return Err(());
     }
     for (key, low, high) in [
@@ -1663,6 +1702,7 @@ mod tests {
             model_id: "vendor/model-a".into(),
             runtime_id: "aider".into(),
             model_context_window_tokens: 1_000,
+            max_input_tokens_per_call: None,
             max_output_tokens_per_call: 100,
             max_calls: 3,
             max_cost_micros: 100_000,
@@ -1759,6 +1799,47 @@ mod tests {
         assert_eq!(request["provider"]["allow_fallbacks"], false);
         assert_eq!(request["data_collection"], "deny");
         assert_eq!(request["zdr"], true);
+    }
+
+    #[test]
+    fn explicit_input_cap_drives_gateway_request_and_worst_case_ceiling() {
+        let mut capped = policy(now_ms());
+        capped.model_context_window_tokens = 262_144;
+        capped.max_input_tokens_per_call = Some(16_384);
+        capped.max_output_tokens_per_call = 8_192;
+        capped.max_calls = 1;
+        capped.max_cost_micros = 14_747;
+        capped.pricing.input_price_micros_per_1m = 300_000;
+        capped.pricing.output_price_micros_per_1m = 1_200_000;
+
+        assert_eq!(call_input_token_ceiling(&capped), 16_384);
+        assert_eq!(
+            call_input_token_ceiling(&capped) + capped.max_output_tokens_per_call,
+            24_576
+        );
+        assert_eq!(worst_case_cost_micros(&capped).unwrap(), 14_747);
+
+        let request_within_cap = json!({
+            "model": "vendor/model-a",
+            "messages": [{"role": "user", "content": "x".repeat(16_368)}],
+            "max_tokens": 8_192
+        });
+        let mut request_within_cap = request_within_cap;
+        assert_eq!(
+            validate_and_cap_request(&mut request_within_cap, &capped).unwrap(),
+            16_384
+        );
+        let mut request_over_cap = json!({
+            "model": "vendor/model-a",
+            "messages": [{"role": "user", "content": "x".repeat(16_369)}],
+            "max_tokens": 8_192
+        });
+        assert!(validate_and_cap_request(&mut request_over_cap, &capped).is_err());
+
+        let mut legacy = capped;
+        legacy.max_input_tokens_per_call = None;
+        assert_eq!(call_input_token_ceiling(&legacy), 262_144);
+        assert_eq!(worst_case_cost_micros(&legacy).unwrap(), 88_475);
     }
 
     fn budget_store() -> (tempfile::TempDir, BudgetStore, String, u64) {

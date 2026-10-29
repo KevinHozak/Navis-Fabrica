@@ -1,0 +1,11 @@
+﻿# Optional Portal text helper — PORTAL-S012
+
+The standalone helper has one explicit optional Portal path. Existing tasks/provider profiles, Codex subscription defaults, optional Aider paid admission and jobs remain unchanged. No frontend/native application source, Tauri version or coding runner is modified by this integration.
+
+Use `scripts/model_helper.py run --task portal-extract` only with a protected `--portal-profile`, existing private `--config`, and persisted `--operation-id`/`--run-id`. The profile must select a separately reviewed Portal 0.2.1 release and bind the same existing helper ledger, exact policy commitment, scoped app-key reference and call/run ceilings. No active profile or key is shipped. Private mode and other helper composition/probe modes are refused for this first path. Denial, unavailability, cancellation, duplicate or unknown billing never invokes a direct OpenRouter/Ollama fallback.
+
+Portal owns authoritative provider accounting. Fabrica retains its same existing helper daily-cap ledger/history/unknown holds and adds a conservative `portal-reference` cap mirror, with globally unique operations and durable per-run limits. Do not sum that reference and Portal's charge as separate purchases. No old coding-run/pilot grant is imported, no historical ledger is replaced, and no cap is increased. Unknown work remains reserved; changing the operation ID to retry it is not authorized.
+
+The [Portal integration runbook](https://github.com/KevinHozak/Navis-Portal/blob/main/docs/fabrica-integration.md) owns the complete protected profile schema, offline commitment command, supported package/runtime, accounting semantics and rollout gates. Actual CLI/bootstrap subprocess tests run from Portal with a fake Portal/upstream, generated text and temporary dummy app credentials; a test-only socket guard denies non-loopback traffic. The existing Fabrica helper tests cover preserved default routes. Independent external review and live rollout are separate from this offline implementation.
+
+No model inference, real credential/policy/budget/ledger change, background service installation, app-default change or deployment is performed by adding this branch. Later live use still requires fresh exact endpoint/token/privacy/fee evidence and its own bounded paid authorization; old pilots do not carry over.

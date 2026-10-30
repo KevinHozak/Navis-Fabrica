@@ -539,6 +539,7 @@ function App() {
       </nav>
       <div className="toolbar-context" aria-live="polite">{title}</div>
       <nav className="toolbar-group toolbar-right" aria-label="Workspace tools">
+        <a className="toolbar-icon-button" href="#usage" title="Model Usage" aria-label="Model Usage"><BrowserIcon name="usage" /></a>
         <a className="toolbar-icon-button" href={route.projectId ? `#runs?project=${encodeURIComponent(route.projectId)}` : "#runs"} title="Activity" aria-label="Activity"><BrowserIcon name="activity" /></a>
         <a className="toolbar-icon-button" href="#settings" title="Settings" aria-label="Settings"><BrowserIcon name="settings" /></a>
       </nav>
@@ -547,7 +548,6 @@ function App() {
       <div className="route-layer" hidden={route.section !== "projects"}>
         {watchError && <p role="status">Automatic content updates are unavailable. Use Settings to refresh.</p>}
         {!desktop && <p className="scan-notice">Browser preview: native discovery and Git details require the desktop app.</p>}
-        <UsageDashboard active={route.section === "projects"} />
         <ProjectCollection projects={projects} onOpenProject={project => navigateToRoute({ section: "project", projectId: project.id })} onOpenChanges={project => navigateToRoute({ section: "changes", projectId: project.id })} onOpenBuild={project => navigateToRoute({ section: "build", projectId: project.id })} onOpenIssues={(project, type) => navigateToRoute({ section: "epics-stories", projectId: project.id, issueType: type })} onRefreshProject={path => { void beginAffectedRefresh([path]); }} refreshingPaths={refreshingPaths} refreshErrorPaths={refreshErrorPaths} refreshVersions={projectRefreshVersions} startupRefreshPending={startupRefreshPending} />
       </div>
       {visitedProjectIds.map(id => {
@@ -561,6 +561,7 @@ function App() {
         const active = isIssueRoute(route) && routeKey(issueRoute) === routeKey(route);
         return <div className="route-layer" hidden={!active} key={routeKey(issueRoute)}>{issueRoute.section === "epics-stories" && project ? <LocalIssuesPanel defaultPath={project.path} initialType={issueRoute.issueType ?? "epic"} autoLoad title={`${project.name} · Epics & Stories`} navigationKey={routeKey(issueRoute)} /> : issueRoute.section === "local-issues" ? <LocalIssuesPanel defaultPath={project?.path ?? projectRoot} navigationKey={routeKey(issueRoute)} /> : <section className="panel"><p>Select a project to browse epics and stories.</p><a href="#projects">Home</a></section>}</div>;
       })}
+      <div className="route-layer" hidden={route.section !== "usage"}><UsageDashboard active={route.section === "usage"} /></div>
       <div className="route-layer" hidden={route.section !== "batches"}><BatchRunnerPanel /></div>
       <div className={`route-layer${route.section === "runs" ? " activity-workspace" : ""}`} hidden={route.section !== "runs"}>{desktop ? <RunsPanel mode="activity" issue={null} project={selectedProject ?? undefined} /> : <section className="panel empty-state"><h2>Activity</h2><p>Run history is available in the desktop app.</p></section>}</div>
       <div className="route-layer settings-page" hidden={route.section !== "settings"}>

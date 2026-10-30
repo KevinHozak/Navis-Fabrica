@@ -311,7 +311,9 @@ fn collect(app: &AppHandle, query: Query, refresh: bool) -> Result<Report, Strin
         .join()
         .map_err(|_| "Could not read usage collection.")?;
     if read.is_err() || bytes.len() > LIMIT || !status.success() {
-        return Err("Usage collection failed. Check configured sources and private storage.".into());
+        return Err(
+            "Usage collection failed. Check configured sources and private storage.".into(),
+        );
     }
     let result: Report = serde_json::from_slice(&bytes)
         .map_err(|_| "Usage collector returned an incompatible schema.")?;

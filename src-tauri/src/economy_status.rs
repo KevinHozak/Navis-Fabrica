@@ -54,8 +54,9 @@ pub async fn get_economy_model_status(
     if profile.kind != providers::ProviderKind::OpenRouter {
         return Err("Choose an OpenRouter provider profile.".into());
     }
-    let runtime_identity_fingerprint = navis_fabrica_runner_core::providers::runtime_identity_fingerprint(&profile)
-        .unwrap_or_default();
+    let runtime_identity_fingerprint =
+        navis_fabrica_runner_core::providers::runtime_identity_fingerprint(&profile)
+            .unwrap_or_default();
     let key = resolve_openrouter_credential(&profile.id, profile.secret_ref.as_deref())
         .ok_or_else(|| "Save a valid OpenRouter credential for this profile first.".to_string())?;
     let provider_id = profile.id;
@@ -88,14 +89,11 @@ pub async fn get_economy_model_status(
     let observed_at = now_ms();
     let passing_ids =
         economy::trusted_economy_candidate_ids("aider", &runtime_version, observed_at);
-    let paid_candidate_canonicals = economy::paid_economy_candidate_models(
-        "aider",
-        &runtime_version,
-        observed_at,
-    )
-    .into_iter()
-    .map(|(model_id, canonical_model_id, _)| (model_id, canonical_model_id))
-    .collect::<BTreeMap<_, _>>();
+    let paid_candidate_canonicals =
+        economy::paid_economy_candidate_models("aider", &runtime_version, observed_at)
+            .into_iter()
+            .map(|(model_id, canonical_model_id, _)| (model_id, canonical_model_id))
+            .collect::<BTreeMap<_, _>>();
     let catalog_ids = observation
         .models
         .iter()
@@ -130,10 +128,7 @@ pub async fn get_economy_model_status(
                     let rows = if let Some(canonical_model_id) =
                         paid_candidate_canonicals_for_probe.get(&model_id)
                     {
-                        let allowed_model_ids = [
-                            model_id.as_str(),
-                            canonical_model_id.as_str(),
-                        ];
+                        let allowed_model_ids = [model_id.as_str(), canonical_model_id.as_str()];
                         providers::openrouter_endpoints_http_probe_with_aliases(
                             &proof_key,
                             &model_id,
@@ -159,7 +154,10 @@ pub async fn get_economy_model_status(
     let paid_endpoint_metadata_by_model = paid_candidate_canonicals
         .into_keys()
         .filter_map(|model_id| {
-            let model = observation.models.iter().find(|model| model.id == model_id)?;
+            let model = observation
+                .models
+                .iter()
+                .find(|model| model.id == model_id)?;
             let endpoints = endpoints_by_model.get(&model_id)?.clone();
             Some((
                 model_id,

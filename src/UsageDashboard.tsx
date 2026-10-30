@@ -38,10 +38,10 @@ export function UsageDashboard({ active }: { active: boolean }) {
  useEffect(()=>{if(active&&isDesktopApp()){void load(true);void invoke<Config>("get_usage_dashboard_config").then(v=>{if(mounted.current){setConfig(v);setDatabases(v.fabrica_databases.join("\n"));}}).catch(e=>{if(mounted.current)setConfigError(String(e));});}},[active]);
  async function save(){if(!config)return;setConfigError("");try{const saved=await invoke<Config>("save_usage_dashboard_config",{config:{...config,fabrica_databases:databases.split("\n").map(v=>v.trim()).filter(Boolean)}});setConfig(saved);await load(true);}catch(e){if(mounted.current)setConfigError(String(e));}}
  useEffect(()=>{if(!active)return;const timer=window.setInterval(()=>setClock(Date.now()),60000);return()=>window.clearInterval(timer);},[active]);
- if(!isDesktopApp())return null;
+ if(!isDesktopApp())return <section className="panel empty-state"><h1>Model Usage</h1><p>Model usage is available in the desktop app.</p></section>;
  const stale=!!report?.collection.at_ms&&clock-report.collection.at_ms>15*60000;
- return <details className="panel usage-dashboard" aria-labelledby="usage-heading" aria-busy={busy}>
-  <summary className="usage-summary"><h2 id="usage-heading">Model usage</h2></summary><div className="usage-heading"><button type="button" disabled={busy} onClick={()=>void load(true)}>{busy?"Collecting…":"Refresh usage"}</button></div>
+ return <section className="panel usage-dashboard" aria-labelledby="usage-heading" aria-busy={busy}>
+  <h1 id="usage-heading">Model Usage</h1><div className="usage-heading"><button type="button" disabled={busy} onClick={()=>void load(true)}>{busy?"Collecting…":"Refresh usage"}</button></div>
   <form className="usage-filters" onSubmit={e=>{e.preventDefault();void load(false);}}>
    <label>From (UTC)<input type="date" disabled={busy} required value={from} onChange={e=>setFrom(e.target.value)}/></label>
    <label>Before (UTC)<input type="date" disabled={busy} required value={to} onChange={e=>setTo(e.target.value)}/></label>
@@ -64,5 +64,5 @@ export function UsageDashboard({ active }: { active: boolean }) {
   <details><summary>Accounting and sources</summary><p>Actual paid-call settlements and API-equivalent estimates have different coverage and are never added. Codex estimates are not subscription bills. Cached input and reasoning are subsets, not extra tokens. Runner task durations are separate from workflow spans; Codex and Fabrica may overlap.</p><p>Usage costs belong to their event timestamp; native call costs belong to dispatch time and are not prorated. Span intervals are clipped to [From, Before). Native paid-call estimates use total-token ranges because input/output/cache splits are unknown. Estimates reconstruct the bundled dated short/long-context rates; missing cache-write counts assume zero, exclude fees and service-tier uplifts, and are not invoice bounds. Known fork copies are deduplicated; fork active time and unmatched inherited token baselines remain unattributed. Missing parent metadata limits fork correlation. Skill loading does not establish per-skill usage.</p>
    {config&&<fieldset disabled={busy}><legend>Verified data locations</legend><label>Codex root<input value={config.codex_root} onChange={e=>setConfig({...config,codex_root:e.target.value})}/></label><label>Additional Fabrica databases (one absolute path per line)<textarea rows={3} value={databases} onChange={e=>setDatabases(e.target.value)}/></label><p>The current native workflow and runner storage locations are always included.</p><button type="button" onClick={()=>void save()}>Save sources and refresh</button></fieldset>}{configError&&<p role="alert">{configError}</p>}
   </details>
- </details>;
+ </section>;
 }

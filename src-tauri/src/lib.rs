@@ -17,11 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tempfile::NamedTempFile;
 
+mod economy_status;
 mod github;
 mod inventory;
 mod issue_work;
 mod issue_work_inference;
-mod economy_status;
 pub use navis_fabrica_runner_core as runner_core;
 pub mod jev;
 mod process;
@@ -3497,7 +3497,10 @@ fn hydrate_economy_routing_evidence(app: &AppHandle, request: &mut routing::Requ
         .map_err(|_| "Configured provider settings are unavailable.".to_string())
         .and_then(|settings| {
             let data_root = default_runner_data_root(app)?;
-            let store = runner_core::provider_observations::ProviderObservationStore::open_read_only(&data_root)?;
+            let store =
+                runner_core::provider_observations::ProviderObservationStore::open_read_only(
+                    &data_root,
+                )?;
             let snapshot = store.snapshot(settings, request.now_ms)?;
             snapshot.candidate_facts(
                 settings,
@@ -3513,10 +3516,15 @@ fn hydrate_economy_routing_evidence(app: &AppHandle, request: &mut routing::Requ
         let configured_profile = configured_settings.as_ref().ok().and_then(|settings| {
             settings.providers.iter().find(|profile| {
                 profile.id == candidate.provider_id
-                    && profile.models.iter().any(|model| model.id == candidate.model_id)
+                    && profile
+                        .models
+                        .iter()
+                        .any(|model| model.id == candidate.model_id)
             })
         });
-        if !configured_profile.is_some_and(|profile| profile.kind == providers::ProviderKind::OpenRouter) {
+        if !configured_profile
+            .is_some_and(|profile| profile.kind == providers::ProviderKind::OpenRouter)
+        {
             continue;
         }
         candidate.requires_economy_evidence = true;
@@ -3525,7 +3533,9 @@ fn hydrate_economy_routing_evidence(app: &AppHandle, request: &mut routing::Requ
         }) else {
             continue;
         };
-        if profile_facts.economy_admission.is_some() || profile_facts.paid_economy_admission.is_some() {
+        if profile_facts.economy_admission.is_some()
+            || profile_facts.paid_economy_admission.is_some()
+        {
             candidate.economy_evidence_ready = true;
             candidate.context_tokens = profile_facts.context_tokens;
             candidate.supports_tools = profile_facts.supports_tools;
@@ -3571,7 +3581,10 @@ fn add_economy_refresh_reasons(
 }
 
 #[tauri::command]
-fn evaluate_routing(app: AppHandle, mut request: routing::Request) -> Result<routing::Decision, String> {
+fn evaluate_routing(
+    app: AppHandle,
+    mut request: routing::Request,
+) -> Result<routing::Decision, String> {
     validate_routing_request(&request)?;
     let now_ms = usage::now_ms();
     request.now_ms = now_ms;

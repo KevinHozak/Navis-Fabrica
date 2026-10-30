@@ -1,4 +1,4 @@
-export type PageSection = "projects" | "project" | "changes" | "build" | "epics-stories" | "local-issues" | "batches" | "runs" | "providers" | "settings";
+export type PageSection = "projects" | "project" | "changes" | "build" | "epics-stories" | "local-issues" | "batches" | "runs" | "usage" | "providers" | "settings";
 export type AppRoute = {
   section: PageSection;
   projectId?: string;
@@ -6,7 +6,7 @@ export type AppRoute = {
 };
 
 const knownSections = new Set<PageSection>([
-  "projects", "project", "changes", "build", "epics-stories", "local-issues", "batches", "runs", "providers", "settings",
+  "projects", "project", "changes", "build", "epics-stories", "local-issues", "batches", "runs", "usage", "providers", "settings",
 ]);
 
 export function parseRoute(hash: string): AppRoute | null {
@@ -52,7 +52,7 @@ export function routeTitle(route: AppRoute, projectName?: string): string {
   const titles: Record<PageSection, string> = {
     projects: "Home", project: "Project", changes: "Changes", build: "Build",
     "epics-stories": "Epics & Stories", "local-issues": "Local issues", batches: "Runner batches",
-    runs: "Activity", providers: "Providers", settings: "Settings",
+    runs: "Activity", usage: "Model Usage", providers: "Providers", settings: "Settings",
   };
   return titles[route.section];
 }

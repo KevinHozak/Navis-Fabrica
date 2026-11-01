@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import json
 import io
 from pathlib import Path
@@ -10,6 +11,7 @@ spec = importlib.util.spec_from_file_location("model_helper", Path(__file__).par
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
+@unittest.skipUnless(os.name=='nt','Shared accounting uses the qualified Windows authority fence')
 class HelperTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

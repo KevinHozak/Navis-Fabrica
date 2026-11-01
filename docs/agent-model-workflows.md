@@ -104,3 +104,5 @@ Contracts verified against [Ollama generate](https://docs.ollama.com/api/generat
 ## Shared-ledger admission
 
 The standalone helper now requires the [durable shared-ledger fence](shared-ledger-fence.md). Missing/unreviewed authority refuses before opening accounting or quoting/dispatching a provider call; this includes existing unmanaged/local helper use. No authority, real-ledger migration or activation is performed automatically. See the gate and compatibility requirements before scheduling helper work.
+
+Accounting-enabled helper execution now requires the qualified Windows authority implementation. Static/context preparation is separate; non-Windows accounting execution fails closed rather than reverting to an unguarded ledger. Native authority fixtures are explicitly Windows-only.

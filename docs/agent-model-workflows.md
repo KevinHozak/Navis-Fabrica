@@ -99,3 +99,8 @@ Results include `incomplete_reason` (null on successful text termination): `outp
 An output limit or empty answer may reflect a model consuming its generation allowance on reasoning, but neither proves reasoning exhaustion. The helper discards provider reasoning fields and never logs reasoning text. It does not add thinking or other unvalidated optional model parameters. Usage settlement remains independent: complete usage can settle an incomplete answer, while absent usage keeps its existing reservation even for apparently usable text. Overruns still block later calls. The ledger schema/content is unchanged; no prompt, selection, response, reasoning or raw diagnostic body is persisted.
 
 Contracts verified against [Ollama generate](https://docs.ollama.com/api/generate) and [show model details](https://docs.ollama.com/api-reference/show-model-details). All local-policy and termination fixtures use synthetic mocked responses; no live probes, inference or paid benchmarks are needed for verification.
+
+
+## Shared-ledger admission
+
+The standalone helper now requires the [durable shared-ledger fence](shared-ledger-fence.md). Missing/unreviewed authority refuses before opening accounting or quoting/dispatching a provider call; this includes existing unmanaged/local helper use. No authority, real-ledger migration or activation is performed automatically. See the gate and compatibility requirements before scheduling helper work.

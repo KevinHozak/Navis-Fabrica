@@ -13,8 +13,18 @@ spec.loader.exec_module(m)
 class HelperTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.path = Path(self.temp.name) / "usage.sqlite3"
+        self.private_root=Path(self.temp.name)/"private"
+        m._fence.create_private(self.private_root)
+        self.path = self.private_root / "usage.sqlite3"
         self.config = {"ledger_path": str(self.path), "daily_budget_usd": 1, "per_call_budget_usd": .05}
+        self.fence_patch = patch.object(m._fence,'default_root',return_value=self.private_root/'authority')
+        self.fence_patch.start();self.addCleanup(self.fence_patch.stop)
+        import sqlite3
+        schema='CREATE TABLE calls(id TEXT PRIMARY KEY, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, task TEXT NOT NULL, state TEXT NOT NULL, reserved_micros INTEGER NOT NULL, cost_micros INTEGER, input_tokens INTEGER, output_tokens INTEGER, elapsed_ms INTEGER, created_at TEXT NOT NULL, reported_cost_usd TEXT)'
+        db=sqlite3.connect(self.path)
+        try:db.execute(schema);db.commit()
+        finally:db.close()
+        m._fence.Fence().initialize(self.path);m._fence.Fence().resume(1)
         self.policy = m.load(m.ROOT / "config/model-routes.json")
         self.catalog = {"data": [{"id": "qwen/qwen3-coder-next", "context_length": 262144, "pricing": {"prompt": "0.00000012", "completion": "0.0000008"}}]}
     def tearDown(self):

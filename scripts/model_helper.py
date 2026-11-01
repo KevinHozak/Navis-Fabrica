@@ -1,5 +1,7 @@
 """Bounded text inference for agents. No tools, shell execution or prompt persistence."""
 import argparse
+import contextlib
+import importlib.util
 import ctypes
 import datetime as dt
 from decimal import Decimal, ROUND_CEILING, DecimalException
@@ -17,6 +19,9 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 OPENROUTER = "https://openrouter.ai/api/v1"
 MAX_RESPONSE = 2 * 1024 * 1024
+_fence_spec=importlib.util.spec_from_file_location('_fabrica_ledger_fence',ROOT/'scripts/ledger_fence.py')
+_fence=importlib.util.module_from_spec(_fence_spec);_fence_spec.loader.exec_module(_fence)
+
 
 class Refusal(Exception):
     def __init__(self, message, incomplete_reason=None):
@@ -257,15 +262,37 @@ def read_document():
 
 class Ledger:
     def __init__(self, path):
-        path = Path(path).resolve()
+        path = Path(path).absolute()
         if path == ROOT or ROOT in path.parents:
             raise Refusal("Usage ledger must be outside the shared Fabrica checkout")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, timeout=15, isolation_level=None)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, task TEXT NOT NULL, state TEXT NOT NULL, reserved_micros INTEGER NOT NULL, cost_micros INTEGER, input_tokens INTEGER, output_tokens INTEGER, elapsed_ms INTEGER, created_at TEXT NOT NULL)")
-        if "reported_cost_usd" not in {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}:
-            self.db.execute("ALTER TABLE calls ADD COLUMN reported_cost_usd TEXT")
+        session = None
+        try:
+            session = _fence.Fence().session(path)
+            with session.admission():
+                self.db = sqlite3.connect(path.as_uri()+"?mode=rw", uri=True, timeout=15,
+                                          isolation_level=None, factory=_fence.Connection,
+                                          cached_statements=0)
+                self.db.fence_session = session
+                if _fence.identity(path) != session.file_id:
+                    raise _fence.FenceError('FENCE_LEDGER_REPLACED')
+                self.db.set_authorizer(session.authorize)
+                self.db.execute("PRAGMA journal_mode=WAL")
+                self.db.execute("CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, task TEXT NOT NULL, state TEXT NOT NULL, reserved_micros INTEGER NOT NULL, cost_micros INTEGER, input_tokens INTEGER, output_tokens INTEGER, elapsed_ms INTEGER, created_at TEXT NOT NULL)")
+                if "reported_cost_usd" not in {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}:
+                    self.db.execute("ALTER TABLE calls ADD COLUMN reported_cost_usd TEXT")
+        except BaseException as error:
+            if hasattr(self,'db'):self.db.close()
+            elif session:session.close()
+            if isinstance(error,_fence.FenceError):raise Refusal(str(error)) from None
+            if isinstance(error,(PermissionError,_fence._private.CredentialError)):raise Refusal('FENCE_PRIVATE_AUTHORITY_REQUIRED') from None
+            raise
+
+    @contextlib.contextmanager
+    def admission(self):
+        try:
+            with self.db.fence_session.admission():yield
+        except _fence.FenceError as error:raise Refusal(str(error)) from None
+        except _fence._private.CredentialError:raise Refusal('FENCE_PRIVATE_AUTHORITY_REQUIRED') from None
 
     def totals(self, day):
         row = self.db.execute("SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='settled' THEN cost_micros ELSE reserved_micros END),0), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), SUM(CASE WHEN state!='settled' THEN 1 ELSE 0 END) FROM calls WHERE day=?", (day,)).fetchone()
@@ -276,18 +303,19 @@ class Ledger:
         return dict(reported_cost_usd=str(reported_cost), calls=row[0], committed_micros=row[1], reported_input_tokens=row[2], reported_output_tokens=row[3], unresolved_calls=row[4] or 0, by_provider=providers)
 
     def reserve(self, day, selected, task, amount, cap):
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            total = self.totals(day)["committed_micros"]
-            if total + amount > cap:
-                raise Refusal(f"Daily budget insufficient: committed/reserved ${total/1e6:.6f}; next ceiling ${amount/1e6:.6f}; cap ${cap/1e6:.2f}. Ask user about a task-specific increase.")
-            identity = str(uuid.uuid4())
-            self.db.execute("INSERT INTO calls(id,day,provider,model,task,state,reserved_micros,cost_micros,input_tokens,output_tokens,elapsed_ms,created_at) VALUES(?,?,?,?,?,'dispatched',?,NULL,NULL,NULL,NULL,?)", (identity, day, selected["provider"], selected["model"], task, amount, dt.datetime.now(dt.timezone.utc).isoformat()))
-            self.db.execute("COMMIT")
-            return identity
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
+        with self.admission():
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                total = self.totals(day)["committed_micros"]
+                if total + amount > cap:
+                    raise Refusal(f"Daily budget insufficient: committed/reserved ${total/1e6:.6f}; next ceiling ${amount/1e6:.6f}; cap ${cap/1e6:.2f}. Ask user about a task-specific increase.")
+                identity = str(uuid.uuid4())
+                self.db.execute("INSERT INTO calls(id,day,provider,model,task,state,reserved_micros,cost_micros,input_tokens,output_tokens,elapsed_ms,created_at) VALUES(?,?,?,?,?,'dispatched',?,NULL,NULL,NULL,NULL,?)", (identity, day, selected["provider"], selected["model"], task, amount, dt.datetime.now(dt.timezone.utc).isoformat()))
+                self.db.execute("COMMIT")
+                return identity
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
 
     def settle(self, identity, cost, input_tokens, output_tokens, elapsed):
         # Missing cost or tokens retains the reservation; timeout/crash never becomes zero.

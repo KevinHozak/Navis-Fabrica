@@ -23,15 +23,47 @@ class FenceError(ValueError):
     pass
 
 
-def default_root():
+def _known_folder(folder_id):
     if os.name != 'nt': raise FenceError('FENCE_WINDOWS_REQUIRED')
     shell = C.WinDLL('shell32')
     shell.SHGetFolderPathW.argtypes = [W.HWND, C.c_int, W.HANDLE, W.DWORD, W.LPWSTR]
     shell.SHGetFolderPathW.restype = C.c_long
     text = C.create_unicode_buffer(32768)
-    if shell.SHGetFolderPathW(None, 0x1c, None, 0, text):
+    if shell.SHGetFolderPathW(None, folder_id, None, 0, text):
         raise FenceError('FENCE_ROOT_UNAVAILABLE')
-    return Path(text.value)/'NavisFabrica-Portal'/'accounting-authority'
+    path = Path(text.value)
+    canonical(path)
+    return path
+
+
+def _present(path):
+    # Permission/lookup ambiguity must not become an absent legacy authority.
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise FenceError('FENCE_NAMESPACE_UNAVAILABLE') from None
+
+
+def default_root():
+    profile = _known_folder(0x28)  # CSIDL_PROFILE, resolved by Windows, not env.
+    local = _known_folder(0x1c)    # Previous Local AppData policy, detection only.
+    parent = profile/'NavisFabrica-Portal'
+    legacy = local/'NavisFabrica-Portal'
+    if canonical(parent) == canonical(legacy):
+        raise FenceError('FENCE_ROOT_CONFLICT')
+    if _present(legacy):
+        raise FenceError('FENCE_LEGACY_ROOT_PRESENT')
+    root = parent/'accounting-authority'
+    for path in (parent, root):
+        if not _present(path):
+            continue
+        if path.lstat().st_file_attributes & 0x400 or not path.is_dir():
+            raise FenceError('FENCE_ROOT_CONFLICT')
+        verify_private_path(path)
+    return root
 
 
 def canonical(path):
@@ -136,9 +168,17 @@ def create_private(path):
 
 class Fence:
     def __init__(self, root=None):
+        self._canonical_namespace = root is None
         self.root = Path(root) if root is not None else default_root()
 
+    def _check_namespace(self):
+        # Recheck existing sessions too: appearance of old state blocks all
+        # supported admissions, not just the next process constructor.
+        if self._canonical_namespace and canonical(default_root()) != canonical(self.root):
+            raise FenceError('FENCE_ROOT_CONFLICT')
+
     def control(self):
+        self._check_namespace()
         verify_private_path(self.root)
         return Lock(self.root/'control.lock')
 
@@ -176,6 +216,7 @@ class Fence:
 
     def initialize(self,ledger):
         """Operator only: existing protected accounting; always starts paused."""
+        self._check_namespace()
         path=canonical(ledger);file_id=identity(path);logical_digest(path)
         create_private(self.root)
         for name in ('control.lock','writers.lock'):

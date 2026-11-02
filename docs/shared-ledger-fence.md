@@ -22,3 +22,23 @@ No production ledger was opened/migrated, canonical authority created, credentia
 The operator approved engineering/offline qualification of the fixed UserProfile location only. Folder lookup uses Windows APIs, not USERPROFILE/LOCALAPPDATA or config overrides. Existing default-root sessions recheck the namespace at admissions/control operations; appearance of old AppData state blocks new admissions. Already admitted settlement remains governed by its existing lease/accounting rules. Legacy state is not deleted, relocated, reset or merged automatically. File/reparse conflicts and unreadable roots refuse.
 
 Production operator work must use the default namespace guard, not an explicit fixture root to bypass it. Tests create only disposable private roots. No production directories, accounting authority, active config or migration are provisioned by this change, and no helper resumes or provider route becomes enabled. Any real deployment requires the separate reviewed S018 maintenance/cutover authorization.
+
+
+## S018 atomic bootstrap retirement — 2026-11-02
+
+`Fence.initialize(ledger, retired_paths=(), verifier=None)` validates every initial
+retirement before creating state. The first atomic manifest is paused, revision
+one/epoch one, and already contains the reviewed original-source retirement.
+Duplicate/selected-path/invalid retirements refuse. Existing non-relocation
+callers retain the empty default; a cutover coordinator must supply its source.
+Supported snapshot selection refuses a retired source immediately and after
+restart. Do not add retirement by hand-editing a manifest after initialization.
+
+The optional verifier is a trusted backend callable only, never renderer/config
+input. It executes after the first commit while control and exclusive writer
+locks remain held; competing pause/resume/selection refuses until verification
+finishes. A verifier/interruption failure leaves any committed state paused with
+retirement intact, and performs no automatic retry, cleanup, rollback or resume.
+Portal's offline operator coordinator also retains source/config and destination
+pins across this complete window. These APIs were exercised only with generated
+roots; no real authority was initialized by the engineering change.

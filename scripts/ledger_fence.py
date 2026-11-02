@@ -214,15 +214,39 @@ class Fence:
         if not k.MoveFileExW(str(temp),str(self.root/'authority.json'),9):
             raise FenceError('FENCE_STATE_COMMIT_FAILED')
 
-    def initialize(self,ledger):
-        """Operator only: existing protected accounting; always starts paused."""
+    def initialize(self,ledger,*,retired_paths=(),verifier=None):
+        """Operator only: first paused manifest includes bootstrap retirements.
+
+        No retirement state is added later through ad-hoc manifest edits. Existing
+        non-relocation callers retain the empty default; a cutover coordinator
+        must supply its original source path before any authority object exists.
+        """
         self._check_namespace()
-        path=canonical(ledger);file_id=identity(path);logical_digest(path)
+        if verifier is not None and not callable(verifier):
+            raise FenceError('FENCE_INITIAL_VERIFIER_INVALID')
+        path=canonical(ledger)
+        if not isinstance(retired_paths,(list,tuple)) or len(retired_paths)>128:
+            raise FenceError('FENCE_RETIRED_PATH_INVALID')
+        retired=[]
+        for value in retired_paths:
+            if not isinstance(value,(str,os.PathLike)):
+                raise FenceError('FENCE_RETIRED_PATH_INVALID')
+            old=canonical(value)
+            if old==path or old in retired:
+                raise FenceError('FENCE_RETIRED_PATH_INVALID')
+            retired.append(old)
+        file_id=identity(path);logical_digest(path)
+        initial=dict(schema=1,revision=1,epoch=1,phase='paused',path=path,identity=file_id,retired=retired)
+        if len(json.dumps(initial,sort_keys=True,separators=(',',':')).encode())>65536:
+            raise FenceError('FENCE_STATE_INVALID')
         create_private(self.root)
         for name in ('control.lock','writers.lock'):
             with (self.root/name).open('xb') as f:f.write(b'0');f.flush();os.fsync(f.fileno())
-        with self.control():
-            self.write(dict(schema=1,revision=1,epoch=1,phase='paused',path=path,identity=file_id,retired=[]))
+        with self.control(),Lock(self.root/'writers.lock'):
+            self.write(initial)
+            # Trusted backend-only callback: verify while competing control and
+            # writer operations are excluded, never a renderer/config callback.
+            if verifier is not None:verifier()
 
     def session(self,ledger):
         path=canonical(ledger)

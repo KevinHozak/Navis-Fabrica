@@ -21,7 +21,7 @@ def read_profile(path):
     return json.loads(raw,object_pairs_hook=unique,parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
 
 
-def run(helper, profile_path, config_path, prompt, operation_id, run_id):
+def run(helper, profile_path, config_path, prompt, operation_id, run_id, *, shared_host=False, expected_host_generation=None):
     try:
         for path in (Path(profile_path).parent,profile_path,Path(config_path).parent,config_path):
             verify_private_path(path)
@@ -61,7 +61,8 @@ def run(helper, profile_path, config_path, prompt, operation_id, run_id):
         private.verify_private_path(config_path)
         adapter=importlib.import_module("portal_gateway.fabrica")
         return adapter.run(profile,helper.load(config_path),prompt,operation_id,run_id,
-            ledger_factory=helper.Ledger,credential_reader=helper.credential,profile_path=profile_path)
+            ledger_factory=helper.Ledger,credential_reader=helper.credential,profile_path=profile_path,
+            shared_host=shared_host,expected_host_generation=expected_host_generation)
     except KeyboardInterrupt:
         return {"complete":False,"billing_state":"unknown","code":"PORTAL_CANCELLED_OR_UNKNOWN","cost_usd":None}
     except Exception:

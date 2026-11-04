@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "encoding": "utf-8",
+  "line_endings": "LF",
+  "files": {
+    "fabrica-helper/scripts/model_helper.py": "17e798b2ee8fffa977df00c0d758ed031c38b01836d233446a05727458aa336c",
+    "fabrica-helper/scripts/portal_bridge.py": "63610dfc6c6938593195ad8d272ca90165ac8fe6b837a23d408ee51aa30bf01e",
+    "fabrica-helper/scripts/ledger_fence.py": "bcb45bb0881447db6ef9b265dd0def4b56ed16ed5bd28f25d329131a9c781459",
+    "fabrica-helper/scripts/portal_private_files.py": "37637e8d6994e3854b5bcc48cce997c9a657b636cd6c658a2ce52c3b67fb451c"
+  }
+}

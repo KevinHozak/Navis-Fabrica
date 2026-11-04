@@ -24,6 +24,10 @@ mod issue_work;
 mod issue_work_inference;
 pub use navis_fabrica_runner_core as runner_core;
 pub mod jev;
+#[cfg(feature = "portal-fixtures")]
+pub mod portal_feature;
+#[cfg(not(feature = "portal-fixtures"))]
+mod portal_feature;
 mod process;
 mod project_icon;
 pub mod providers;
@@ -3006,7 +3010,10 @@ pub fn run() {
             );
             Ok(())
         })
+        .manage(portal_feature::PortalFeatureState::default())
         .invoke_handler(tauri::generate_handler![
+            portal_feature::start_portal_extract,
+            portal_feature::cancel_portal_extract,
             usage_dashboard::get_usage_dashboard,
             usage_dashboard::get_usage_dashboard_config,
             usage_dashboard::save_usage_dashboard_config,

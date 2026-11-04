@@ -423,17 +423,24 @@ def main(argv=None):
     parser.add_argument("--preview", action="store_true", help="Include selected text in transient context output")
     parser.add_argument("--probe-local", action="store_true", help="Read local model metadata without inference")
     parser.add_argument("--portal-profile", help="Explicit private Portal integration profile; no fallback")
+    parser.add_argument("--portal-shared-host", action="store_true", help="Explicitly use the registered shared Portal host")
+    parser.add_argument("--portal-host-generation", help=argparse.SUPPRESS)
     parser.add_argument("--operation-id")
     parser.add_argument("--run-id")
     args = parser.parse_args(argv)
     try:
+        if args.portal_host_generation and not args.portal_shared_host:
+            raise Refusal("Portal host generation requires explicit shared-host mode")
+        if args.portal_shared_host and not args.portal_profile:
+            raise Refusal("Shared Portal mode requires an explicit Portal profile")
         if args.portal_profile:
             if (args.command!="run" or args.task!="portal-extract" or args.private or args.preset
                     or args.document_mode or args.instruction is not None or args.start is not None or args.end is not None
                     or args.preview or args.probe_local or not args.config or not args.operation_id or not args.run_id):
                 raise Refusal("Portal requires explicit run/task/config/profile/operation/run IDs and reviewed public text; other modes are unsupported")
             import portal_bridge
-            result=portal_bridge.run(sys.modules[__name__],args.portal_profile,args.config,read_document(),args.operation_id,args.run_id)
+            result=portal_bridge.run(sys.modules[__name__],args.portal_profile,args.config,read_document(),args.operation_id,args.run_id,
+                shared_host=args.portal_shared_host,expected_host_generation=args.portal_host_generation)
             print(json.dumps(result,ensure_ascii=True))
             return 0 if result.get("complete") and result.get("billing_state")=="settled" else 3
         if args.operation_id or args.run_id:

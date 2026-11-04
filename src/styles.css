@@ -723,3 +723,10 @@ fieldset.local-issue-editor { border: 0; margin: 0; padding: 0; min-width: 0; }
 .usage-dashboard button { cursor: pointer; }
 .usage-dashboard button:disabled { opacity: .6; cursor: default; }
 .usage-dashboard :is(input,select,textarea,button,summary):focus-visible { outline: 2px solid #8bcaff; outline-offset: 3px; }
+
+.portal-extract-panel { max-width: 900px; margin: 24px auto; display: grid; gap: 12px; }
+.portal-extract-heading, .portal-extract-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.portal-extract-heading h1 { margin: 0; }
+.portal-extract-panel textarea { width: 100%; box-sizing: border-box; resize: vertical; background: #172533; color: #e9edf5; border: 1px solid #456078; border-radius: 6px; padding: 10px; font: inherit; }
+.portal-extract-output { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #456078; border-radius: 6px; padding: 12px; }
+.portal-extract-panel :is(button,textarea):focus-visible { outline: 2px solid #8bcaff; outline-offset: 3px; }

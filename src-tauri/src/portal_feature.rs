@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::State;
@@ -27,6 +28,13 @@ p=Path(sys.argv[1]).resolve(); root=Path(sys.argv[2]).resolve(); sys.path.insert
 spec=importlib.util.spec_from_file_location("_fabrica_test_helper",p); helper=importlib.util.module_from_spec(spec); sys.modules[spec.name]=helper; spec.loader.exec_module(helper)
 assert helper.ROOT.resolve()==(root/"fabrica-helper").resolve(); helper._fence.default_root=lambda:root/"accounting-authority"
 args=sys.argv[3:]; profile=Path(args[args.index("--portal-profile")+1]); document=json.loads(profile.read_text(encoding="utf-8"))
+fixture_target="credential-store:Navis-Portal/Fabrica/fixture"
+fixture_app_key="synthetic-fabrica-portal-app-key-01234567890123456789"
+if document.get("app_key_ref")!=fixture_target: raise RuntimeError("FIXTURE_CREDENTIAL_TARGET_INVALID")
+def fixture_credential(reference):
+    if reference!=fixture_target: raise helper.Refusal("Fixture credential target refused")
+    return fixture_app_key
+helper.credential=fixture_credential
 release=Path(document["portal_release_root"]).resolve(); sys.path.insert(0,str(release))
 native=importlib.import_module("portal_gateway.host_native"); native.canonical_root=lambda:root
 sys.argv=[str(p),*args]; raise SystemExit(helper.main())
@@ -88,9 +96,52 @@ struct Usage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PortalFeatureState {
-    operations: Mutex<HashMap<String, Cancellation>>,
+    operations: Arc<Mutex<HashMap<String, Cancellation>>>,
+}
+impl PortalFeatureState {
+    fn register(&self, operation_id: &str) -> Result<Cancellation, &'static str> {
+        if !id(operation_id) {
+            return Err("denied");
+        }
+        let mut operations = self.operations.lock().map_err(|_| "unavailable")?;
+        if operations.contains_key(operation_id) {
+            return Err("unknown");
+        }
+        let cancel = Cancellation::default();
+        operations.insert(operation_id.to_owned(), cancel.clone());
+        Ok(cancel)
+    }
+
+    fn cancel(&self, operation_id: &str) -> Result<(), &'static str> {
+        if !id(operation_id) {
+            return Err("denied");
+        }
+        if let Some(cancel) = self
+            .operations
+            .lock()
+            .map_err(|_| "unavailable")?
+            .get(operation_id)
+        {
+            cancel.cancel();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        if let Ok(operations) = self.operations.lock() {
+            for cancel in operations.values() {
+                cancel.cancel();
+            }
+        }
+    }
+
+    fn finish(&self, operation_id: &str) {
+        if let Ok(mut operations) = self.operations.lock() {
+            operations.remove(operation_id);
+        }
+    }
 }
 #[derive(Clone)]
 struct FeatureBackend {
@@ -114,6 +165,16 @@ impl FeatureBackend {
             fixture_root: Some(root),
         }
     }
+}
+
+#[cfg(feature = "portal-fixtures")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixtureCancelMode {
+    #[default]
+    None,
+    Operation,
+    Exit,
 }
 
 fn id(value: &str) -> bool {
@@ -553,6 +614,19 @@ async fn run_feature(
     .await
     .map_err(|_| "unknown")?
 }
+
+async fn run_registered_feature(
+    state: &PortalFeatureState,
+    backend: FeatureBackend,
+    prompt: String,
+    operation_id: String,
+) -> Result<Value, &'static str> {
+    let cancel = state.register(&operation_id)?;
+    let result = run_feature(backend, prompt, operation_id.clone(), cancel).await;
+    state.finish(&operation_id);
+    result
+}
+
 #[cfg(feature = "portal-fixtures")]
 pub async fn run_fixture(
     root: PathBuf,
@@ -561,6 +635,26 @@ pub async fn run_fixture(
     prompt: String,
     operation_id: String,
 ) -> Result<Value, String> {
+    run_fixture_with_cancel(
+        root,
+        worker,
+        worker_sha256,
+        prompt,
+        operation_id,
+        FixtureCancelMode::None,
+    )
+    .await
+}
+
+#[cfg(feature = "portal-fixtures")]
+pub async fn run_fixture_with_cancel(
+    root: PathBuf,
+    worker: PathBuf,
+    worker_sha256: String,
+    prompt: String,
+    operation_id: String,
+    cancel_mode: FixtureCancelMode,
+) -> Result<Value, String> {
     if prompt.trim().is_empty()
         || prompt.len() > MAX_PROMPT
         || !id(&operation_id)
@@ -568,10 +662,84 @@ pub async fn run_fixture(
     {
         return Err("denied".into());
     }
-    let backend = FeatureBackend::fixture(root, worker, worker_sha256);
-    run_feature(backend, prompt, operation_id, Cancellation::default())
-        .await
-        .map_err(str::to_owned)
+    let backend = FeatureBackend::fixture(root.clone(), worker, worker_sha256);
+    let state = PortalFeatureState::default();
+    let cancel = state
+        .register(&operation_id)
+        .map_err(str::to_owned)?;
+    let finished = Arc::new(AtomicBool::new(false));
+    let dispatch_path = root.join("dispatch.flag");
+    let watcher = if cancel_mode == FixtureCancelMode::None {
+        None
+    } else {
+        match std::fs::symlink_metadata(&dispatch_path) {
+            Ok(_) => {
+                state.finish(&operation_id);
+                return Err("fixture_dispatch_marker_must_be_new".into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                state.finish(&operation_id);
+                return Err("fixture_dispatch_marker_unavailable".into());
+            }
+        }
+        let watcher_state = state.clone();
+        let operation = operation_id.clone();
+        let watcher_finished = finished.clone();
+        let spawned = thread::Builder::new()
+            .name("portal-fixture-cancel".into())
+            .spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if watcher_finished.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    if std::fs::symlink_metadata(&dispatch_path).is_ok() {
+                        let marker = portal_client::lifecycle::pin_private_fixture(
+                            &root,
+                            &dispatch_path,
+                            None,
+                            64,
+                        );
+                        if marker.map(|pin| pin.bytes() == b"unknown").unwrap_or(false) {
+                            let result = match cancel_mode {
+                                FixtureCancelMode::Operation => watcher_state.cancel(&operation),
+                                FixtureCancelMode::Exit => {
+                                    watcher_state.cancel_all();
+                                    Ok(())
+                                }
+                                FixtureCancelMode::None => Ok(()),
+                            };
+                            return result.is_ok();
+                        }
+                        return false;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = watcher_state.cancel(&operation);
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+        });
+        match spawned {
+            Ok(watcher) => Some(watcher),
+            Err(_) => {
+                state.finish(&operation_id);
+                return Err("fixture_cancel_signal_unavailable".into());
+            }
+        }
+    };
+    let result = run_feature(backend, prompt, operation_id.clone(), cancel).await;
+    finished.store(true, Ordering::SeqCst);
+    state.finish(&operation_id);
+    if let Some(watcher) = watcher {
+        match watcher.join() {
+            Ok(true) => {}
+            Ok(false) => return Err("fixture_cancel_signal_missing".into()),
+            Err(_) => return Err("fixture_cancel_signal_unavailable".into()),
+        }
+    }
+    result.map_err(str::to_owned)
 }
 #[tauri::command]
 pub async fn start_portal_extract(
@@ -582,24 +750,13 @@ pub async fn start_portal_extract(
     if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT || !id(&operation_id) {
         return Err("denied".into());
     }
-    let cancel = Cancellation::default();
-    {
-        let mut map = state.operations.lock().map_err(|_| "unavailable")?;
-        if map.contains_key(&operation_id) {
-            return Err("unknown".into());
-        }
-        map.insert(operation_id.clone(), cancel.clone());
-    }
-    let result = run_feature(
+    let result = run_registered_feature(
+        &state,
         FeatureBackend::registered(),
         prompt,
-        operation_id.clone(),
-        cancel,
+        operation_id,
     )
     .await;
-    if let Ok(mut map) = state.operations.lock() {
-        map.remove(&operation_id);
-    }
     result.map_err(str::to_owned)
 }
 #[tauri::command]
@@ -610,15 +767,7 @@ pub fn cancel_portal_extract(
     if !id(&operation_id) {
         return Err("denied".into());
     }
-    if let Some(cancel) = state
-        .operations
-        .lock()
-        .map_err(|_| "unavailable")?
-        .get(&operation_id)
-    {
-        cancel.cancel()
-    }
-    Ok(())
+    state.cancel(&operation_id).map_err(str::to_owned)
 }
 fn execute(
     profile: ReviewedProfile,
@@ -706,6 +855,48 @@ fn execute(
 #[cfg(all(test, feature = "portal-fixtures"))]
 mod tests {
     use super::*;
+    #[test]
+    fn operation_registration_is_shared_and_cancel_is_scoped_by_id() {
+        let state = PortalFeatureState::default();
+        let first = state.register("op-first").unwrap();
+        let second = state.register("op-second").unwrap();
+        assert_eq!(state.register("op-first").err(), Some("unknown"));
+        state.cancel("op-first").unwrap();
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        state.finish("op-first");
+        assert!(state.register("op-first").is_ok());
+    }
+
+    #[test]
+    fn app_exit_core_cancels_only_registered_feature_operations() {
+        let state = PortalFeatureState::default();
+        let first = state.register("op-first").unwrap();
+        let second = state.register("op-second").unwrap();
+        state.cancel_all();
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        let operations = state.operations.lock().unwrap();
+        assert_eq!(operations.len(), 2);
+    }
+
+    #[test]
+    fn fixture_cancel_mode_accepts_only_fixed_actions() {
+        assert_eq!(
+            serde_json::from_str::<FixtureCancelMode>("\"none\"").unwrap(),
+            FixtureCancelMode::None
+        );
+        assert_eq!(
+            serde_json::from_str::<FixtureCancelMode>("\"operation\"").unwrap(),
+            FixtureCancelMode::Operation
+        );
+        assert_eq!(
+            serde_json::from_str::<FixtureCancelMode>("\"exit\"").unwrap(),
+            FixtureCancelMode::Exit
+        );
+        assert!(serde_json::from_str::<FixtureCancelMode>("\"pid:1234\"").is_err());
+    }
+
     #[test]
     fn renderer_ids_and_prompt_bounds_are_enforced() {
         assert!(!id("../bad"));

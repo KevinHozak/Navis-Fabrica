@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "navis-fabrica"
-version = "1.0.30"
+version = "1.0.31"
 dependencies = [
  "base64 0.22.1",
  "navis-fabrica-runner-core",
@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "portal-client"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "libc",
  "serde",

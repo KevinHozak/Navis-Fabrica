@@ -47,6 +47,15 @@ mod native {
     pub fn peer(_: &std::net::TcpStream, _: &Peer) -> Result<(), ClientError> {
         Err(unsupported())
     }
+    pub fn broker_pipe() -> Result<Option<String>, ClientError> {
+        Ok(None)
+    }
+    pub fn broker_request(
+        _: &str, _: bool, _: Instant, _: &Cancellation, _: &Cancellation,
+        _: &Registration,
+    ) -> Result<Value, ClientError> {
+        Err(unsupported())
+    }
 }
 
 pub const HOST_CONTRACT: &str = "portal.host/1";
@@ -339,6 +348,12 @@ fn safe_private_child(root: &Path, path: &Path) -> bool {
     path.is_absolute() && path.starts_with(root) && path != root
         && !path.components().any(|component| matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir))
 }
+fn safe_trusted_root(root: &Path) -> bool {
+    root.is_absolute()
+        && root.components().all(|component| {
+            !matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+        })
+}
 /// Exposes the SDK bounded duplicate-key validator for native feature profiles.
 pub fn validate_unique_json(raw: &[u8]) -> bool { super::unique_json(raw) }
 /// Read and pin a small private file after validating every in-root ancestor.
@@ -352,6 +367,23 @@ fn pin_private_at(root: &Path, path: &Path, expected_sha256: Option<&str>, max_b
 }
 pub fn pin_private(path: &Path, expected_sha256: Option<&str>, max_bytes: usize) -> Result<PrivatePin, ClientError> {
     pin_private_at(&native::root()?,path,expected_sha256,max_bytes)
+}
+/// Pin a private file below a root selected by trusted native code, such as an app-owned config directory.
+/// Never pass a root or path supplied by a webview. The root and every in-root ancestor must satisfy the
+/// same no-reparse and private-ACL checks as registered Portal inputs.
+pub fn pin_private_from_trusted_root(root: &Path, path: &Path, expected_sha256: Option<&str>, max_bytes: usize) -> Result<PrivatePin, ClientError> {
+    if !safe_trusted_root(root) { return Err(invalid()); }
+    pin_private_at(root,path,expected_sha256,max_bytes)
+}
+/// Pin a public app-owned source input under a trusted root using an exact reviewed hash.
+/// This deliberately omits the private-ACL check and must never be used for profiles, keys, or configuration.
+pub fn pin_reviewed_source_from_trusted_root(root: &Path, path: &Path, expected_sha256: &str, max_bytes: usize) -> Result<PrivatePin, ClientError> {
+    if !safe_trusted_root(root) || max_bytes == 0 || max_bytes > 64 * 1024 * 1024
+        || !hex(expected_sha256, 64) || !safe_private_child(root,path) { return Err(invalid()); }
+    let directories = native::directories(path)?;
+    let (file, bytes) = read_pinned(path, false, max_bytes)?;
+    if digest(&bytes) != expected_sha256 { return Err(error("not_sent", "HOST_IDENTITY_MISMATCH")); }
+    Ok(PrivatePin { _file:file, bytes, _directories:directories, _registration:None })
 }
 #[cfg(feature = "host-fixtures")]
 pub fn pin_private_fixture(root: &Path, path: &Path, expected_sha256: Option<&str>, max_bytes: usize) -> Result<PrivatePin, ClientError> {
@@ -431,13 +463,71 @@ pub struct HostConnection {
     registration: Arc<Registration>,
     peer: Option<Peer>,
 }
+/// Reviewed launch facts derived from a verified `HostConnection`.
+///
+/// This is trusted-backend-only data. It intentionally implements none of
+/// `Debug`, `Serialize`, or `Clone`, and retains the registration (including
+/// its open profile, runtime, and release pins) until the broker exits.
+pub struct HostLaunchInputs {
+    runtime: PathBuf,
+    runtime_sha256: String,
+    bootstrap: PathBuf,
+    bootstrap_sha256: String,
+    state: PathBuf,
+    generation: String,
+    _registration: Arc<Registration>,
+    _peer: Peer,
+}
+impl HostLaunchInputs {
+    pub fn runtime(&self) -> &Path { &self.runtime }
+    pub fn runtime_sha256(&self) -> &str { &self.runtime_sha256 }
+    pub fn bootstrap(&self) -> &Path { &self.bootstrap }
+    pub fn bootstrap_sha256(&self) -> &str { &self.bootstrap_sha256 }
+    pub fn state(&self) -> &Path { &self.state }
+    /// Exact running generation, for backend-only broker binding.
+    pub fn generation(&self) -> &str { &self.generation }
+}
 impl HostConnection {
     pub fn state(&self) -> &str {
         &self.state
     }
     /// Backend-only generation binding; never serialize this into the webview.
     pub fn generation(&self) -> Option<&str> {
-        self.frame["generation"].as_str().filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        self.frame["generation"].as_str().filter(|value| hex(value, 32))
+    }
+    /// Return only the selected runtime/bootstrap/state and generation already
+    /// validated by this connection. No descriptor, environment variable,
+    /// renderer input, or mutable registration is consulted again.
+    pub fn launch_inputs(&self) -> Result<HostLaunchInputs, ClientError> {
+        if self.state != "running" {
+            return Err(error("not_sent", "HOST_UNAVAILABLE"));
+        }
+        let generation = self.generation().ok_or_else(invalid)?.to_owned();
+        let peer = self.peer.clone().ok_or_else(invalid)?;
+        let profile = &self.registration.profile;
+        if profile.state != self.registration.root.join("portal-state") {
+            return Err(invalid());
+        }
+        let runtime = profile.runtime.executable.clone();
+        let runtime_sha256 = profile.runtime.sha256.clone();
+        let bootstrap = profile.release.join("bootstrap.py");
+        let bootstrap_sha256 = profile.files.get(&bootstrap).ok_or_else(invalid)?.clone();
+        if !hex(&runtime_sha256, 64)
+            || profile.files.get(&runtime) != Some(&runtime_sha256)
+            || !hex(&bootstrap_sha256, 64)
+        {
+            return Err(invalid());
+        }
+        Ok(HostLaunchInputs {
+            runtime,
+            runtime_sha256,
+            bootstrap,
+            bootstrap_sha256,
+            state: profile.state.clone(),
+            generation,
+            _registration: self.registration.clone(),
+            _peer: peer,
+        })
     }
     pub fn receipt(&self) -> Value {
         let code = match self.frame["readiness"]["code"].as_str().unwrap_or("") {
@@ -613,6 +703,22 @@ impl SharedPortal {
         let root = native::root()?;
         let registration = Arc::new(Registration::load(root)?);
         check()?;
+        if let Some(pipe) = native::broker_pipe()? {
+            let frame = native::broker_request(
+                &pipe, acquire, deadline, cancel, dropped, &registration,
+            )?;
+            validate_frame(&frame, &registration)?;
+            if frame["state"] == "unavailable" {
+                return Err(frame_error(&frame));
+            }
+            let state = frame["state"].as_str().ok_or_else(invalid)?.to_owned();
+            let peer = if state == "running" {
+                Some(registration.peer(&frame)?)
+            } else {
+                None
+            };
+            return Ok(HostConnection { state, frame, registration, peer });
+        }
         let p = &registration.profile;
         let mut command = Command::new(&p.runtime.executable);
         command.args(["-I", "-B"]);
@@ -747,6 +853,7 @@ fn frame_error(frame: &Value) -> ClientError {
         "HOST_CANCELLED" => "HOST_CANCELLED",
         "HOST_START_TIMEOUT" => "HOST_START_TIMEOUT",
         "HOST_LAUNCH_REFUSED" => "HOST_LAUNCH_REFUSED",
+        "HOST_LAUNCH_CLEANUP_PENDING" => "HOST_LAUNCH_CLEANUP_PENDING",
         "HOST_PROFILE_INVALID" => "HOST_PROFILE_INVALID",
         "HOST_IDENTITY_MISMATCH" => "HOST_IDENTITY_MISMATCH",
         "HOST_INCOMPATIBLE" => "HOST_INCOMPATIBLE",
@@ -801,6 +908,65 @@ fn validate_frame(frame: &Value, r: &Registration) -> Result<(), ClientError> {
         }
     }
     Ok(())
+}
+
+const BROKER_CONTRACT: u32 = 1;
+fn broker_request_bytes(request_id: &str, op: &str) -> Result<Vec<u8>, ClientError> {
+    if !hex(request_id, 32) || !matches!(op, "status" | "acquire" | "cancel") {
+        return Err(error("not_sent", "HOST_PROFILE_INVALID"));
+    }
+    let bytes = serde_json::to_vec(&json!({"schema":BROKER_CONTRACT,"request_id":request_id,"op":op}))
+        .map_err(|_| invalid())?;
+    if bytes.len() > 512 { return Err(invalid()); }
+    Ok(bytes)
+}
+fn broker_reply_frame(raw: &[u8], request_id: &str) -> Result<Value, ClientError> {
+    let value: Value = document(raw)?;
+    let object = value.as_object().ok_or_else(invalid)?;
+    if value["schema"] != BROKER_CONTRACT || value["request_id"] != request_id
+        || !value["ok"].is_boolean() {
+        return Err(error("not_sent", "LIFECYCLE_UNRESOLVED"));
+    }
+    if value["ok"] == true {
+        if object.len()==4 && object.keys().all(|k|["schema","request_id","ok","cancelled"].contains(&k.as_str()))
+            && value["cancelled"]==true {
+            return Err(error("not_sent","HOST_CANCELLED"));
+        }
+        if object.len() != 4 || object.keys().any(|k| !["schema","request_id","ok","frame"].contains(&k.as_str()))
+            || !value["frame"].is_object() {
+            return Err(error("not_sent", "LIFECYCLE_UNRESOLVED"));
+        }
+        return Ok(value["frame"].clone());
+    }
+    if object.len() != 4 || object.keys().any(|k| !["schema","request_id","ok","code"].contains(&k.as_str())) {
+        return Err(error("not_sent", "LIFECYCLE_UNRESOLVED"));
+    }
+    let safe = match value["code"].as_str().unwrap_or("") {
+        "GUARDIAN_REQUEST_INVALID" => "GUARDIAN_REQUEST_INVALID",
+        "GUARDIAN_CALLER_REFUSED" => "GUARDIAN_CALLER_REFUSED",
+        "GUARDIAN_BUSY" => "GUARDIAN_BUSY",
+        "GUARDIAN_PROFILE_CHANGED" => "GUARDIAN_PROFILE_CHANGED",
+        "GUARDIAN_COLD_START_BLOCKED" => "GUARDIAN_COLD_START_BLOCKED",
+        "GUARDIAN_BROKER_UNAVAILABLE" => "GUARDIAN_BROKER_UNAVAILABLE",
+        "LIFECYCLE_UNRESOLVED" => "LIFECYCLE_UNRESOLVED",
+        "HOST_CANCELLED" => "HOST_CANCELLED",
+        "HOST_START_TIMEOUT" => "HOST_START_TIMEOUT",
+        "HOST_LAUNCH_REFUSED" => "HOST_LAUNCH_REFUSED",
+        "HOST_LAUNCH_CLEANUP_PENDING" => "HOST_LAUNCH_CLEANUP_PENDING",
+        "HOST_PROFILE_INVALID" => "HOST_PROFILE_INVALID",
+        "HOST_IDENTITY_MISMATCH" => "HOST_IDENTITY_MISMATCH",
+        "HOST_INCOMPATIBLE" => "HOST_INCOMPATIBLE",
+        "HOST_LISTENER_UNTRUSTED" => "HOST_LISTENER_UNTRUSTED",
+        "HOST_UNAVAILABLE" => "HOST_UNAVAILABLE",
+        "HOST_STOP_PENDING" => "HOST_STOP_PENDING",
+        "HOST_TIMEOUT_INVALID" => "HOST_TIMEOUT_INVALID",
+        "HOST_REGISTRATION_EXISTS" => "HOST_REGISTRATION_EXISTS",
+        "HOST_SELECTED_RELEASE_REQUIRED" => "HOST_SELECTED_RELEASE_REQUIRED",
+        "HOST_INPUT_PIN_FAILED" => "HOST_INPUT_PIN_FAILED",
+        "HOST_PLATFORM_UNSUPPORTED" => "HOST_PLATFORM_UNSUPPORTED",
+        _ => "LIFECYCLE_UNRESOLVED",
+    };
+    Err(error("not_sent", safe))
 }
 
 struct TaskState {
@@ -858,11 +1024,74 @@ impl Drop for LifecycleTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn launch_fixture(state: &str, generation: &str, include_bootstrap: bool) -> HostConnection {
+        let root = PathBuf::from(r"C:\PortalFixture");
+        let release_id = "a".repeat(64);
+        let release = root.join("portal-releases").join(&release_id);
+        let runtime = PathBuf::from(r"C:\PythonFixture\python.exe");
+        let bootstrap = release.join("bootstrap.py");
+        let runtime_sha = "b".repeat(64);
+        let bootstrap_sha = "c".repeat(64);
+        let mut files = BTreeMap::from([(runtime.clone(), runtime_sha.clone())]);
+        if include_bootstrap {
+            files.insert(bootstrap.clone(), bootstrap_sha.clone());
+        }
+        let registration = Registration {
+            profile: Profile {
+                schema: 1,
+                contract: HOST_CONTRACT.into(),
+                sid: "S-1-fixture".into(),
+                state: root.join("portal-state"),
+                release,
+                release_id,
+                version: "0.2.19".into(),
+                runtime: RuntimePin { executable: runtime.clone(), sha256: runtime_sha },
+                lifetime: "operator-session".into(),
+                files,
+            },
+            root,
+            profile_sha: "d".repeat(64),
+            _pins: Vec::new(),
+        };
+        HostConnection {
+            state: state.into(),
+            frame: json!({"generation": generation}),
+            registration: Arc::new(registration),
+            peer: Some(Peer {
+                pid: 7,
+                created: 9,
+                executable: runtime.to_string_lossy().into_owned(),
+                sid: "S-1-fixture".into(),
+            }),
+        }
+    }
     #[test]
     fn lifecycle_documents_reject_duplicate_nested_fields() {
         assert!(document::<Value>(br#"{"files":{"a":"1","a":"2"}}"#).is_err());
         assert!(document::<Value>(br#"{"state":"stopped","state":"running"}"#).is_err());
         assert!(document::<Value>(br#"{"state":"starting"}"#).is_ok());
+    }
+    #[test]
+    fn guardian_lifecycle_codec_is_content_free_bounded_and_exact() {
+        let id="0123456789abcdef0123456789abcdef";
+        let request=broker_request_bytes(id,"acquire").unwrap();
+        assert!(request.len()<=512);
+        let parsed:Value=document(&request).unwrap();
+        assert_eq!(parsed,json!({"schema":1,"request_id":id,"op":"acquire"}));
+        assert!(broker_request_bytes(id,"stop").is_err());
+        let frame=json!({"contract":"portal.host/1","state":"stopped","readiness":null});
+        let reply=json!({"schema":1,"request_id":id,"ok":true,"frame":frame});
+        assert_eq!(broker_reply_frame(&serde_json::to_vec(&reply).unwrap(),id).unwrap(),frame);
+        assert!(broker_reply_frame(br#"{"schema":1,"schema":1,"request_id":"0123456789abcdef0123456789abcdef","ok":true,"frame":{}}"#,id).is_err());
+        assert!(broker_reply_frame(br#"{"schema":1,"request_id":"0123456789abcdef0123456789abcdef","ok":true,"frame":{},"path":"C:\\private"}"#,id).is_err());
+        assert!(broker_reply_frame(br#"{"schema":1,"request_id":"fedcba9876543210fedcba9876543210","ok":true,"frame":{}}"#,id).is_err());
+        assert!(broker_reply_frame(br#"{"schema":1,"request_id":"0123456789abcdef0123456789abcdef","ok":false,"code":"HOST_COLD_START_BLOCKED"}"#,id).is_err());
+        let cleanup=json!({"schema":1,"request_id":id,"ok":false,"code":"HOST_LAUNCH_CLEANUP_PENDING"});
+        let cleanup_error=broker_reply_frame(&serde_json::to_vec(&cleanup).unwrap(),id).unwrap_err();
+        assert_eq!(cleanup_error.receipt()["code"],"HOST_LAUNCH_CLEANUP_PENDING");
+        let unknown=json!({"schema":1,"request_id":id,"ok":false,"code":"ARBITRARY_INTERNAL_DETAIL"});
+        let unknown_error=broker_reply_frame(&serde_json::to_vec(&unknown).unwrap(),id).unwrap_err();
+        assert_eq!(unknown_error.receipt()["code"],"LIFECYCLE_UNRESOLVED");
     }
     #[test]
     fn reviewed_policy_refuses_unbounded_or_invalid_limits() {
@@ -880,9 +1109,29 @@ mod tests {
         assert!(ReviewedPolicy::new("fixture", "unreviewed", 1, 1, 1).is_err());
     }
     #[test]
+    fn launch_inputs_are_derived_from_a_running_pinned_registration() {
+        let connection = launch_fixture("running", &"1".repeat(32), true);
+        let inputs = connection.launch_inputs().unwrap();
+        assert_eq!(inputs.runtime(), Path::new(r"C:\PythonFixture\python.exe"));
+        assert_eq!(inputs.runtime_sha256(), "b".repeat(64));
+        assert!(inputs.bootstrap().ends_with("bootstrap.py"));
+        assert_eq!(inputs.bootstrap_sha256(), "c".repeat(64));
+        assert_eq!(inputs.state(), Path::new(r"C:\PortalFixture\portal-state"));
+        assert_eq!(inputs.generation(), "1".repeat(32));
+    }
+    #[test]
+    fn launch_inputs_refuse_nonrunning_or_incomplete_host_identity() {
+        assert!(launch_fixture("starting", &"1".repeat(32), true).launch_inputs().is_err());
+        assert!(launch_fixture("running", &"A".repeat(32), true).launch_inputs().is_err());
+        assert!(launch_fixture("running", &"1".repeat(32), false).launch_inputs().is_err());
+    }
+    #[test]
     fn private_paths_reject_lexical_traversal_and_duplicate_profiles() {
         let root=Path::new(r"C:\Users\fixture\NavisFabrica-Portal");
         assert!(safe_private_child(root, &root.join("launches/fabrica-extract.json")));
+        assert!(safe_trusted_root(root));
+        assert!(!safe_trusted_root(Path::new(r"C:\Users\fixture\..\outside")));
+        assert!(!safe_trusted_root(Path::new(r"relative\root")));
         assert!(!safe_private_child(root, &root.join("scripts/../outside.py")));
         assert!(!safe_private_child(root, Path::new(r"C:\Users\fixture\elsewhere.py")));
         assert!(!validate_unique_json(br#"{"profile":{"run_id":"a","run_id":"b"}}"#));

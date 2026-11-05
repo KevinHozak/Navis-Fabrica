@@ -1,6 +1,6 @@
 [package]
 name = "navis-fabrica"
-version = "1.0.30"
+version = "1.0.31"
 description = "Navis-Fabrica desktop workshop"
 edition = "2021"
 
@@ -33,3 +33,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 portal-fixtures = ["portal-client/host-fixtures"]
+
+[[example]]
+name = "portal_fixture"
+path = "examples/portal_fixture.rs"
+required-features = ["portal-fixtures"]

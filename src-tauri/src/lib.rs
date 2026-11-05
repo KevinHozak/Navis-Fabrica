@@ -3074,8 +3074,14 @@ pub fn run() {
             evaluate_provider_fallback,
             calibrate_routing
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Navis-Fabrica");
+        .build(tauri::generate_context!())
+        .expect("error while building Navis-Fabrica")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<portal_feature::PortalFeatureState>()
+                    .cancel_all();
+            }
+        });
 }
 
 #[cfg(test)]

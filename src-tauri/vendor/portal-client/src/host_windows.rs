@@ -214,6 +214,93 @@ pub(crate) fn broker_pipe() -> Result<Option<String>, ClientError> {
     }
 }
 
+#[cfg(feature = "operator-controls")]
+pub(crate) fn operator_session_pipe() -> Result<Option<String>, ClientError> {
+    let required=std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED");
+    let pipe=std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_PIPE");
+    operator_session_pipe_config(required.as_deref(),pipe.as_deref())
+}
+
+#[cfg(feature = "operator-controls")]
+fn operator_session_pipe_config(required: Option<&std::ffi::OsStr>, pipe: Option<&std::ffi::OsStr>) -> Result<Option<String>, ClientError> {
+    match (required,pipe) {
+        (None,None)=>Ok(None),
+        (Some(required),Some(pipe)) if required==std::ffi::OsStr::new("1")=>{
+            let value=pipe.to_str().ok_or_else(bad)?;
+            let prefix=r"\\.\pipe\NavisPortalOperatorSession-v1-";
+            let suffix=value.strip_prefix(prefix).ok_or_else(bad)?;
+            if suffix.len()!=32||!suffix.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)) {return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+            Ok(Some(value.to_owned()))
+        }
+        _=>Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE")),
+    }
+}
+
+#[cfg(feature = "operator-controls")]
+pub(crate) fn operator_session_required() -> bool {
+    std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED").is_some()
+}
+
+#[cfg(feature = "operator-controls")]
+pub(crate) fn operator_session_request(
+    pipe_name:&str, registration:&super::Registration,
+)->Result<serde_json::Value,ClientError>{
+    let deadline=Instant::now()+Duration::from_secs(5);
+    let id=broker_request_id();
+    let raw=super::operator_session_request_bytes(&id)?;
+    let mut endpoint=pipe_name.encode_utf16().collect::<Vec<_>>();endpoint.push(0);
+    let handle=loop{
+        if Instant::now()>=deadline{return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+        let remaining=deadline.saturating_duration_since(Instant::now()).as_millis().clamp(1,200) as u32;
+        unsafe{
+            if WaitNamedPipeW(endpoint.as_ptr(),remaining)!=0{
+                let h=CreateFileW(endpoint.as_ptr(),0xc0000000,0,std::ptr::null_mut(),3,0,std::ptr::null_mut());
+                if !h.is_null()&&h as isize!=-1{break h;}
+            }
+        }
+    };
+    let pipe=unsafe{File::from_raw_handle(handle)};
+    let server=unsafe{verify_guardian_peer(pipe.as_raw_handle(),registration)?};
+    let mode=1u32;
+    if unsafe{SetNamedPipeHandleState(pipe.as_raw_handle(),&mode,std::ptr::null_mut(),std::ptr::null_mut())}==0{
+        return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));
+    }
+    let packet=[(raw.len() as u32).to_le_bytes().as_slice(),raw.as_slice()].concat();
+    let mut offset=0;
+    while offset<packet.len(){
+        if Instant::now()>=deadline{return Err(error("not_sent","OPERATOR_SESSION_STALE"));}
+        let mut written=0u32;
+        let ok=unsafe{WriteFile(pipe.as_raw_handle(),packet[offset..].as_ptr() as H,(packet.len()-offset) as u32,&mut written,std::ptr::null_mut())};
+        if ok!=0&&written>0{offset+=written as usize;}else{std::thread::sleep(Duration::from_millis(2));}
+    }
+    let mut response=Vec::new();
+    while response.len()<4{
+        if Instant::now()>=deadline{return Err(error("not_sent","OPERATOR_SESSION_STALE"));}
+        let mut available=0u32;
+        if unsafe{PeekNamedPipe(pipe.as_raw_handle(),std::ptr::null_mut(),0,std::ptr::null_mut(),&mut available,std::ptr::null_mut())}==0{
+            return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));
+        }
+        if available==0{std::thread::sleep(Duration::from_millis(2));continue;}
+        let take=(4-response.len()).min(available as usize);let mut chunk=vec![0u8;take];let mut read=0u32;
+        if unsafe{ReadFile(pipe.as_raw_handle(),chunk.as_mut_ptr() as H,take as u32,&mut read,std::ptr::null_mut())}==0||read==0{return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+        response.extend_from_slice(&chunk[..read as usize]);
+    }
+    let size=u32::from_le_bytes(response[..4].try_into().map_err(|_|bad())?) as usize;
+    if !(1..=65536).contains(&size){return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+    response.clear();
+    while response.len()<size{
+        if Instant::now()>=deadline{return Err(error("not_sent","OPERATOR_SESSION_STALE"));}
+        let mut available=0u32;
+        if unsafe{PeekNamedPipe(pipe.as_raw_handle(),std::ptr::null_mut(),0,std::ptr::null_mut(),&mut available,std::ptr::null_mut())}==0{return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+        if available==0{std::thread::sleep(Duration::from_millis(2));continue;}
+        let take=(size-response.len()).min(available as usize);let mut chunk=vec![0u8;take];let mut read=0u32;
+        if unsafe{ReadFile(pipe.as_raw_handle(),chunk.as_mut_ptr() as H,take as u32,&mut read,std::ptr::null_mut())}==0||read==0{return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+        response.extend_from_slice(&chunk[..read as usize]);
+    }
+    if unsafe{WaitForSingleObject(server.as_raw_handle(),0)}!=258{return Err(error("not_sent","OPERATOR_SESSION_UNAVAILABLE"));}
+    super::operator_session_reply(&response,&id)
+}
+
 static BROKER_REQUESTS: AtomicU64 = AtomicU64::new(1);
 fn broker_request_id()->String{
     let tick=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -572,6 +659,22 @@ unsafe fn verify_tcp(port: u16, remote: u16, pid: u32) -> Result<(), ClientError
 mod filesystem_path_tests {
     use super::*;
     use std::os::windows::ffi::OsStringExt;
+
+    #[cfg(feature = "operator-controls")]
+    #[test]
+    fn resident_session_marker_never_falls_back_when_pipe_is_missing_or_malformed() {
+        use std::ffi::OsStr;
+        assert_eq!(operator_session_pipe_config(None,None).unwrap(),None);
+        for (required,pipe) in [
+            (Some(OsStr::new("1")),None),
+            (None,Some(OsStr::new(r"\\.\pipe\NavisPortalOperatorSession-v1-0123456789abcdef0123456789abcdef"))),
+            (Some(OsStr::new("0")),Some(OsStr::new(r"\\.\pipe\NavisPortalOperatorSession-v1-0123456789abcdef0123456789abcdef"))),
+            (Some(OsStr::new("1")),Some(OsStr::new(r"\\.\pipe\NavisPortalOperatorSession-v1-invalid"))),
+        ] {
+            assert_eq!(operator_session_pipe_config(required,pipe).unwrap_err().receipt()["code"],
+                       "OPERATOR_SESSION_UNAVAILABLE");
+        }
+    }
 
     fn decoded(path: &Path) -> String {
         let value = extended_filesystem_path(path).unwrap();

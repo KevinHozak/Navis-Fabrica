@@ -1,22 +1,22 @@
 {
   "schema": 1,
   "source": "KevinHozak/Navis-Portal clients/rust",
-  "version": "1.6.0",
-  "base_commit": "7b181dbd206159b845f4a706a290fcc45696f941",
-  "source_state": "unshipped Portal canonical clients/rust working-tree snapshot based on base commit 7b181dbd206159b845f4a706a290fcc45696f941; source not published",
+  "version": "1.7.0",
+  "base_commit": "ab154af39b13d2ebd586951ac8acdc592f466120",
+  "source_state": "unpublished local Portal clients/rust 1.7.0 working-tree snapshot based on commit ab154af39b13d2ebd586951ac8acdc592f466120; source not published",
   "features": {
     "default": [],
     "operator_controls": false,
     "host_fixtures": "non-default offline fixture feature only"
   },
   "files": {
-    "Cargo.toml": "8cdc2b2698dbb04cbcda6f526b7e7dc9769d92a35df51696e91e17916f9ad058",
-    "Cargo.lock": "fc67e2731fa00c12effa4396da6d0245d7ff4953241b2e9e0f102d4dc67fc6e0",
+    "Cargo.toml": "de0d504b9f0978c104c9fef54f1c2c789caabb6f907ee9d98d499bea46f0d4c7",
+    "Cargo.lock": "05c95fc5c0b6d92d646c5237438f1811feb08450643512857cbf2ba6fbe63dab",
     "src/lib.rs": "80560c4c3c170b16eddd9e5ef8a4c127d2c27e685577557d39eee91eebe44e7e",
     "src/image.rs": "a07d2e225910e980ee8aa0314edb55e656a23414249d525c583c56858f15c3df",
-    "src/operator.rs": "883c2b7972ec03b4f75d0b8c7e78c9f1661ff93145db929ea64cabaf76a5091b",
-    "src/lifecycle.rs": "521b2c82ba247c863a75e39a0334cc9145f16ec679dcb3c176145ba219cd72b0",
-    "src/host_windows.rs": "f57f92ba773db1a2f5d190f5654255989bafdf0d4bb015533fb56f1bc896fa84",
+    "src/operator.rs": "333993380aea9d1df3dfff2f0f798057c8a2e3b4f443068ca1f83b4af11642ba",
+    "src/lifecycle.rs": "4b186b9445f589ee82d1c2e06aac252c9a36c152cae733a13ed8342a51709870",
+    "src/host_windows.rs": "adea01eee74fbb820411a1c74a30ebbc15c3c913546fb59bc333aa4d993241a3",
     "examples/native_backend.rs": "ad34ec9d9a15893410b4201abd2487e6e9e715b67feaede2b6e965529bea66f4",
     "examples/image_backend.rs": "d59ebad6e98c9d208e44c1fbbb0322e1dd37eddbd78084f740b4810af4c6e33f",
     "examples/host_backend.rs": "9109304ed3fdd49df358a903f67dea63aeba51c6411e053ded33839c7ca61342"

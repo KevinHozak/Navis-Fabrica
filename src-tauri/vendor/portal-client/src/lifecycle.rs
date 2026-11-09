@@ -56,6 +56,16 @@ mod native {
     ) -> Result<Value, ClientError> {
         Err(unsupported())
     }
+    pub fn operator_session_pipe() -> Result<Option<String>, ClientError> {
+        if std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED").is_some()
+            || std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_PIPE").is_some() {
+            Err(error("not_sent", "OPERATOR_SESSION_UNAVAILABLE"))
+        } else { Ok(None) }
+    }
+    pub fn operator_session_request(_: &str, _: &Registration) -> Result<Value, ClientError> {
+        Err(unsupported())
+    }
+    pub fn operator_session_required() -> bool { std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED").is_some() }
 }
 
 pub const HOST_CONTRACT: &str = "portal.host/1";
@@ -142,6 +152,9 @@ struct Registration {
     profile_sha: String,
     _pins: Vec<File>,
 }
+fn release_file_limit(version: &str) -> usize {
+    if version == "0.2.23" { 65 } else { 64 }
+}
 fn release_inventory(release: &Path, files: &BTreeMap<String, String>) -> Result<(), ClientError> {
     let expected: BTreeSet<PathBuf> = files
         .keys()
@@ -222,7 +235,7 @@ impl Registration {
             || numbers[2].as_ref().is_ok_and(|n| *n < 15)
             || !p.runtime.executable.is_absolute()
             || !hex(&p.runtime.sha256, 64)
-            || p.files.len() > 64
+            || p.files.len() > release_file_limit(&p.version)
         {
             return Err(invalid());
         }
@@ -969,6 +982,42 @@ fn broker_reply_frame(raw: &[u8], request_id: &str) -> Result<Value, ClientError
     Err(error("not_sent", safe))
 }
 
+#[cfg(feature = "operator-controls")]
+fn operator_session_request_bytes(request_id: &str) -> Result<Vec<u8>, ClientError> {
+    if !hex(request_id, 32) { return Err(invalid()); }
+    let bytes = serde_json::to_vec(&json!({"contract":"portal.operator.session/1","schema":1,
+        "request_id":request_id,"op":"report"})).map_err(|_| invalid())?;
+    if bytes.len() > 512 { return Err(invalid()); }
+    Ok(bytes)
+}
+
+#[cfg(feature = "operator-controls")]
+fn operator_session_reply(raw: &[u8], request_id: &str) -> Result<Value, ClientError> {
+    let value: Value = document(raw)?;
+    let object = value.as_object().ok_or_else(invalid)?;
+    if value["contract"] != "portal.operator.session/1" || value["schema"] != 1
+        || value["request_id"] != request_id || !value["ok"].is_boolean() {
+        return Err(error("not_sent", "OPERATOR_SESSION_UNAVAILABLE"));
+    }
+    if value["ok"] == true {
+        if object.len() != 5 || object.keys().any(|k| !["contract","schema","request_id","ok","report"].contains(&k.as_str()))
+            || !value["report"].is_object() {
+            return Err(error("not_sent", "OPERATOR_SESSION_UNAVAILABLE"));
+        }
+        return Ok(value["report"].clone());
+    }
+    if object.len()!=5 || object.keys().any(|k| !["contract","schema","request_id","ok","code"].contains(&k.as_str())) {
+        return Err(error("not_sent", "OPERATOR_SESSION_UNAVAILABLE"));
+    }
+    let code=match value["code"].as_str().unwrap_or("") {
+        "OPERATOR_SESSION_INVALID"=>"OPERATOR_SESSION_INVALID",
+        "OPERATOR_SESSION_BUSY"=>"OPERATOR_SESSION_BUSY",
+        "OPERATOR_SESSION_STALE"=>"OPERATOR_SESSION_STALE",
+        _=>"OPERATOR_SESSION_UNAVAILABLE",
+    };
+    Err(error("not_sent",code))
+}
+
 struct TaskState {
     result: Option<Result<HostConnection, ClientError>>,
     waker: Option<Waker>,
@@ -1024,6 +1073,12 @@ impl Drop for LifecycleTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_host_inventory_budget_is_exact_and_historical_cap_stays_fixed() {
+        assert_eq!(release_file_limit("0.2.22"),64);
+        assert_eq!(release_file_limit("0.2.23"),65);
+        assert_eq!(release_file_limit("0.2.24"),64);
+    }
     fn launch_fixture(state: &str, generation: &str, include_bootstrap: bool) -> HostConnection {
         let root = PathBuf::from(r"C:\PortalFixture");
         let release_id = "a".repeat(64);
@@ -1092,6 +1147,27 @@ mod tests {
         let unknown=json!({"schema":1,"request_id":id,"ok":false,"code":"ARBITRARY_INTERNAL_DETAIL"});
         let unknown_error=broker_reply_frame(&serde_json::to_vec(&unknown).unwrap(),id).unwrap_err();
         assert_eq!(unknown_error.receipt()["code"],"LIFECYCLE_UNRESOLVED");
+    }
+    #[cfg(feature = "operator-controls")]
+    #[test]
+    fn resident_operator_codec_is_exact_and_rejects_bad_frames_without_fallback() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let request = operator_session_request_bytes(id).unwrap();
+        assert!(request.len() <= 512);
+        assert_eq!(document::<Value>(&request).unwrap(), json!({
+            "contract":"portal.operator.session/1","schema":1,"request_id":id,"op":"report"
+        }));
+        assert!(operator_session_request_bytes("bad").is_err());
+        let valid = json!({"contract":"portal.operator.session/1","schema":1,
+            "request_id":id,"ok":true,"report":{"host":"running"}});
+        assert_eq!(operator_session_reply(&serde_json::to_vec(&valid).unwrap(), id).unwrap(), valid["report"]);
+        for malformed in [
+            json!({"contract":"portal.operator.session/1","schema":1,"request_id":id,"ok":true,"report":{},"path":"C:/private"}),
+            json!({"contract":"portal.operator.session/1","schema":1,"request_id":"fedcba9876543210fedcba9876543210","ok":true,"report":{}}),
+            json!({"contract":"portal.operator.session/1","schema":1,"request_id":id,"ok":false,"code":"ARBITRARY"}),
+        ] {
+            assert!(operator_session_reply(&serde_json::to_vec(&malformed).unwrap(), id).is_err());
+        }
     }
     #[test]
     fn reviewed_policy_refuses_unbounded_or_invalid_limits() {

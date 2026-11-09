@@ -16,15 +16,52 @@ pub fn user_identity() -> Result<String, ClientError> {
 }
 /// Installation must explicitly create this protected profile; startup never does.
 pub fn ui_directory() -> Result<PathBuf, ClientError> {
-    let path = native::root()?.join("portal-ui");
+    let path = native::root()?.join(ui_directory_name(native::operator_session_required()));
     native::private(&path)?;
     Ok(path)
 }
+fn ui_directory_name(monitor: bool) -> &'static str {
+    if monitor { "portal-ui-persistent-01" } else { "portal-ui" }
+}
 #[cfg(feature = "host-fixtures")]
 pub fn fixture_ui_directory(root: &Path) -> Result<PathBuf, ClientError> {
-    let path = root.join("portal-ui");
+    let path = root.join(ui_directory_name(native::operator_session_required()));
     native::private(&path)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod ui_directory_tests {
+    use super::ui_directory_name;
+
+    #[test]
+    fn monitor_uses_isolated_ui_directory() {
+        assert_eq!(ui_directory_name(false), "portal-ui");
+        assert_eq!(ui_directory_name(true), "portal-ui-persistent-01");
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn monitor_profile_refuses_operator_actions_before_host_access() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED");
+        std::env::set_var("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED", "1");
+        let operator = Operator::registered();
+        let result = operator.prepare(Action::Pause).err().expect("monitor action must refuse");
+        assert_eq!(result.receipt()["code"], "OPERATOR_ROLE_READ_ONLY");
+        if let Some(value) = previous {
+            std::env::set_var("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED", value);
+        } else {
+            std::env::remove_var("NAVIS_PORTAL_OPERATOR_SESSION_REQUIRED");
+        }
+    }
 }
 impl Action {
     pub fn name(self) -> &'static str {
@@ -140,27 +177,22 @@ impl Operator {
         ) {
             return Err(error("not_sent", "HOST_INCOMPATIBLE"));
         }
+        if let Some(pipe) = native::operator_session_pipe()? {
+            let safe = native::operator_session_request(&pipe, &registration)?;
+            let host_state = safe["host"].as_str().filter(|v|
+                ["stopped", "starting", "running", "unavailable"].contains(v))
+                .ok_or_else(|| error("not_sent", "OPERATOR_SESSION_UNAVAILABLE"))?;
+            let readiness = safe["readiness"].as_str().unwrap_or("POLICY_GATED");
+            let view: View = serde_json::from_value(safe["accounting"].clone()).map_err(|_| invalid())?;
+            validate_view(&view)?;
+            let host = json!({"state":host_state,"readiness":{"code":readiness}});
+            return Ok(Report { view, host, revision: 0, policy: "0".repeat(64),
+                generation: None, registration });
+        }
         let frame = broker(&self.context, &registration, "report", None, None)?;
         validate_frame(&frame["host"], &registration)?;
         let view: View = serde_json::from_value(frame["view"].clone()).map_err(|_| invalid())?;
-        if !view.global.valid()
-            || view.apps.len() > 64
-            || view.configured_routes > 64
-            || !["disabled", "paused", "approval_required", "policy_gated"]
-                .contains(&view.dispatch.as_str())
-            || !["active", "paused", "revoked", "emergency"].contains(&view.control.as_str())
-            || view.route_eligibility != "not_inspected"
-            || view.openrouter_account != "not_queried"
-            || view.helper_authority != "not_inspected"
-            || view.apps.iter().enumerate().any(|(i, a)| {
-                a.label != format!("App {}", i + 1)
-                    || a.routes > 64
-                    || !a.usage.valid()
-                    || a.eligibility != "not_inspected"
-            })
-        {
-            return Err(invalid());
-        }
+        validate_view(&view)?;
         let revision = frame["operator"]["revision"]
             .as_u64()
             .filter(|v| *v < i64::MAX as u64)
@@ -183,23 +215,41 @@ impl Operator {
             registration,
         })
     }
-    pub fn prepare(&self, action: Action) -> Result<Plan, ClientError> {
-        let report = self.report()?;
-        if report.view.sealed {
-            return Err(error("not_sent", "LEDGER_SEALED"));
-        }
-        if matches!(action, Action::Start) && report.host["state"] != "stopped" {
-            return Err(error("not_sent", "HOST_UNAVAILABLE"));
-        }
-        if matches!(action, Action::Stop) && report.generation.is_none() {
-            return Err(error("not_sent", "HOST_UNAVAILABLE"));
-        }
-        Ok(Plan {
-            context: self.context.clone(),
-            action,
-            report,
-        })
+    pub fn monitor_mode(&self) -> bool {
+        native::operator_session_required()
     }
+    pub fn prepare(&self, action: Action) -> Result<Plan, ClientError> {
+        if self.monitor_mode() {
+            return Err(error("not_sent", "OPERATOR_ROLE_READ_ONLY"));
+        }
+        let report = self.report()?;
+        if report.view.sealed
+            || matches!(action, Action::Start) && report.host["state"] != "stopped"
+            || matches!(action, Action::Stop) && report.generation.is_none() {
+            return Err(error("not_sent", if report.view.sealed {"LEDGER_SEALED"} else {"HOST_UNAVAILABLE"}));
+        }
+        Ok(Plan { context: self.context.clone(), action, report })
+    }
+}
+
+fn validate_view(view: &View) -> Result<(), ClientError> {
+    if !view.global.valid()
+            || view.apps.len() > 64
+            || view.configured_routes > 64
+            || !["disabled", "paused", "approval_required", "policy_gated"]
+                .contains(&view.dispatch.as_str())
+            || !["active", "paused", "revoked", "emergency"].contains(&view.control.as_str())
+            || view.route_eligibility != "not_inspected"
+            || view.openrouter_account != "not_queried"
+            || view.helper_authority != "not_inspected"
+            || view.apps.iter().enumerate().any(|(i, a)| {
+                a.label != format!("App {}", i + 1)
+                    || a.routes > 64
+                    || !a.usage.valid()
+                    || a.eligibility != "not_inspected"
+            })
+        { return Err(invalid()); }
+    Ok(())
 }
 /// One-use native review ticket. No Clone, Debug, Deserialize or Serialize.
 pub struct Plan {

@@ -9,6 +9,7 @@ fn main() {
             "prepare_issue_work",
             "get_settings",
             "get_project_inventory",
+            "add_project_folder",
             "list_project_branches",
             "open_project_github",
             "get_project_commit_draft_context",

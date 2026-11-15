@@ -32,16 +32,15 @@ fn main() {
             return;
         }
     };
-    let output = tauri::async_runtime::block_on(
-        navis_fabrica_lib::portal_feature::run_fixture_with_cancel(
+    let output =
+        tauri::async_runtime::block_on(navis_fabrica_lib::portal_feature::run_fixture_with_cancel(
             request.root,
             request.worker,
             request.worker_sha256,
             request.prompt,
             request.operation_id,
             request.cancel_mode,
-        ),
-    );
+        ));
     let response = match output {
         Ok(value) => value,
         Err(code) => serde_json::json!({"status":code}),

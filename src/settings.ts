@@ -322,6 +322,8 @@ function validatePreviewSecretReferences(providers: ProviderProfile[]): void {
 
 export const isDesktopApp = () => isTauri();
 
+export const addProjectFolder = () => invoke<ProjectEntry | null>("add_project_folder");
+
 export const getProjectInventory = () => invoke<ProjectEntry[]>("get_project_inventory");
 export const getProjectCommitDraftContext = (projectId: string) => invoke<CommitDraftContext>("get_project_commit_draft_context", { projectId });
 export const getProjectCommitChangedPaths = (projectId: string) => invoke<string[]>("get_project_commit_changed_paths", { projectId });

@@ -76,7 +76,20 @@ fn default_capability_is_scoped_to_registered_commands() {
         })
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(permitted, registered);
+    // Portal extraction remains registered for the host integration but is not
+    // exposed to the webview until that feature receives its own capability.
+    let host_only = [
+        "start_portal_extract".to_owned(),
+        "cancel_portal_extract".to_owned(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert!(host_only.is_subset(&registered));
+    assert!(host_only.is_disjoint(&permitted));
+    assert_eq!(
+        permitted,
+        registered.difference(&host_only).cloned().collect()
+    );
 }
 
 #[test]

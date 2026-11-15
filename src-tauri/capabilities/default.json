@@ -55,6 +55,7 @@
     "allow-evaluate-provider-fallback",
     "allow-calibrate-routing",
     "allow-get-project-inventory",
+    "allow-add-project-folder",
     "allow-get-project-commit-draft-context",
     "allow-get-project-commit-changed-paths",
     "allow-prepare-project-commit-review",

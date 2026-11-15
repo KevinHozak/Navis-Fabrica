@@ -2,7 +2,7 @@
 
 Selected implementation phase: FAB-S002. Authorized 2026-10-18.
 
-Home opens maximized to a roomy, searchable collection of explicitly selected projects. Discovery provides candidates only; new clones never join automatically. Settings manages selection, showing names and full paths, with an explicit save and read-back. Existing favorites are reused as the saved collection; hidden/view preferences no longer decide home membership. Empty collections guide setup. Missing saved projects remain selected and visible in Settings for removal.
+Home opens maximized to a roomy, searchable collection of explicitly selected projects. Discovery provides candidates only; new clones never join automatically. Settings lists saved projects with names, full paths and Remove buttons. Add project opens a Windows folder picker at `C:\Projects`; selection is inspected read-only, validated inside the configured project root, added to the catalog and saved immediately with read-back. Cancel leaves the collection unchanged, duplicate selection reuses the same project, and Remove saves immediately without deleting project files. Unavailable saved entries remain removable. Existing favorites are reused as the saved collection; hidden/view preferences no longer decide home membership. Empty collections guide setup. Missing saved projects remain selected and visible in Settings for removal.
 
 Verified candidate directories under C:\Projects include Agents, DreamCatcher, GP-Vault, GP-Grimoire, GP-Dev, Mimir, Navis-Fabrica, Navis-Protocol, Navis-Recon. These are reviewable suggestions, not proof of ownership or automatic selections. Other discovered projects remain unchecked unless the user selects them.
 

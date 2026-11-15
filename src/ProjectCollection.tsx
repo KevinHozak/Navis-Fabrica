@@ -1,7 +1,7 @@
 import { useWorkflowActivity, useBatchActivity, activityLabel, sameProjectPath } from "./Activity";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { commitReviewReducer, initialCommitReview, loadCommitReview } from "./commitReviewState";
-import { listProjectBranches, draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectGithub, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
+import { addProjectFolder, listProjectBranches, draftProjectCommitMessage, getProjectCommitChangedPaths, prepareProjectCommitReview, getProjectIcon, getReleaseExecutableVersion, loadSettings, saveProjectDisplayPreferences, defaultProjectDisplayPreferences, isDesktopApp, runProjectGitAction, openProjectGithub, openProjectFolder, startReviewedGitRun, type ProjectEntry, type ReleaseExecutableVersion, type WorkflowRun } from "./settings";
 import { issueCommand, type IssuePage } from "./runnerClient";
 import { RunsPanel } from "./RunsPanel";
 import { LocalIssuesPanel } from "./LocalIssuesPanel";
@@ -74,22 +74,39 @@ export function ProjectCollection({ projects, manage = false, onSelect, onRefres
   const runs = useWorkflowActivity();
   const [selected, setSelected] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [addedProjects, setAddedProjects] = useState<ProjectEntry[]>([]);
   const [openedIds, setOpenedIds] = useState<string[]>([]);
   useEffect(() => { let alive = true; loadSettings().then(s => { if (alive) { setPreferences(s.preferences.projectDisplay); setReady(true); } }).catch(e => { if (alive) setMessage(`Could not load collection: ${String(e)}`); }); const changed = () => { loadSettings().then(s => { if (alive) setPreferences(s.preferences.projectDisplay); }).catch(e => setMessage(String(e))); };
     window.addEventListener("fabrica-collection-saved", changed);
     return () => { alive = false; window.removeEventListener("fabrica-collection-saved", changed); }; }, []);
-  async function save() {
-    setSaving(true);
+  async function removeProject(id: string) {
+    if (saving) return;
+    setSaving(true); setMessage("");
     try {
-      await saveProjectDisplayPreferences(preferences);
+      const current = (await loadSettings()).preferences.projectDisplay;
+      const next = { ...current, favoriteProjectIds: current.favoriteProjectIds.filter(item => item !== id) };
+      await saveProjectDisplayPreferences(next);
       const saved = (await loadSettings()).preferences.projectDisplay;
-      if (JSON.stringify(saved.favoriteProjectIds) !== JSON.stringify(preferences.favoriteProjectIds)) throw new Error("Collection read-back did not match");
-      setPreferences(saved); window.dispatchEvent(new Event("fabrica-collection-saved")); setMessage("My Projects saved and verified.");
-    } catch (e) { setMessage(`Could not save: ${String(e)}`); }
+      if (saved.favoriteProjectIds.includes(id)) throw new Error("Project removal was not saved");
+      setPreferences(saved); window.dispatchEvent(new Event("fabrica-collection-saved"));
+    } catch (e) { setMessage(`Could not remove project: ${String(e)}`); }
     finally { setSaving(false); }
   }
-  const unique = [...new Map(projects.map(p => [p.id, p])).values()];
-  const visible = unique.filter(p => manage || preferences.favoriteProjectIds.includes(p.id));
+  async function addProject() {
+    if (saving) return;
+    setSaving(true); setMessage("");
+    try {
+      const project = await addProjectFolder();
+      if (!project) return;
+      const saved = (await loadSettings()).preferences.projectDisplay;
+      if (!saved.favoriteProjectIds.includes(project.id)) throw new Error("Project addition was not saved");
+      setAddedProjects(current => [...current.filter(item => item.id !== project.id), project]);
+      setPreferences(saved); window.dispatchEvent(new Event("fabrica-collection-saved"));
+    } catch (e) { setMessage(`Could not add project: ${String(e)}`); }
+    finally { setSaving(false); }
+  }
+  const unique = [...new Map([...projects, ...addedProjects].map(p => [p.id, p])).values()];
+  const visible = unique.filter(p => preferences.favoriteProjectIds.includes(p.id));
   if (!manage) {
     const committedAt = (project: ProjectEntry) => {
       const timestamp = Date.parse(project.git.latestCommit?.committedAt ?? "");
@@ -102,16 +119,28 @@ export function ProjectCollection({ projects, manage = false, onSelect, onRefres
   return <section className="my-projects">
     {message && <p role="status">{message}</p>}
     {!ready ? <p>Loading saved collection…</p> : <>
-      {manage ? <><div className="collection-options">{visible.map(p => <label key={p.id}><input type="checkbox" disabled={saving} checked={preferences.favoriteProjectIds.includes(p.id)} onChange={e => setPreferences({ ...preferences, favoriteProjectIds: e.target.checked ? [...preferences.favoriteProjectIds, p.id] : preferences.favoriteProjectIds.filter(id => id !== p.id) })} /><span><strong>{p.name}</strong><small>{p.path}</small></span></label>)}</div>
-      {preferences.favoriteProjectIds.filter(id => !unique.some(p => p.id === id)).map(id => <label className="collection-missing" key={id}><input type="checkbox" checked disabled={saving} onChange={() => setPreferences({ ...preferences, favoriteProjectIds: preferences.favoriteProjectIds.filter(item => item !== id) })} />Unavailable saved project: {id}</label>)}
-      {!visible.length && <p>No discovered projects yet. Use Discover project folders in Settings.</p>}
-      <button className="button button-primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save My Projects"}</button></> : <>
+      {manage ? <>
+      <button className="button button-primary" type="button" disabled={saving || !isDesktopApp()} onClick={() => void addProject()}>{saving ? "Updating…" : "Add project"}</button>
+      <SavedProjectList projects={unique} selectedIds={preferences.favoriteProjectIds} busy={saving} onRemove={id => void removeProject(id)} />
+      </> : <>
       {!visible.length && <div className="empty-state"><h3>{preferences.favoriteProjectIds.length ? "No available projects match" : "Choose your projects"}</h3><p>Your collection only includes projects you select.</p><a href="#settings">Manage My Projects in Settings</a></div>}
       <div className="my-project-grid" role="list" aria-label={manage ? "Project candidates" : "My Projects"}>{visible.map(p => <div role="listitem" key={p.id}><ProjectCard project={p} runs={runs} selected={p.id === selected} onOpenIssues={type => onOpenIssues?.(p, type)} onOpenChanges={() => onOpenChanges?.(p)} onOpenBuild={() => onOpenBuild?.(p)} onClick={() => { setSelected(p.id); setOpenedIds(ids => ids.includes(p.id) ? ids : [...ids, p.id]); onSelect?.(p.id); onOpenProject?.(p); }} onRefreshProject={onRefreshProject} refreshing={startupRefreshPending || refreshingPaths.some(path => sameProjectPath(path, p.path))} refreshError={refreshErrorPaths.some(path => sameProjectPath(path, p.path))} refreshVersion={refreshVersions[p.id] ?? 0} /></div>)}</div>
       {!onOpenProject && unique.filter(project => openedIds.includes(project.id)).map(project => <section key={project.id} hidden={project.id !== selected} className="project-inspector panel" aria-label={`${project.name} details`}><div className="panel-heading"><h2>{project.name}</h2><button className="text-button" onClick={() => setSelected(null)}>Close details</button></div><p>{project.path}</p>{isDesktopApp() && selected === project.id && <RunsPanel key={project.id} mode="actions" defaultCwd={project.path} project={project} issue={null} />}<h3>Changed files</h3>{project.git.changedFiles == null ? <p>Changed files unavailable. Reopen the app or rediscover folders in Settings to inspect current Git state.</p> : project.git.changedFiles.length ? <ul>{project.git.changedFiles.map(path => <li key={path}><code>{path}</code></li>)}</ul> : <p>Working tree clean.</p>}<div className="project-actions"><a className="button button-secondary" href="#runs">View activity</a><a className="button button-secondary" href="#batches">Run local issue batch</a></div><h3>Local issues</h3><LocalIssuesPanel key={project.id} defaultPath={project.path} refreshToken={project} /></section>)}
       </>}
     </>}
   </section>;
+}
+
+export function SavedProjectList({ projects, selectedIds, busy, onRemove }: { projects: ProjectEntry[]; selectedIds: string[]; busy: boolean; onRemove: (id: string) => void }) {
+  return <>
+      <ul className="collection-options" aria-label="Saved projects">
+        {selectedIds.map(id => {
+          const project = projects.find(item => item.id === id);
+          return <li key={id}><span><strong>{project?.name ?? "Unavailable project"}</strong><small>{project?.path ?? id}</small></span><button className="button button-secondary" type="button" disabled={busy} aria-label={`Remove ${project?.name ?? id}`} onClick={() => onRemove(id)}>Remove</button></li>;
+        })}
+      </ul>
+      {!selectedIds.length && <p>No saved projects.</p>}
+  </>;
 }
 
 export function ProjectCard({ project, runs, selected, onClick, onRefreshProject, refreshing = false, refreshError = false, refreshVersion = 0, onOpenIssues, onOpenChanges, onOpenBuild }: { onOpenIssues?: (type: "epic" | "story") => void; onOpenChanges?: () => void; onOpenBuild?: () => void; project: ProjectEntry; runs: WorkflowRun[] | null; selected: boolean; onClick: () => void; onRefreshProject?: (path: string) => void; refreshing?: boolean; refreshError?: boolean; refreshVersion?: number }) {

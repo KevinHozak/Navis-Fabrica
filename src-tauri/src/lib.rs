@@ -30,6 +30,7 @@ pub mod portal_feature;
 mod portal_feature;
 mod process;
 mod project_icon;
+mod project_picker;
 pub mod providers;
 mod routing;
 mod runs;
@@ -1470,6 +1471,75 @@ fn get_project_inventory(app: AppHandle) -> Result<Vec<scanner::ProjectEntry>, S
         &project_inventory_path(&app)?,
         &settings.project_root,
     ))
+}
+
+// The picker accepts no frontend path or executable input.
+#[tauri::command]
+async fn add_project_folder(app: AppHandle) -> Result<Option<scanner::ProjectEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = project_picker::pick_folder()? else {
+            return Ok(None);
+        };
+        // Serialize inventory changes with discovery and watcher refreshes.
+        let scans = active_scans()
+            .lock()
+            .map_err(|_| "Could not access project scans.")?;
+        if !scans.is_empty() {
+            return Err("Wait for the project refresh to finish, then add the project.".into());
+        }
+        let project =
+            register_project_folder(&settings_path(&app)?, &project_inventory_path(&app)?, &path)?;
+        project_fact_cache()
+            .lock()
+            .map_err(|_| "Could not access project cache.")?
+            .insert(project.id.clone(), project.clone());
+        drop(scans);
+        Ok(Some(project))
+    })
+    .await
+    .map_err(|error| format!("Could not add project: {error}"))?
+}
+
+fn register_project_folder(
+    settings_file: &Path,
+    inventory_file: &Path,
+    path: &Path,
+) -> Result<scanner::ProjectEntry, String> {
+    let settings = load_settings(settings_file)?;
+    let root = Path::new(&settings.project_root)
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve project root: {error}"))?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve project folder: {error}"))?;
+    if !path.is_dir() || path == root || !path.starts_with(&root) {
+        return Err("Choose a project folder inside the configured project root.".into());
+    }
+    let project = scanner::refresh_project_directory(&path, &AtomicBool::new(false))?
+        .ok_or("Choose a Git repository or a supported code project folder.")?;
+    // Inspection may take time; retain settings changed while Git was being read.
+    let mut current = load_settings(settings_file)?;
+    if current.project_root != settings.project_root {
+        return Err("The project root changed. Add the project again.".into());
+    }
+    let mut projects = inventory::load(inventory_file, &current.project_root);
+    projects.retain(|item| item.id != project.id);
+    projects.push(project.clone());
+    inventory::save(inventory_file, &current.project_root, &projects)?;
+    if !current
+        .preferences
+        .project_display
+        .favorite_project_ids
+        .contains(&project.id)
+    {
+        current
+            .preferences
+            .project_display
+            .favorite_project_ids
+            .push(project.id.clone());
+    }
+    write_settings_atomic(settings_file, &current)?;
+    Ok(project)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3022,6 +3092,7 @@ pub fn run() {
             get_runner_context,
             get_settings,
             get_project_inventory,
+            add_project_folder,
             get_project_commit_draft_context,
             get_project_commit_changed_paths,
             prepare_project_commit_review,
@@ -4209,6 +4280,59 @@ mod tests {
             validate_exclusions(vec![String::from(".git"), String::from(".GIT")]).unwrap(),
             vec![".git"]
         );
+    }
+
+    #[test]
+    fn project_folder_addition_persists_and_deduplicates_without_changing_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let folder = root.join("Example project");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("package.json"), "{}").unwrap();
+        let settings_file = temp.path().join("settings.json");
+        let inventory_file = temp.path().join("inventory.json");
+        let mut settings =
+            recover_settings(serde_json::json!({"projectRoot": root.to_string_lossy()}));
+        settings
+            .preferences
+            .project_display
+            .favorite_project_ids
+            .push("previous".into());
+        write_settings_atomic(&settings_file, &settings).unwrap();
+        let project = register_project_folder(&settings_file, &inventory_file, &folder).unwrap();
+        register_project_folder(&settings_file, &inventory_file, &folder).unwrap();
+        let saved = load_settings(&settings_file).unwrap();
+        assert_eq!(
+            saved.preferences.project_display.favorite_project_ids,
+            vec!["previous".to_string(), project.id.clone()]
+        );
+        let mut expected = serde_json::to_value(&settings).unwrap();
+        expected["preferences"]["projectDisplay"]["favoriteProjectIds"] =
+            serde_json::json!(["previous", project.id]);
+        assert_eq!(serde_json::to_value(&saved).unwrap(), expected);
+        assert_eq!(
+            inventory::load(&inventory_file, &settings.project_root).len(),
+            1
+        );
+        assert!(folder.join("package.json").exists());
+    }
+
+    #[test]
+    fn project_folder_addition_rejects_outside_root_and_nonprojects_without_saving() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let settings_file = temp.path().join("settings.json");
+        let inventory_file = temp.path().join("inventory.json");
+        let settings = recover_settings(serde_json::json!({"projectRoot": root.to_string_lossy()}));
+        write_settings_atomic(&settings_file, &settings).unwrap();
+        let before = fs::read(&settings_file).unwrap();
+        for path in [temp.path(), root.as_path(), empty.as_path()] {
+            assert!(register_project_folder(&settings_file, &inventory_file, path).is_err());
+        }
+        assert_eq!(fs::read(&settings_file).unwrap(), before);
+        assert!(!inventory_file.exists());
     }
 
     #[test]

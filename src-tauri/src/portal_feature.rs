@@ -664,9 +664,7 @@ pub async fn run_fixture_with_cancel(
     }
     let backend = FeatureBackend::fixture(root.clone(), worker, worker_sha256);
     let state = PortalFeatureState::default();
-    let cancel = state
-        .register(&operation_id)
-        .map_err(str::to_owned)?;
+    let cancel = state.register(&operation_id).map_err(str::to_owned)?;
     let finished = Arc::new(AtomicBool::new(false));
     let dispatch_path = root.join("dispatch.flag");
     let watcher = if cancel_mode == FixtureCancelMode::None {
@@ -720,7 +718,7 @@ pub async fn run_fixture_with_cancel(
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-        });
+            });
         match spawned {
             Ok(watcher) => Some(watcher),
             Err(_) => {
@@ -750,13 +748,8 @@ pub async fn start_portal_extract(
     if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT || !id(&operation_id) {
         return Err("denied".into());
     }
-    let result = run_registered_feature(
-        &state,
-        FeatureBackend::registered(),
-        prompt,
-        operation_id,
-    )
-    .await;
+    let result =
+        run_registered_feature(&state, FeatureBackend::registered(), prompt, operation_id).await;
     result.map_err(str::to_owned)
 }
 #[tauri::command]

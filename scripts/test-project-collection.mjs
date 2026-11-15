@@ -11,7 +11,7 @@ async function load(entry) {
   new Function('require','module','exports',result.outputFiles[0].text)(require,mod,mod.exports);
   return mod.exports;
 }
-const { ProjectCard, ProjectCardHeading, ProjectCollection } = await load('src/ProjectCollection.tsx');
+const { ProjectCard, ProjectCardHeading, ProjectCollection, SavedProjectList } = await load('src/ProjectCollection.tsx');
 const { activityLabel, sameProjectPath } = await load('src/Activity.tsx');
 const settings = await load('src/settings.ts');
 globalThis.window = {};
@@ -51,3 +51,18 @@ assert.doesNotMatch(card(project), /project-card-menu|More actions/);
 assert.match(card(project), /aria-label="Project actions for Owned project"/);
 assert.match(card(project), /aria-label="Open Owned project folder unavailable:/);
 assert.match(card({...project, git: {...project.git, remotes: [{github: {canonicalUrl: 'https://github.com/example/owned'}}]}}), /<button[^>]*aria-label="Open Owned project on GitHub"/);
+
+const savedList = (ids, busy = false) => renderToStaticMarkup(React.createElement(SavedProjectList, {
+  projects: [project, { ...project, id: 'candidate', name: 'Unselected candidate' }],
+  selectedIds: ids, busy, onRemove: () => {},
+}));
+const selectedList = savedList(['owned', 'missing']);
+assert.match(selectedList, /Owned project/);
+assert.match(selectedList, /C:\\Projects\\Owned/);
+assert.match(selectedList, /aria-label="Remove Owned project"/);
+assert.match(selectedList, /aria-label="Remove missing"/);
+assert.doesNotMatch(selectedList, /Unselected candidate|checkbox/);
+assert.match(savedList([]), /No saved projects/);
+assert.doesNotMatch(savedList([]), /Owned project/);
+assert.match(savedList(['owned'], true), /disabled=""/);
+console.log('Saved project list: selected folders only, removable unavailable entries, empty and busy states passed.');

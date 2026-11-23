@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 
 SEMVER = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
 TITLE_VERSION = re.compile(rf"(?<![\w.])v?({SEMVER})(?![\w.])")
@@ -18,6 +19,18 @@ def discover(repo: Path) -> dict[str, Path]:
                          and not Path(root, d).is_symlink())
         if Path(root).name == "src-tauri" and "tauri.conf.json" in files:
             candidates.append(Path(root, "tauri.conf.json"))
+    # Preserved, Git-ignored runtime trees can contain copies of other apps.
+    # Ignore those copies only when a tracked/unignored candidate remains.
+    if len(candidates) > 1:
+        visible = []
+        for candidate in candidates:
+            probe = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", str(candidate)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == 1:
+                visible.append(candidate)
+            elif probe.returncode != 0:
+                raise ValueError("Could not determine whether a Tauri candidate is Git-ignored")
+        candidates = visible
     if len(candidates) != 1:
         raise ValueError(f"Expected one Tauri project under {repo}; found {len(candidates)}. Pass its frontend directory for multi-app repositories.")
     config = candidates[0]

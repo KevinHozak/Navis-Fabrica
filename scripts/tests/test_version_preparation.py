@@ -71,6 +71,15 @@ class VersionPreparation(unittest.TestCase):
         sha = self.commit()
         return helper.record(self.ctx, token=prepared["token"], commit=sha, remote_head=sha)
 
+    def test_ignored_runtime_app_does_not_shadow_selected_app(self):
+        self.write(".gitignore", "target/\nnode_modules/\ndist/\nruntime/\n")
+        self.write("runtime/fixture/src-tauri/tauri.conf.json", "{}")
+        self.assertEqual(helper.context(self.root, self.store)["paths"]["tauri"],
+                         self.root / "src-tauri" / "tauri.conf.json")
+        self.write("other/src-tauri/tauri.conf.json", "{}")
+        with self.assertRaisesRegex(ValueError, "found 2"):
+            helper.context(self.root, self.store)
+
     def test_build_first_then_push_and_retries_allocate_once(self):
         self.change()
         first = self.prepare(base=self.base)
